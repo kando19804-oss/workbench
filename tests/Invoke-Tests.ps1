@@ -46,10 +46,11 @@ $results = foreach ($file in $testFiles) {
         Write-Host ''
         Write-Host ('===== {0} / {1}' -f $testName, $target.Label) -ForegroundColor Cyan
         $sw      = [Diagnostics.Stopwatch]::StartNew()
-        $lines   = @()
+        # テストが途中で止まっても、それまでの結果を残すため、1 行ずつ受け取る
+        $lines   = New-Object 'System.Collections.Generic.List[object]'
         $crashed = $false
         try {
-            $lines = @(& $file.FullName -Exe $target.Exe)
+            & $file.FullName -Exe $target.Exe | ForEach-Object { $lines.Add($_) }
         } catch {
             $crashed = $true
             Write-Host ('  テストが途中で止まりました: {0}' -f $_.Exception.Message) -ForegroundColor Red

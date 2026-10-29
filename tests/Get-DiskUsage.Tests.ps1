@@ -71,9 +71,14 @@ function New-SizedFile([string]$FilePath, [long]$Size, [int]$DaysAgo = 0) {
     if ($DaysAgo -gt 0) { [IO.File]::SetLastWriteTime('\\?\' + $FilePath, (Get-Date).AddDays(-$DaysAgo)) }
 }
 
+# コンソールで実行すると、長い行は画面の幅で折り返され、出力に改行が入る。
+# 画面の幅によって結果が変わらないように、文字を探す前に改行を取り除く
+function ConvertTo-FlatText([string]$Text) { $Text -replace '\r?\n', '' }
+
+# Log には、画面への出力から改行を取り除いたものを入れる
 function Invoke-Tool([string]$Label, [string[]]$ToolArgs) {
     $out  = Join-Path $workRoot "out_$Label"
-    $log  = & $Exe -NoProfile -ExecutionPolicy Bypass -File $tool @ToolArgs -OutputFolder $out 2>&1 | Out-String
+    $log  = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool @ToolArgs -OutputFolder $out 2>&1 | Out-String)
     $code = $LASTEXITCODE
     $dir  = $null
     if (Test-Path -LiteralPath $out) {
@@ -83,17 +88,46 @@ function Invoke-Tool([string]$Label, [string[]]$ToolArgs) {
     [pscustomobject]@{ Code = $code; Log = $log; Dir = $dir }
 }
 
+# 結果のファイルがないとき（ツールが保存に失敗したときなど）も止まらないように、空として読む
 function Read-Result([string]$Dir) {
-    if (-not $Dir) {
-        return [pscustomobject]@{ Folders = @(); Files = @(); Exts = @(); Skipped = @(); Summary = '' }
+    function Read-CsvOrEmpty([string]$Name) {
+        if (-not $Dir) { return @() }
+        $file = Join-Path $Dir $Name
+        if (-not (Test-Path -LiteralPath $file)) { return @() }
+        @(Import-Csv -LiteralPath $file -Encoding UTF8)
     }
+    $summary = ''
+    if ($Dir -and (Test-Path -LiteralPath (Join-Path $Dir 'summary.txt'))) { $summary = [IO.File]::ReadAllText((Join-Path $Dir 'summary.txt')) }
     [pscustomobject]@{
-        Folders = @(Import-Csv -LiteralPath (Join-Path $Dir 'folders.csv') -Encoding UTF8)
-        Files   = @(Import-Csv -LiteralPath (Join-Path $Dir 'files.csv') -Encoding UTF8)
-        Exts    = @(Import-Csv -LiteralPath (Join-Path $Dir 'extensions.csv') -Encoding UTF8)
-        Skipped = @(Import-Csv -LiteralPath (Join-Path $Dir 'skipped.csv') -Encoding UTF8)
-        Summary = [IO.File]::ReadAllText((Join-Path $Dir 'summary.txt'))
+        Folders = @(Read-CsvOrEmpty 'folders.csv')
+        Files   = @(Read-CsvOrEmpty 'files.csv')
+        Exts    = @(Read-CsvOrEmpty 'extensions.csv')
+        Skipped = @(Read-CsvOrEmpty 'skipped.csv')
+        Summary = $summary
     }
+}
+
+# 5.1 と 7 で並び順が変わらないように、文字コード順に並べてカンマでつなぐ
+function Join-Sorted($Items) {
+    $array = [string[]]@($Items)
+    [Array]::Sort($array, [StringComparer]::Ordinal)
+    $array -join ','
+}
+
+# 保存されたファイルの名前の一覧
+function Get-ResultFileNames([string]$Dir) {
+    if (-not $Dir) { return '(なし)' }
+    Join-Sorted (Get-ChildItem -LiteralPath $Dir -File | ForEach-Object { $_.Name })
+}
+
+function Get-LineCount([string]$Dir, [string]$FileName) {
+    if (-not $Dir -or -not (Test-Path -LiteralPath (Join-Path $Dir $FileName))) { return -1 }
+    @(Get-Content -LiteralPath (Join-Path $Dir $FileName) -Encoding UTF8).Count
+}
+
+# 除外指定でスキップされたフォルダの、Root から見た相対パスの一覧
+function Get-ExcludedNames($Result, [string]$Root) {
+    Join-Sorted (@($Result.Skipped | Where-Object { $_.'理由' -eq '除外指定' }) | ForEach-Object { $_.'パス'.Substring($Root.Length + 1) })
 }
 
 # コマンドプロンプトから起動した場合の引数の渡り方を確かめるため、バッチファイル経由で実行する
@@ -102,7 +136,7 @@ function Invoke-ViaCmd([string]$CommandLine) {
     $codePage = [Console]::OutputEncoding.CodePage
     $encoding = if ($codePage -eq 65001) { New-Object Text.UTF8Encoding $false } else { [Text.Encoding]::GetEncoding($codePage) }
     [IO.File]::WriteAllLines($batch, [string[]]@('@echo off', $CommandLine), $encoding)
-    $log = & cmd.exe /d /c $batch 2>&1 | Out-String
+    $log = ConvertTo-FlatText (& cmd.exe /d /c $batch 2>&1 | Out-String)
     [pscustomobject]@{ Code = $LASTEXITCODE; Log = $log }
 }
 
@@ -203,13 +237,13 @@ try {
     Assert-Equal '"パス\" の後ろに引数: ヒント' ([regex]::IsMatch($run.Log, '最後に \\ を付けないでください')) 'True'
 
     Write-Section '異常系'
-    $log = & $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Path (Join-Path $workRoot 'no\such\folder') 2>&1 | Out-String
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Path (Join-Path $workRoot 'no\such\folder') 2>&1 | Out-String)
     Assert-Equal '存在しないパス: 終了コード' $LASTEXITCODE 1
     Assert-Equal '存在しないパス: メッセージ' ([regex]::IsMatch($log, '指定したフォルダが見つかりません')) 'True'
     $usedLetters = @(Get-PSDrive -PSProvider FileSystem | ForEach-Object { $_.Name.ToUpperInvariant() })
     $freeLetter  = @('Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z') | Where-Object { $usedLetters -notcontains $_ } | Select-Object -First 1
     if ($freeLetter) {
-        $log = & $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Path $tree -OutputFolder "${freeLetter}:\nope" 2>&1 | Out-String
+        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Path $tree -OutputFolder "${freeLetter}:\nope" 2>&1 | Out-String)
         Assert-Equal '書き込めない保存先: 終了コード' $LASTEXITCODE 0
         Assert-Equal '書き込めない保存先: 警告' ([regex]::IsMatch($log, '保存先に書き込めないため')) 'True'
     } else {
@@ -248,6 +282,128 @@ try {
         Assert-Equal '中断のメッセージ' $result['MESSAGE'] '中断しました。結果は保存していません。'
     } else {
         Write-Skip 'Ctrl+C で中断' '3 秒以内に調べ終わったため、途中で止められなかった'
+    }
+
+    Write-Section 'レビューで見つかった問題の再発防止'
+    $extra    = Join-Path $workRoot 'extra'
+    $allFiles = 'extensions.csv,files.csv,folders.csv,skipped.csv,summary.txt'
+    New-SizedFile "$extra\flat\a.log" 100
+    foreach ($name in '[a]', 'a', "back``tick", 'a.b', 'aXb') { New-SizedFile "$extra\br\$name\f.bin" 10 }
+    foreach ($name in 'app.log.1', 'app.log.10', 'part.001', 'x.log') { New-SizedFile "$extra\ext\$name" 5 }
+    New-SizedFile ("$extra\ext\s." + [char]0xD800) 7
+
+    # 行が 0 件のとき、CSV の保存が途中で止まっていた
+    $run = Invoke-Tool 'r-flat' @('-Path', "$extra\flat")
+    Assert-Equal 'サブフォルダなし: 終了コード' $run.Code 0
+    Assert-Equal 'サブフォルダなし: 5 つとも保存' (Get-ResultFileNames $run.Dir) $allFiles
+    Assert-Equal 'サブフォルダなし: folders.csv は見出しだけ' (Get-LineCount $run.Dir 'folders.csv') 1
+    $run = Invoke-Tool 'r-older0' @('-Path', "$extra\flat", '-OlderThan', '90')
+    Assert-Equal '-OlderThan で 0 件: 5 つとも保存' (Get-ResultFileNames $run.Dir) $allFiles
+    Assert-Equal '-OlderThan で 0 件: files.csv は見出しだけ' (Get-LineCount $run.Dir 'files.csv') 1
+
+    # -Exclude の [ ] やバッククォートが、ワイルドカードや 5.1 のエスケープとして解釈されていた
+    $cases = @(@('*\[a]', '[a]'), @('*\[a', ''), @("*\BACK``TICK", "back``tick"), @('*\a.b', 'a.b'))
+    for ($i = 0; $i -lt $cases.Count; $i++) {
+        $run = Invoke-Tool "r-exclude$i" @('-Path', "$extra\br", '-Exclude', $cases[$i][0])
+        Assert-Equal ('-Exclude {0}: 終了コード' -f $cases[$i][0]) $run.Code 0
+        Assert-Equal ('-Exclude {0}: 除外されたフォルダ' -f $cases[$i][0]) (Get-ExcludedNames (Read-Result $run.Dir) "$extra\br") $cases[$i][1]
+    }
+
+    # 数字だけの拡張子が Excel で数値に変わっていた。壊れた文字の拡張子があると、CSV がすべて消えていた
+    $run = Invoke-Tool 'r-ext' @('-Path', "$extra\ext")
+    Assert-Equal '拡張子: 終了コード' $run.Code 0
+    Assert-Equal '拡張子: 壊れた文字があっても 5 つとも保存' (Get-ResultFileNames $run.Dir) $allFiles
+    $x = Read-Result $run.Dir
+    foreach ($ext in '=".1"', '=".10"', '=".001"', '.log') {
+        Assert-Equal ('拡張子: extensions.csv に {0}' -f $ext) @($x.Exts | Where-Object { $_.'拡張子' -eq $ext }).Count 1
+    }
+    Assert-Equal '拡張子: files.csv の app.log.1' (@($x.Files | Where-Object { $_.'ファイル' -like '*\app.log.1' }) | ForEach-Object { $_.'拡張子' }) '=".1"'
+
+    # 260 文字を超える -Path、\\?\ 付きの -Path、末尾にピリオドが付いた -Path を扱えなかった
+    $longDir = "$tree\" + ('L' * 120) + '\' + ('M' * 120)
+    $run = Invoke-Tool 'r-long' @('-Path', $longDir, '-NoCsv')
+    Assert-Equal '260 文字を超える -Path' ('{0}/{1}' -f $run.Code, [regex]::Match($run.Log, 'ファイル \S+ 件').Value) '0/ファイル 1 件'
+    $run = Invoke-Tool 'r-prefix' @('-Path', ('\\?\' + $tree), '-NoCsv')
+    Assert-Equal '\\?\ 付きの -Path' ('{0}/{1}' -f $run.Code, [regex]::Match($run.Log, 'ファイル \S+ 件').Value) '0/ファイル 9 件'
+    Assert-Equal '\\?\ 付きの -Path: 表示に \\?\ が残らない' $run.Log.Contains('\\?\') 'False'
+    $run = Invoke-Tool 'r-period' @('-Path', "$extra\flat.", '-NoCsv')
+    Assert-Equal '末尾にピリオドが付いた -Path' ('{0}/{1}' -f $run.Code, [regex]::Match($run.Log, 'ファイル \S+ 件').Value) '0/ファイル 1 件'
+
+    # コマンドプロンプトで -Exclude / -OutputFolder の最後が \" だと、別のフォルダを黙って調べていた
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoCsv -Exclude "{2}\a\" -Path "{2}"' -f $Exe, $tool, "$extra\br")
+    Assert-Equal 'cmd の -Exclude "…\" の後ろに引数' ('{0}/{1}' -f $run.Code, [regex]::IsMatch($run.Log, '最後に \\ を付けないでください')) '1/True'
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoCsv -Path "{3}"' -f $Exe, $tool, (Join-Path $workRoot 'out_q'), "$extra\br")
+    Assert-Equal 'cmd の -OutputFolder "…\" の後ろに引数' ('{0}/{1}' -f $run.Code, [regex]::IsMatch($run.Log, '最後に \\ を付けないでください')) '1/True'
+    # コマンドプロンプトで、カンマ区切りの全体を ' で囲むと効かなかった
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoCsv -Path "{2}" -Exclude ''*\[a],*\aXb''' -f $Exe, $tool, "$extra\br")
+    Assert-Equal 'cmd の ''…,…''' ([regex]::Match($run.Log, '除外したフォルダ \S+ 件').Value) '除外したフォルダ 2 件'
+
+    # 保存先を作れないときの警告に、改行が混ざっていた。
+    # 画面に出た文字は、コンソールの幅で折り返されて改行が入るため使わない。対象の PowerShell の中でツールを動かし、
+    # 警告のメッセージそのものをファイルに書き出して確かめる
+    $warnScript = Join-Path $workRoot 'collect-warnings.ps1'
+    $warnFile   = Join-Path $workRoot 'warnings.txt'
+    [IO.File]::WriteAllLines($warnScript, [string[]]@(
+        'param($Tool, $Path, $OutputFolder, $ResultFile)'
+        '$ps = [powershell]::Create()'
+        '[void]$ps.AddCommand($Tool).AddParameter(''Path'', $Path).AddParameter(''OutputFolder'', $OutputFolder)'
+        '[void]$ps.Invoke()'
+        '$lines = @($ps.Streams.Warning | ForEach-Object { $_.Message.Replace("`r", ''<CR>'').Replace("`n", ''<LF>'') })'
+        '[IO.File]::WriteAllLines($ResultFile, [string[]]$lines, (New-Object Text.UTF8Encoding $true))'
+    ), (New-Object Text.UTF8Encoding $true))
+    $null = & $Exe -NoProfile -ExecutionPolicy Bypass -File $warnScript -Tool $tool -Path "$extra\flat" -OutputFolder '\\localhost\workbench_no_such_share\out' -ResultFile $warnFile 2>&1
+    $saveWarnings = @()
+    if (Test-Path -LiteralPath $warnFile) { $saveWarnings = @([IO.File]::ReadAllLines($warnFile) | Where-Object { $_ -like '*保存先に書き込めないため*' }) }
+    Assert-Equal '保存先を作れないときの警告が出る' ($saveWarnings.Count -gt 0) 'True'
+    Assert-Equal '保存先を作れないときの警告に改行が入らない' (@($saveWarnings | Where-Object { $_.Contains('<CR>') -or $_.Contains('<LF>') }).Count) 0
+
+    # 日付の書式が、OS の地域設定によって変わっていた
+    $probe   = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; (Get-Date '2026-10-29 08:05:00').ToString('yyyy/MM/dd HH:mm:ss')"
+    $control = "$(& $Exe -NoProfile -Command $probe)"
+    if ($control -and $control -ne '2026/10/29 08:05:00') {
+        $cultureOut = Join-Path $workRoot 'out_culture'
+        $command = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; & '{0}' -Path '{1}' -OutputFolder '{2}' | Out-Null" -f $tool.Replace("'", "''"), "$extra\flat".Replace("'", "''"), $cultureOut.Replace("'", "''")
+        $null = & $Exe -NoProfile -ExecutionPolicy Bypass -Command $command 2>&1
+        $found = @(Get-ChildItem -LiteralPath $cultureOut -Directory -ErrorAction SilentlyContinue)
+        $x = Read-Result $(if ($found.Count -gt 0) { $found[0].FullName } else { $null })
+        Assert-Equal 'fi-FI でも summary の日時は yyyy-MM-dd HH:mm:ss' ([regex]::IsMatch($x.Summary, '対象: .*   \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}   ')) 'True'
+        Assert-Equal 'fi-FI でも files.csv の日時は yyyy/MM/dd HH:mm:ss' ([regex]::IsMatch("$(@($x.Files | ForEach-Object { $_.'最終更新日時' }) | Select-Object -First 1)", '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$')) 'True'
+    } else {
+        Write-Skip '地域設定' 'fi-FI に切り替えられなかったため'
+    }
+
+    # 調べ終わった後（並べ替えや保存の途中）に Ctrl+C すると、途中までの結果が残っていた
+    $many = Join-Path $workRoot 'many'
+    for ($i = 0; $i -lt 150; $i++) { for ($j = 0; $j -lt 100; $j++) { [void][IO.Directory]::CreateDirectory("$many\d$i\e$j") } }
+    $saveStopScript = Join-Path $workRoot 'stop-during-save.ps1'
+    $saveStopOut    = Join-Path $workRoot 'out_ctrlc_save'
+    [IO.File]::WriteAllLines($saveStopScript, [string[]]@(
+        'param($Tool, $Target, $OutRoot)'
+        '$ps = [powershell]::Create()'
+        '[void]$ps.AddCommand($Tool).AddParameter(''Path'', $Target).AddParameter(''OutputFolder'', $OutRoot)'
+        '$handle  = $ps.BeginInvoke()'
+        '$sw      = [Diagnostics.Stopwatch]::StartNew()'
+        '$stopped = $false'
+        'while (-not $handle.IsCompleted -and $sw.Elapsed.TotalSeconds -lt 120) {'
+        '    if (@(Get-ChildItem -LiteralPath $OutRoot -Recurse -Filter ''summary.txt'' -ErrorAction SilentlyContinue).Count -gt 0) { $ps.Stop(); $stopped = $true; break }'
+        '    Start-Sleep -Milliseconds 20'
+        '}'
+        '''STOPPED='' + $stopped'
+        '''AFTER='' + @(Get-ChildItem -LiteralPath $OutRoot -Directory -ErrorAction SilentlyContinue).Count'
+        '''MESSAGE='' + (($ps.Streams.Information | ForEach-Object { $_.MessageData.ToString() } | Where-Object { $_ -like ''*中断*'' }) -join '' / '')'
+    ), (New-Object Text.UTF8Encoding $true))
+    [void][IO.Directory]::CreateDirectory($saveStopOut)
+    $result = @{}
+    & $Exe -NoProfile -ExecutionPolicy Bypass -File $saveStopScript -Tool $tool -Target $many -OutRoot $saveStopOut 2>&1 | ForEach-Object {
+        $line = "$_"
+        $eq = $line.IndexOf('=')
+        if ($eq -gt 0) { $result[$line.Substring(0, $eq)] = $line.Substring($eq + 1) }
+    }
+    if ($result['STOPPED'] -eq 'True') {
+        Assert-Equal '保存の途中で止めた後は保存先が残らない' $result['AFTER'] '0'
+        Assert-Equal '保存の途中で止めたときのメッセージ' $result['MESSAGE'] '中断しました。結果は保存していません。'
+    } else {
+        Write-Skip '保存の途中で Ctrl+C' 'summary.txt ができる前に保存まで終わったため、途中で止められなかった'
     }
 
     Write-Section '共有フォルダ経由（\\localhost\<ドライブ>$）'
