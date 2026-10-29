@@ -3,3 +3,6 @@ doc/
 
 # Claude Code の個人用設定
 .claude/settings.local.json
+
+# Get-DiskUsage の実行結果（既定ではスクリプトと同じフォルダに保存される）
+DiskUsage_*/
