@@ -31,6 +31,7 @@
 
 .PARAMETER Exclude
     調べないフォルダ。フォルダのフルパスに対して、ワイルドカード（*）で指定します。
+    * 以外の文字（[ ] など）は、そのままの文字として扱います。
     大文字と小文字は区別しません。複数指定するときは、カンマで区切ります。
 
 .PARAMETER OutputFolder
@@ -106,6 +107,7 @@ function Remove-Quote([string]$Text) {
 
 # 5.1 は 260 文字を超えるパスを通常の書き方では読めないため、内部では \\?\ 付きのパスを使う
 function ConvertTo-LongPath([string]$FullPath) {
+    if ($FullPath.StartsWith('\\?\')) { return $FullPath }
     if ($FullPath.StartsWith('\\')) { return '\\?\UNC\' + $FullPath.Substring(2) }
     return '\\?\' + $FullPath
 }
@@ -126,10 +128,22 @@ function Format-Size([long]$Bytes) {
     return [string]::Format($Invariant, '{0:N1} {1}', $value, $units[$i])
 }
 
-# CSV 用の数値。Excel の「標準」書式は 12 桁以上を指数で表示してしまうため、3 桁区切りで出す
-# （Excel は桁区切り付きの数値として読み込み、全桁を表示する）
-function Format-Number($Value, [string]$Format = 'N0') {
-    return [string]::Format($Invariant, "{0:$Format}", $Value)
+# 日付や数値の区切り文字が、OS の地域設定によって変わらないようにする
+function Format-Invariant([string]$Format) {
+    return [string]::Format($Invariant, $Format, [object[]]$args)
+}
+
+# Excel は「.1」「.001」のような値を数値に変えてしまうため、数値として読める値は ="..." の形で出す
+function ConvertTo-ExcelText([string]$Text) {
+    # 全角の数字も Excel は数値にするため、半角にそろえてから判定する。
+    # 壊れた文字（対になっていないサロゲート）を含むと Normalize が例外を出すので、そのときはそのまま判定する
+    $normalized = $Text
+    try { $normalized = $Text.Normalize([Text.NormalizationForm]::FormKC) } catch { }
+    $number = 0.0
+    if ([double]::TryParse($normalized.TrimEnd('%'), [Globalization.NumberStyles]::Float, $Invariant, [ref]$number)) {
+        return '="' + $Text + '"'
+    }
+    return $Text
 }
 
 function Format-Duration([TimeSpan]$Span) {
@@ -146,13 +160,17 @@ function Get-InnerException([Exception]$Exception) {
     return $Exception
 }
 
-# 例外メッセージに含まれる \\?\ 付きのパスを、表示用のパスに戻す
+# 例外メッセージに含まれる \\?\ 付きのパスを、表示用のパスに戻す。
+# .NET のメッセージは途中や末尾に改行が入ることがあるため、1 行にまとめる
 function Get-ErrorText([Exception]$Exception) {
-    return $Exception.Message.Replace('\\?\UNC\', '\\').Replace('\\?\', '')
+    $text = $Exception.Message.Replace('\\?\UNC\', '\\').Replace('\\?\', '')
+    return ($text -replace '\s*[\r\n]+\s*', ' ').Trim()
 }
 
-# 5.1 と 7 のどちらでも BOM 付き UTF-8 で保存する（Export-Csv の -Encoding UTF8 は 7 だと BOM なしになる）
+# 5.1 と 7 のどちらでも BOM 付き UTF-8 で保存する（Export-Csv の -Encoding UTF8 は 7 だと BOM なしになる）。
+# 行が 0 件のときは見出しだけを書く
 function Save-Csv($Rows, [string[]]$Columns, [string]$FilePath) {
+    if ($null -eq $Rows) { $Rows = @() }
     $lines = @($Rows | ConvertTo-Csv -NoTypeInformation)
     if ($lines.Count -eq 0) { $lines = @(($Columns | ForEach-Object { '"' + $_ + '"' }) -join ',') }
     [IO.File]::WriteAllLines($FilePath, [string[]]$lines, $Utf8Bom)
@@ -163,37 +181,64 @@ function Stop-WithError([string]$Message) {
     exit 1
 }
 
+# コマンドプロンプトで "C:\data\" のように最後が \" だと、引用符が閉じずに後ろの引数まで 1 つの値として届く。
+# " は Windows のパスに使えない文字なので、値に残っていたらこの問題とみなして止める
+function Stop-WithQuoteError([string]$Name, [string]$Value) {
+    Stop-WithError (('{0} の値に引用符（"）が残っています: {1}' -f $Name, $Value) + "`r`n" +
+        'パスを引用符で囲むときは、最後に \ を付けないでください（例: -Path "C:\data"）。最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
+}
+
 #endregion
 
 #region 引数の確認
 
-$rawPath = $Path
 $Path = Remove-Quote $Path
-if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
-$resolved = $null
-try { $resolved = Resolve-Path -LiteralPath $Path } catch { }
-if (-not $resolved -or $resolved.Provider.Name -ne 'FileSystem' -or -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
-    $message = '指定したフォルダが見つかりません: {0}' -f $Path
-    if ($rawPath.Contains('"')) {
-        # -Path "C:\data\" -NoCsv のように最後が \" だと、後ろの引数までパスの一部として届く
-        $message += "`r`n" + 'パスを引用符で囲むときは、最後に \ を付けないでください（例: -Path "C:\data"）。最後が \" になっていると、後ろの引数までパスとして扱われます。'
-    }
-    Stop-WithError $message
-}
-$target = $resolved.ProviderPath
-if ($target -notmatch '^[A-Za-z]:\\$') { $target = $target.TrimEnd('\') }
+if ($Path.Contains('"')) { Stop-WithQuoteError '-Path' $Path }
+if ($Path -match '^(\\\\\?\\)?[A-Za-z]:$') { $Path += '\' }
 
-# -File で起動すると配列を渡せないため、カンマ区切りの文字列も受け付ける
-$excludePatterns = @(
+# -File で起動すると配列を渡せないため、カンマ区切りの文字列も受け付ける。
+# コマンドプロンプトでは ' がそのまま届くため、'*\a,*\b' のように全体を囲んだ場合も、各要素の前後の ' を外す
+# ワイルドカードは * だけにして、それ以外の文字は文字どおりに扱う。5.1 の WildcardPattern.Escape は
+# バッククォートをエスケープしないため、自分でエスケープしてから照合用のパターンを作る
+$wildcardOptions = [Management.Automation.WildcardOptions]'IgnoreCase, CultureInvariant'
+$excludeRules = @(
     foreach ($item in $Exclude) {
         foreach ($part in ($item -split ',')) {
-            $pattern = Remove-Quote $part
-            if ($pattern -notmatch '^[A-Za-z]:\\$') { $pattern = $pattern.TrimEnd('\') }
-            if ($pattern) { $pattern }
+            $text = (Remove-Quote $part).Trim("'")
+            if ($text.Contains('"')) { Stop-WithQuoteError '-Exclude' $text }
+            if ($text -notmatch '^[A-Za-z]:\\$') { $text = $text.TrimEnd('\') }
+            if ($text) {
+                $escaped = $text.Replace('`', '``').Replace('[', '`[').Replace(']', '`]').Replace('?', '`?')
+                [pscustomobject]@{ Text = $text; Matcher = [Management.Automation.WildcardPattern]::new($escaped, $wildcardOptions) }
+            }
         }
     }
 )
-$hasExclude = $excludePatterns.Count -gt 0
+$hasExclude = $excludeRules.Count -gt 0
+
+$outputText = $null
+if ($OutputFolder) {
+    $outputText = Remove-Quote $OutputFolder
+    if ($outputText.Contains('"')) { Stop-WithQuoteError '-OutputFolder' $outputText }
+}
+
+$target   = $null
+$resolved = $null
+try { $resolved = Resolve-Path -LiteralPath $Path } catch { }
+if ($resolved -and $resolved.Provider.Name -eq 'FileSystem' -and (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
+    $target = ConvertTo-DisplayPath $resolved.ProviderPath
+    # 通常の書き方では末尾のピリオドが無視されるが、\\?\ 付きでは残って読めなくなるため、ここで正規化する
+    try { $target = [IO.Path]::GetFullPath($target) } catch { }
+} else {
+    # 5.1 の Resolve-Path は 260 文字を超えるパスを扱えないため、\\?\ を付けて確かめ直す（\\?\ 付きの指定も受け付ける）
+    try {
+        $full = ConvertTo-DisplayPath $Path
+        if (-not [IO.Path]::IsPathRooted($full)) { $full = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($full) }
+        if ([IO.Directory]::Exists((ConvertTo-LongPath $full))) { $target = $full }
+    } catch { }
+}
+if (-not $target) { Stop-WithError ('指定したフォルダが見つかりません: {0}' -f $Path) }
+if ($target -notmatch '^[A-Za-z]:\\$') { $target = $target.TrimEnd('\') }
 
 $startTime = Get-Date
 $useCutoff = $PSBoundParameters.ContainsKey('OlderThan')
@@ -233,13 +278,17 @@ try {
 $runDir      = $null
 $saveWarning = $null
 if (-not $NoCsv) {
-    $baseDir = if ($OutputFolder) { Remove-Quote $OutputFolder } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
+    $baseDir = if ($outputText) { $outputText } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
-        $runDir  = Join-Path $baseDir ('DiskUsage_{0}_{1:yyyyMMdd_HHmmss}' -f $env:COMPUTERNAME, $startTime)
+        $runName = Format-Invariant 'DiskUsage_{0}_{1:yyyyMMdd_HHmmss}' $env:COMPUTERNAME $startTime
+        $runDir  = Join-Path $baseDir $runName
+        # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
+        $suffix = 1
+        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
         [void][IO.Directory]::CreateDirectory($runDir)
     } catch {
-        $saveWarning = '保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-InnerException $_.Exception).Message
+        $saveWarning = '保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))
         $runDir = $null
         Write-Warning $saveWarning
     }
@@ -351,8 +400,8 @@ try {
                 if ($hasExclude) {
                     $entryPath = ConvertTo-DisplayPath $entry.FullName
                     $matched   = $null
-                    foreach ($pattern in $excludePatterns) {
-                        if ($entryPath -like $pattern) { $matched = $pattern; break }
+                    foreach ($rule in $excludeRules) {
+                        if ($rule.Matcher.IsMatch($entryPath)) { $matched = $rule.Text; break }
                     }
                     if ($matched) {
                         $excludedCount++
@@ -404,117 +453,147 @@ try {
 if ($fatal) { Stop-WithError $fatal }
 $elapsed = $sw.Elapsed
 
-$bySizeThenPath = @{ Expression = 'Size'; Descending = $true }, @{ Expression = 'Path'; Descending = $false }
-$folderRank = @($folders | Sort-Object -Property $bySizeThenPath)
-$fileRank   = @($candidates | Sort-Object -Property $bySizeThenPath | Select-Object -First $CsvFileTop)
-$extList    = foreach ($key in $extTable.Keys) {
-    $extName = if ($key) { $key.ToLowerInvariant() } else { '（拡張子なし）' }
-    [pscustomobject]@{ Path = $extName; Size = $extTable[$key][0]; Files = $extTable[$key][1] }
-}
-$extRank = @($extList | Sort-Object -Property $bySizeThenPath)
-
 #endregion
 
-#region 画面表示
-
-$lines = New-Object 'System.Collections.Generic.List[string]'
-$lines.Add(('容量検索 (Get-DiskUsage {0})' -f $ScriptVersion))
-$lines.Add(('対象: {0}   {1:yyyy-MM-dd HH:mm:ss}   {2}（管理者: {3}）' -f $target, $startTime, $env:COMPUTERNAME, $(if ($isAdmin) { 'はい' } else { 'いいえ' })))
-if ($useCutoff) { $lines.Add(('条件: 最終更新が {0} 日以上前のファイルのみ（{1:yyyy-MM-dd HH:mm} より前）' -f $OlderThan, $cutoff)) }
-if ($hasExclude) { $lines.Add(('除外: {0}' -f ($excludePatterns -join ', '))) }
-if ($driveLine) { $lines.Add($driveLine) }
-$lines.Add(('集計 {0}  ファイル {1:N0} 件  フォルダ {2:N0} 件  所要 {3}' -f (Format-Size $totalSize), $totalFiles, $totalDirs, (Format-Duration $elapsed)))
-
-$notes = @()
-$kinds = @()
-if ($deniedCount -gt 0) { $kinds += , @('権限なし', $deniedCount) }
-if ($errorCount -gt 0) { $kinds += , @('その他のエラー', $errorCount) }
-if ($kinds.Count -eq 1) {
-    $notes += 'スキップ {0:N0} 件（{1}）' -f $kinds[0][1], $kinds[0][0]
-} elseif ($kinds.Count -gt 1) {
-    $notes += 'スキップ {0:N0} 件（権限なし {1:N0}・その他のエラー {2:N0}）' -f ($deniedCount + $errorCount), $deniedCount, $errorCount
-}
-if ($linkCount -gt 0) { $notes += 'たどらなかったリンク {0:N0} 件' -f $linkCount }
-if ($excludedCount -gt 0) { $notes += '除外したフォルダ {0:N0} 件' -f $excludedCount }
-if ($notes.Count -gt 0) { $lines.Add($notes -join '  ') }
-if ($deniedCount -gt 0 -and -not $isAdmin) { $lines.Add('※ 管理者として実行すると、読める範囲が広がります') }
-
-$lines.Add('')
-$lines.Add(('■ 大きいフォルダ（{0} 階層まで・上位 {1}）' -f $Depth, $Top))
-$lines.Add(' 順位  合計サイズ  ファイル数  フォルダ')
-$rank = 0
-foreach ($row in ($folderRank | Select-Object -First $Top)) {
-    $rank++
-    $lines.Add(('{0,5}  {1,10}  {2,10:N0}  {3}' -f $rank, (Format-Size $row.Size), $row.Files, $row.Path))
-}
-if ($rank -eq 0) { $lines.Add('    （該当なし）') }
-
-$lines.Add('')
-$lines.Add(('■ 大きいファイル（上位 {0}）' -f $Top))
-$lines.Add(' 順位      サイズ  最終更新          ファイル')
-$rank = 0
-foreach ($row in ($fileRank | Select-Object -First $Top)) {
-    $rank++
-    $lines.Add(('{0,5}  {1,10}  {2:yyyy-MM-dd HH:mm}  {3}' -f $rank, (Format-Size $row.Size), $row.Time, (ConvertTo-DisplayPath $row.Path)))
-}
-if ($rank -eq 0) { $lines.Add('    （該当なし）') }
-
-$lines.Add('')
-$lines.Add(('■ 拡張子ごとの合計（上位 {0}）' -f $Top))
-$lines.Add(' 順位  合計サイズ  ファイル数  拡張子')
-$rank = 0
-foreach ($row in ($extRank | Select-Object -First $Top)) {
-    $rank++
-    $lines.Add(('{0,5}  {1,10}  {2,10:N0}  {3}' -f $rank, (Format-Size $row.Size), $row.Files, $row.Path))
-}
-if ($rank -eq 0) { $lines.Add('    （該当なし）') }
-
-foreach ($line in $lines) {
-    if ($line.StartsWith('■')) { Write-Host $line -ForegroundColor Cyan } else { Write-Host $line }
-}
-
-#endregion
-
-#region 保存
-
-if ($runDir) {
-    try {
-        [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
-
-        $rank = 0
-        $rows = foreach ($row in $folderRank) {
-            $rank++
-            [pscustomobject]@{ '順位' = $rank; 'フォルダ' = $row.Path; '階層' = $row.Depth; 'サイズ(MB)' = (Format-Number ($row.Size / 1MB) 'N2'); 'サイズ(バイト)' = (Format-Number $row.Size); 'ファイル数' = (Format-Number $row.Files) }
+# 並べ替え・画面表示・保存の途中で Ctrl+C されたときや、保存に失敗したときは、書きかけの結果を残さない
+$finished  = $false
+$saveError = $null
+try {
+    $bySizeThenPath = @{ Expression = 'Size'; Descending = $true }, @{ Expression = 'Path'; Descending = $false }
+    $folderRank = @($folders | Sort-Object -Property $bySizeThenPath)
+    $fileRank   = @($candidates | Sort-Object -Property $bySizeThenPath | Select-Object -First $CsvFileTop)
+    $extList    = @(
+        foreach ($key in $extTable.Keys) {
+            $extName = if ($key) { $key.ToLowerInvariant() } else { '（拡張子なし）' }
+            [pscustomobject]@{ Path = $extName; Size = $extTable[$key][0]; Files = $extTable[$key][1] }
         }
-        Save-Csv $rows @('順位', 'フォルダ', '階層', 'サイズ(MB)', 'サイズ(バイト)', 'ファイル数') (Join-Path $runDir 'folders.csv')
+    )
+    $extRank = @($extList | Sort-Object -Property $bySizeThenPath)
 
-        $rank = 0
-        $rows = foreach ($row in $fileRank) {
-            $rank++
-            $filePath = ConvertTo-DisplayPath $row.Path
-            [pscustomobject]@{ '順位' = $rank; 'ファイル' = $filePath; 'サイズ(MB)' = (Format-Number ($row.Size / 1MB) 'N2'); 'サイズ(バイト)' = (Format-Number $row.Size); '最終更新日時' = $row.Time.ToString('yyyy/MM/dd HH:mm:ss'); '拡張子' = [IO.Path]::GetExtension($filePath).ToLowerInvariant() }
-        }
-        Save-Csv $rows @('順位', 'ファイル', 'サイズ(MB)', 'サイズ(バイト)', '最終更新日時', '拡張子') (Join-Path $runDir 'files.csv')
+    #region 画面表示
 
-        $rank = 0
-        $rows = foreach ($row in $extRank) {
-            $rank++
-            [pscustomobject]@{ '順位' = $rank; '拡張子' = $row.Path; 'サイズ(MB)' = (Format-Number ($row.Size / 1MB) 'N2'); 'サイズ(バイト)' = (Format-Number $row.Size); 'ファイル数' = (Format-Number $row.Files) }
-        }
-        Save-Csv $rows @('順位', '拡張子', 'サイズ(MB)', 'サイズ(バイト)', 'ファイル数') (Join-Path $runDir 'extensions.csv')
+    $lines = New-Object 'System.Collections.Generic.List[string]'
+    $lines.Add((Format-Invariant '容量検索 (Get-DiskUsage {0})' $ScriptVersion))
+    $lines.Add((Format-Invariant '対象: {0}   {1:yyyy-MM-dd HH:mm:ss}   {2}（管理者: {3}）' $target $startTime $env:COMPUTERNAME $(if ($isAdmin) { 'はい' } else { 'いいえ' })))
+    if ($useCutoff) { $lines.Add((Format-Invariant '条件: 最終更新が {0} 日以上前のファイルのみ（{1:yyyy-MM-dd HH:mm} より前）' $OlderThan $cutoff)) }
+    if ($hasExclude) { $lines.Add(('除外: {0}' -f (($excludeRules | ForEach-Object { $_.Text }) -join ', '))) }
+    if ($driveLine) { $lines.Add($driveLine) }
+    $lines.Add((Format-Invariant '集計 {0}  ファイル {1:N0} 件  フォルダ {2:N0} 件  所要 {3}' (Format-Size $totalSize) $totalFiles $totalDirs (Format-Duration $elapsed)))
 
-        Save-Csv $skipped @('理由', 'パス', '詳細') (Join-Path $runDir 'skipped.csv')
-
-        Write-Host ''
-        Write-Host ('保存先: {0}' -f $runDir)
-    } catch {
-        Write-Warning ('結果を保存できませんでした: {0}' -f (Get-InnerException $_.Exception).Message)
+    $notes = @()
+    $kinds = @()
+    if ($deniedCount -gt 0) { $kinds += , @('権限なし', $deniedCount) }
+    if ($errorCount -gt 0) { $kinds += , @('その他のエラー', $errorCount) }
+    if ($kinds.Count -eq 1) {
+        $notes += Format-Invariant 'スキップ {0:N0} 件（{1}）' $kinds[0][1] $kinds[0][0]
+    } elseif ($kinds.Count -gt 1) {
+        $notes += Format-Invariant 'スキップ {0:N0} 件（権限なし {1:N0}・その他のエラー {2:N0}）' ($deniedCount + $errorCount) $deniedCount $errorCount
     }
+    if ($linkCount -gt 0) { $notes += Format-Invariant 'たどらなかったリンク {0:N0} 件' $linkCount }
+    if ($excludedCount -gt 0) { $notes += Format-Invariant '除外したフォルダ {0:N0} 件' $excludedCount }
+    if ($notes.Count -gt 0) { $lines.Add($notes -join '  ') }
+    if ($deniedCount -gt 0 -and -not $isAdmin) { $lines.Add('※ 管理者として実行すると、読める範囲が広がります') }
+
+    $lines.Add('')
+    $lines.Add(('■ 大きいフォルダ（{0} 階層まで・上位 {1}）' -f $Depth, $Top))
+    $lines.Add(' 順位  合計サイズ  ファイル数  フォルダ')
+    $rank = 0
+    foreach ($row in ($folderRank | Select-Object -First $Top)) {
+        $rank++
+        $lines.Add((Format-Invariant '{0,5}  {1,10}  {2,10:N0}  {3}' $rank (Format-Size $row.Size) $row.Files $row.Path))
+    }
+    if ($rank -eq 0) { $lines.Add('    （該当なし）') }
+
+    $lines.Add('')
+    $lines.Add(('■ 大きいファイル（上位 {0}）' -f $Top))
+    $lines.Add(' 順位      サイズ  最終更新          ファイル')
+    $rank = 0
+    foreach ($row in ($fileRank | Select-Object -First $Top)) {
+        $rank++
+        $lines.Add((Format-Invariant '{0,5}  {1,10}  {2:yyyy-MM-dd HH:mm}  {3}' $rank (Format-Size $row.Size) $row.Time (ConvertTo-DisplayPath $row.Path)))
+    }
+    if ($rank -eq 0) { $lines.Add('    （該当なし）') }
+
+    $lines.Add('')
+    $lines.Add(('■ 拡張子ごとの合計（上位 {0}）' -f $Top))
+    $lines.Add(' 順位  合計サイズ  ファイル数  拡張子')
+    $rank = 0
+    foreach ($row in ($extRank | Select-Object -First $Top)) {
+        $rank++
+        $lines.Add((Format-Invariant '{0,5}  {1,10}  {2,10:N0}  {3}' $rank (Format-Size $row.Size) $row.Files $row.Path))
+    }
+    if ($rank -eq 0) { $lines.Add('    （該当なし）') }
+
+    foreach ($line in $lines) {
+        if ($line.StartsWith('■')) { Write-Host $line -ForegroundColor Cyan } else { Write-Host $line }
+    }
+
+    #endregion
+
+    #region 保存
+
+    if ($runDir) {
+        Write-Progress -Activity '容量検索' -Status '結果を保存しています'
+        try {
+            [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
+
+            # Excel の「標準」書式は 12 桁以上の数値を指数で表示するため、数値は 3 桁区切りで出す
+            # （Excel は桁区切り付きの数値として読み込む）。行数が多いため、関数を呼ばずに書式を直接指定する
+            $rank = 0
+            $rows = @(
+                foreach ($row in $folderRank) {
+                    $rank++
+                    [pscustomobject]@{ '順位' = $rank; 'フォルダ' = $row.Path; '階層' = $row.Depth; 'サイズ(MB)' = ($row.Size / 1MB).ToString('N2', $Invariant); 'サイズ(バイト)' = $row.Size.ToString('N0', $Invariant); 'ファイル数' = $row.Files.ToString('N0', $Invariant) }
+                }
+            )
+            Save-Csv $rows @('順位', 'フォルダ', '階層', 'サイズ(MB)', 'サイズ(バイト)', 'ファイル数') (Join-Path $runDir 'folders.csv')
+
+            $rank = 0
+            $rows = @(
+                foreach ($row in $fileRank) {
+                    $rank++
+                    $filePath = ConvertTo-DisplayPath $row.Path
+                    [pscustomobject]@{ '順位' = $rank; 'ファイル' = $filePath; 'サイズ(MB)' = ($row.Size / 1MB).ToString('N2', $Invariant); 'サイズ(バイト)' = $row.Size.ToString('N0', $Invariant); '最終更新日時' = $row.Time.ToString('yyyy/MM/dd HH:mm:ss', $Invariant); '拡張子' = (ConvertTo-ExcelText ([IO.Path]::GetExtension($filePath).ToLowerInvariant())) }
+                }
+            )
+            Save-Csv $rows @('順位', 'ファイル', 'サイズ(MB)', 'サイズ(バイト)', '最終更新日時', '拡張子') (Join-Path $runDir 'files.csv')
+
+            $rank = 0
+            $rows = @(
+                foreach ($row in $extRank) {
+                    $rank++
+                    [pscustomobject]@{ '順位' = $rank; '拡張子' = (ConvertTo-ExcelText $row.Path); 'サイズ(MB)' = ($row.Size / 1MB).ToString('N2', $Invariant); 'サイズ(バイト)' = $row.Size.ToString('N0', $Invariant); 'ファイル数' = $row.Files.ToString('N0', $Invariant) }
+                }
+            )
+            Save-Csv $rows @('順位', '拡張子', 'サイズ(MB)', 'サイズ(バイト)', 'ファイル数') (Join-Path $runDir 'extensions.csv')
+
+            Save-Csv $skipped @('理由', 'パス', '詳細') (Join-Path $runDir 'skipped.csv')
+        } catch {
+            $saveError = Get-ErrorText (Get-InnerException $_.Exception)
+        }
+        Write-Progress -Activity '容量検索' -Completed
+    }
+
+    #endregion
+
+    $finished = $true
+} finally {
+    if (-not $finished -or $saveError) {
+        # 消すのは、このツールが作った保存先のフォルダだけ
+        if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
+        if (-not $finished) { Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow }
+    }
+}
+
+if ($saveError) {
+    Write-Host ''
+    Write-Warning ('結果を保存できませんでした: {0}' -f $saveError)
+} elseif ($runDir) {
+    Write-Host ''
+    Write-Host ('保存先: {0}' -f $runDir)
 } elseif ($saveWarning) {
     Write-Host ''
     Write-Warning $saveWarning
 }
-
-#endregion
 
 exit 0
