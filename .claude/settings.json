@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(powershell.exe -NoProfile -ExecutionPolicy Bypass -File *)",
+      "PowerShell(pwsh -NoProfile -ExecutionPolicy Bypass -File *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$r=New-Object IO.StreamReader([Console]::OpenStandardInput(),[Text.Encoding]::UTF8); $j=$r.ReadToEnd()|ConvertFrom-Json; $f=$j.tool_input.file_path; if($f -and $f -match '\\.ps[dm]?1$' -and (Test-Path -LiteralPath $f)){ $b=[IO.File]::ReadAllBytes($f); $bom=$b.Length -ge 3 -and $b[0] -eq 0xEF -and $b[1] -eq 0xBB -and $b[2] -eq 0xBF; $u16=$b.Length -ge 2 -and (($b[0] -eq 0xFF -and $b[1] -eq 0xFE) -or ($b[0] -eq 0xFE -and $b[1] -eq 0xFF)); if(-not $bom -and -not $u16){ $n=New-Object byte[] ($b.Length+3); $n[0]=0xEF; $n[1]=0xBB; $n[2]=0xBF; [Array]::Copy($b,0,$n,3,$b.Length); [IO.File]::WriteAllBytes($f,$n) } }",
+            "shell": "powershell",
+            "timeout": 30,
+            "statusMessage": ".ps1 BOM確認"
+          }
+        ]
+      }
+    ]
+  }
+}

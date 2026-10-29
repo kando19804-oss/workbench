@@ -1,0 +1,5 @@
+# 内部資料（企画書など）は公開しない
+doc/
+
+# Claude Code の個人用設定
+.claude/settings.local.json
