@@ -167,12 +167,18 @@ function Stop-WithError([string]$Message) {
 
 #region 引数の確認
 
+$rawPath = $Path
 $Path = Remove-Quote $Path
 if ($Path -match '^[A-Za-z]:$') { $Path += '\' }
 $resolved = $null
 try { $resolved = Resolve-Path -LiteralPath $Path } catch { }
 if (-not $resolved -or $resolved.Provider.Name -ne 'FileSystem' -or -not (Test-Path -LiteralPath $resolved.ProviderPath -PathType Container)) {
-    Stop-WithError ('指定したフォルダが見つかりません: {0}' -f $Path)
+    $message = '指定したフォルダが見つかりません: {0}' -f $Path
+    if ($rawPath.Contains('"')) {
+        # -Path "C:\data\" -NoCsv のように最後が \" だと、後ろの引数までパスの一部として届く
+        $message += "`r`n" + 'パスを引用符で囲むときは、最後に \ を付けないでください（例: -Path "C:\data"）。最後が \" になっていると、後ろの引数までパスとして扱われます。'
+    }
+    Stop-WithError $message
 }
 $target = $resolved.ProviderPath
 if ($target -notmatch '^[A-Za-z]:\\$') { $target = $target.TrimEnd('\') }
