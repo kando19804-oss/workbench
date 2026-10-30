@@ -29,6 +29,9 @@ powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -Path C:\ -OutputFo
 
 # 結果を保存せず、画面表示だけにする
 powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -Path C:\ -NoCsv
+
+# 設定ファイルに書いた条件で調べる
+powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -ConfigFile .\monthly.ini
 ```
 
 ## パラメーター
@@ -42,6 +45,103 @@ powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -Path C:\ -NoCsv
 | `-Exclude` | 調べないフォルダ。フォルダのフルパスに対して、ワイルドカード（`*`）で指定します。`*` 以外の文字（`[` `]` など）は、そのままの文字として扱います。大文字と小文字は区別しません。複数指定するときは、`"C:\Windows,*\node_modules"` のようにカンマで区切って1つの文字列にします | 指定なし |
 | `-OutputFolder` | 結果の保存先 | スクリプトと同じフォルダ |
 | `-NoCsv` | 結果を保存せず、画面表示だけにします | なし |
+| `-ConfigFile` | 設定ファイルのパス。ここまでのパラメーターを、ファイルにまとめて書いておけます（[設定ファイル](#設定ファイル)を参照）。コマンドラインで指定した値は、設定ファイルより優先します | 指定なし |
+
+## 設定ファイル
+
+同じ条件で繰り返し調べるときは、パラメーターを設定ファイルにまとめておけます。毎月の点検、タスクスケジューラでの定期実行、複数のサーバーで同じ除外リストを使うときなどに便利です。設定ファイルを使わなくても、これまでどおりパラメーターだけで動きます。
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -ConfigFile .\monthly.ini
+```
+
+設定ファイルは、`-ConfigFile` で指定したときだけ読みます。スクリプトと同じフォルダに置いても、自動では読みません。
+
+### 書き方
+
+メモ帳などで次のように書いて保存します。ファイル名と拡張子は自由です（`.ini` にしておくと、ダブルクリックでメモ帳が開きます）。
+
+```ini
+# Get-DiskUsage の設定ファイル
+# 「項目 = 値」の形で、1 行に 1 つずつ書きます。# か ; で始まる行はコメントです
+# 書かなかった項目は、既定値で動きます
+
+Path = D:\data
+Depth = 4
+Top = 50
+OlderThan = 90
+
+# Exclude は、複数の行に分けて書けます（すべての行を合わせて使います）
+Exclude = D:\data\backup
+Exclude = *\node_modules
+
+OutputFolder = \\fileserver\report\disk
+NoCsv = false
+```
+
+- 項目の名前は、パラメーターの名前から `-` を除いたものです（`Path`、`Depth`、`Top`、`OlderThan`、`Exclude`、`OutputFolder`、`NoCsv`）。大文字と小文字は区別しません。値の意味と範囲は、パラメーターと同じです
+- `Exclude` は、カンマで区切って 1 行に書いても、複数の行に分けて書いてもかまいません
+- `NoCsv` は `true` か `false` で書きます
+- 書かなかった項目は、既定値で動きます。`OlderThan =` のように値を空にした行は、書かなかったのと同じ扱いです（同じ項目を下の行に書き足しても、2 回書いたことにはなりません）
+- 値は `"` で囲んでも、囲まなくてもかまいません。スペースを含むパスも、そのまま書けます（例: `Path = C:\Program Files`）。コマンドプロンプトで起きる「最後の `\"`」の問題も、設定ファイルでは起きません
+- コメントになるのは、`#` か `;` で始まる行だけです。行の途中の `#` や `;` は、フォルダ名に使える文字なので、値の一部として扱います
+- `Path`、`OutputFolder`、`Exclude` には、`%TEMP%` や `%COMPUTERNAME%` のような環境変数を書けます（例: `OutputFolder = \\fileserver\report\%COMPUTERNAME%`）
+- `Path` と `OutputFolder` に相対パス（`.\report` など）を書くと、設定ファイルのあるフォルダを基準にします。タスクスケジューラから実行すると、現在のフォルダが `C:\Windows\System32` になるためです
+- 文字コードは、UTF-8（BOM の有無は問いません）、Shift_JIS、UTF-16 のどれでも読めます。Windows 11 のメモ帳は BOM なしの UTF-8、Windows Server 2016 / 2019 のメモ帳は Shift_JIS で保存します
+
+### コマンドラインと一緒に使うとき
+
+コマンドラインで指定した値が、設定ファイルより優先します。設定ファイルの条件を、今回だけ変えたいときに使えます。
+
+```powershell
+# 設定ファイルの条件で、表示する件数だけ 100 件にする
+powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -ConfigFile .\monthly.ini -Top 100
+```
+
+- コマンドラインで `-Exclude` を指定すると、設定ファイルの `Exclude` は使いません（両方を合わせることはしません）
+- 設定ファイルに書いた `NoCsv = true` と `OlderThan` は、コマンドラインから取り消せません。CSV を保存したいとき、すべてのファイルで集計したいときは、設定ファイルを直してください（`powershell -File` で起動すると `-NoCsv:$false` の書き方が使えず、`-OlderThan` には 1 以上しか指定できないためです）
+
+### タスクスケジューラで使うとき
+
+タスクスケジューラから実行すると、現在のフォルダが `C:\Windows\System32` になります。次の 2 点に気を付けてください。
+
+- `-ConfigFile` は、フルパスで指定してください。相対パスは現在のフォルダが基準になるためです
+- 設定ファイルに `Path` を書いてください。書かないと、既定値の「現在のフォルダ」（`C:\Windows\System32`）を調べます
+
+「操作」の設定は、次のようにします。結果は、`OutputFolder` を書かなければスクリプトと同じフォルダに保存します。
+
+| 項目 | 値 |
+| --- | --- |
+| プログラム/スクリプト | `powershell.exe` |
+| 引数の追加 | `-ExecutionPolicy Bypass -File C:\tools\Get-DiskUsage.ps1 -ConfigFile C:\tools\monthly.ini` |
+
+### 書き間違いがあったとき
+
+調べ始める前に、エラーを表示して止まります。打ち間違いで除外が効かないまま、時間のかかる調査が終わってしまうのを防ぐためです。
+
+```
+設定ファイルの 6 行目: 知らない項目です: Exlude
+使える項目: Path, Depth, Top, OlderThan, Exclude, OutputFolder, NoCsv
+ファイル: C:\tools\monthly.ini
+```
+
+次の場合に止まります。
+
+| 場合 | 表示の例 |
+| --- | --- |
+| 設定ファイルが見つからない | 「設定ファイルが見つかりません: C:\tools\monthly.ini」。同じ名前に `.txt` を付けたファイルがあれば、「拡張子が .txt になっていませんか」とヒントも表示します |
+| 設定ファイルを読めない（権限がないなど） | 「設定ファイルを読めません: C:\tools\monthly.ini（理由）」 |
+| 「項目 = 値」の形になっていない行がある | 「「項目 = 値」の形になっていません: Depth 4」 |
+| 知らない項目がある | 上の例のとおり |
+| 値が範囲外、または数値でない | 「Depth は 1～100 の数値で指定してください: 0」 |
+| `NoCsv` が `true` / `false` 以外 | 「NoCsv は true か false で指定してください: yes」 |
+| `Exclude` 以外の項目を 2 回書いた | 「Depth が 2 回書かれています（3 行目と 8 行目）」 |
+| 値に `"` が残っている | 「Path の値に引用符（"）が残っています: "D:\data」 |
+| 定義されていない環境変数を書いた | 「定義されていない環境変数です: %COMPUTERNAM%」 |
+
+ファイルが見つからない・読めない場合を除き、表示の 1 行目に設定ファイルの何行目かを、最後の行に設定ファイルのパスを表示します。
+
+書き方は正しくても、設定ファイルに書いた `Path` のフォルダが見つからないときや、`OutputFolder` に書き込めないときは、表示の最後に「（設定ファイルの 2 行目）」のように、どの行の値かを書き添えます。
 
 ## 画面の表示例
 
@@ -73,6 +173,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -Path C:\ -NoCsv
 
 条件によって、次の行も表示します。
 
+- `-ConfigFile` を指定したとき：「対象」の次の行に「設定ファイル: C:\tools\monthly.ini」
 - `-OlderThan` を指定したとき：「条件: 最終更新が 90 日以上前のファイルのみ（2026-07-31 21:30 より前）」
 - `-Exclude` を指定したとき：「除外: C:\Windows, *\node_modules」。除外したフォルダがあれば、スキップの行に「除外したフォルダ 3 件」
 - 権限なし以外のエラーでも読めなかった場所があったとき：スキップの行が「スキップ 37 件（権限なし 35・その他のエラー 2）」

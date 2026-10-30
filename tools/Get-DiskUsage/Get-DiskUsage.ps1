@@ -40,6 +40,10 @@
 .PARAMETER NoCsv
     結果を保存せず、画面表示だけにします。
 
+.PARAMETER ConfigFile
+    設定ファイルのパス。Path～NoCsv の値を「項目 = 値」の形で書いておけます。
+    コマンドラインで指定した値は、設定ファイルより優先します。書き方は README を参照してください。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -Path C:\
 
@@ -54,6 +58,11 @@
     powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -Path C:\ -Exclude "C:\Windows,*\node_modules"
 
     C:\Windows と、すべての node_modules フォルダを調べません。
+
+.EXAMPLE
+    powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -ConfigFile .\monthly.ini
+
+    設定ファイル monthly.ini に書いた条件で調べます。
 
 .NOTES
     Get-DiskUsage 1.0.0
@@ -83,7 +92,9 @@ param(
 
     [string]$OutputFolder,
 
-    [switch]$NoCsv
+    [switch]$NoCsv,
+
+    [string]$ConfigFile
 )
 
 Set-StrictMode -Version 2.0
@@ -188,6 +199,179 @@ function Stop-WithQuoteError([string]$Name, [string]$Value) {
         'パスを引用符で囲むときは、最後に \ を付けないでください（例: -Path "C:\data"）。最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
 }
 
+# 5.1 の Get-Content は BOM のない UTF-8 を Shift_JIS として読んでしまうため、文字コードを自分で判定する。
+# BOM があればそれに従い、なければ UTF-8 として読めるかを確かめ、読めなければ Shift_JIS とみなす
+function Read-ConfigText([string]$FilePath) {
+    $bytes = [IO.File]::ReadAllBytes($FilePath)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        return (New-Object Text.UTF8Encoding $false).GetString($bytes, 3, $bytes.Length - 3)
+    }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { return [Text.Encoding]::Unicode.GetString($bytes, 2, $bytes.Length - 2) }
+    if ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { return [Text.Encoding]::BigEndianUnicode.GetString($bytes, 2, $bytes.Length - 2) }
+    try { return (New-Object Text.UTF8Encoding $false, $true).GetString($bytes) } catch { }
+    return [Text.Encoding]::GetEncoding(932).GetString($bytes)
+}
+
+# 設定ファイルの値は、前後を同じ引用符で囲んだときだけ外す（片方だけの引用符は書き間違いとして残す）
+function Remove-ConfigQuote([string]$Text) {
+    $t = $Text.Trim()
+    if ($t.Length -ge 2 -and (($t.StartsWith('"') -and $t.EndsWith('"')) -or ($t.StartsWith("'") -and $t.EndsWith("'")))) {
+        $t = $t.Substring(1, $t.Length - 2)
+    }
+    return $t
+}
+
+# 設定ファイルの書き間違いは、何行目かと設定ファイルのパスを添えて止める
+function Stop-WithConfigError([int]$LineNumber, [string]$Message, [string]$Hint) {
+    $text = '設定ファイルの {0} 行目: {1}' -f $LineNumber, $Message
+    if ($Hint) { $text += "`r`n" + $Hint }
+    Stop-WithError ($text + "`r`n" + ('ファイル: {0}' -f $configPath))
+}
+
+# 設定ファイルから来た値なら、何行目かを添える（見つからない・書き込めないときに原因を探しやすくするため）
+function Get-ConfigNote([string]$Name) {
+    if ($configApplied.ContainsKey($Name)) { return '（設定ファイルの {0} 行目）' -f $configApplied[$Name] }
+    return ''
+}
+
+# .NET の IsPathRooted は | などの文字で例外を出すため、先頭の形で判定する
+function Test-RootedPath([string]$Text) {
+    return $Text -match '^([A-Za-z]:|[\\/])'
+}
+
+# 5.1 は、名前に [ や ] を含むフォルダで起動すると、その名前をワイルドカードとして PowerShell の現在の場所を決める
+# （プロセスの現在のフォルダは正しい）。移る先は、一致するフォルダがなければ $PSHOME、1 つだけ一致すればそのフォルダ
+# （[a] なら隣の a）、パターンとして正しくない（a[b）か 2 つ以上一致する（[ab]）とドライブのルートになる。
+# そのときだけ、相対パスをプロセスの現在のフォルダを基準に解決する。対話の PowerShell で cd したあとは
+# プロセスの現在のフォルダが古いままなので、「違っていたら常にプロセスの現在のフォルダを使う」とはしない
+$startDir   = $null
+$processDir = [Environment]::CurrentDirectory.TrimEnd('\')
+$location   = (Get-Location).ProviderPath.TrimEnd('\')
+if ($processDir -match '[\[\]]' -and $location -ne $processDir) {
+    $misplaced = $location -eq $PSHOME.TrimEnd('\') -or $location -match '^[A-Za-z]:$'
+    if (-not $misplaced) {
+        try { $misplaced = [Management.Automation.WildcardPattern]::new($processDir, [Management.Automation.WildcardOptions]::IgnoreCase).IsMatch($location) } catch { }
+    }
+    if ($misplaced) { $startDir = $processDir }
+}
+
+function Resolve-StartPath([string]$Text) {
+    if ($startDir -and $Text -and -not (Test-RootedPath $Text)) { return $startDir + '\' + $Text }
+    return $Text
+}
+
+# %TEMP% などの環境変数を展開する。名前を打ち間違えると %名前% のまま残り、その名前のフォルダに保存してしまうため止める。
+# URL エンコードされたフォルダ名（%E3%81%82 など）を誤って止めないよう、16 進 2 桁の %XX% は対象にしない
+function Expand-ConfigVariable([int]$LineNumber, [string]$Text) {
+    $expanded = [Environment]::ExpandEnvironmentVariables($Text)
+    if ($expanded -match '%(?![0-9A-Fa-f]{2}%)[A-Za-z_][^%\\=\s]*%') { Stop-WithConfigError $LineNumber ('定義されていない環境変数です: {0}' -f $Matches[0]) }
+    return $expanded
+}
+
+#endregion
+
+#region 設定ファイル
+
+# 書ける項目は、パラメーターの名前から - を除いたもの。数値の範囲は param の ValidateRange と同じにする
+$configItems  = 'Path', 'Depth', 'Top', 'OlderThan', 'Exclude', 'OutputFolder', 'NoCsv'
+$configRanges = @{ Depth = 1, 100; Top = 1, 1000; OlderThan = 1, 36500 }
+$configPath   = $null
+$configApplied = @{}   # 設定ファイルの値を使った項目 → 行番号
+
+if ($ConfigFile) {
+    $configText = Remove-Quote $ConfigFile
+    if ($configText.Contains('"')) { Stop-WithQuoteError '-ConfigFile' $configText }
+    $configText = Resolve-StartPath $configText
+    $configPath = $configText
+    try {
+        $configPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((ConvertTo-DisplayPath $configText))
+        $configPath = [IO.Path]::GetFullPath($configPath)
+    } catch { }
+    if (-not [IO.File]::Exists((ConvertTo-LongPath $configPath))) {
+        # エクスプローラーで拡張子を表示していないと、メモ帳で monthly.ini.txt として保存してしまうことがある
+        $message = '設定ファイルが見つかりません: {0}' -f $configPath
+        if ([IO.File]::Exists((ConvertTo-LongPath ($configPath + '.txt')))) {
+            $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $configPath)
+        }
+        Stop-WithError $message
+    }
+    try {
+        $configLines = (Read-ConfigText (ConvertTo-LongPath $configPath)) -split '\r\n|\n|\r'
+    } catch {
+        Stop-WithError ('設定ファイルを読めません: {0}（{1}）' -f $configPath, (Get-ErrorText (Get-InnerException $_.Exception)))
+    }
+
+    $configDir    = Split-Path -LiteralPath $configPath   # -LiteralPath には -Parent を付けられない（親フォルダを返すのが既定）
+    $configValues = @{}
+    $configLineOf = @{}
+    $excludeItems = New-Object 'System.Collections.Generic.List[string]'
+    $lineNumber   = 0
+    foreach ($rawLine in $configLines) {
+        $lineNumber++
+        $lineText = $rawLine.Trim()
+        # # と ; はフォルダ名に使える文字なので、行の先頭にあるときだけコメントとみなす
+        if ($lineText -eq '' -or $lineText.StartsWith('#') -or $lineText.StartsWith(';')) { continue }
+        $separator = $lineText.IndexOf('=')
+        if ($separator -le 0) { Stop-WithConfigError $lineNumber ('「項目 = 値」の形になっていません: {0}' -f $lineText) }
+
+        $itemKey  = $lineText.Substring(0, $separator).Trim()
+        $itemName = $configItems | Where-Object { $_ -eq $itemKey }
+        if (-not $itemName) { Stop-WithConfigError $lineNumber ('知らない項目です: {0}' -f $itemKey) ('使える項目: {0}' -f ($configItems -join ', ')) }
+
+        $rawValue  = $lineText.Substring($separator + 1).Trim()
+        $itemValue = Remove-ConfigQuote $rawValue
+        # 値が空の行は、書かなかったのと同じ扱い（ひな形の空の行の下に書き足しても、2 回書いたことにしない）
+        if ($itemValue -eq '') { continue }
+
+        # Exclude は長くなりやすいので複数の行に分けて書ける。ほかの項目は、どちらが効いているか分からなくなるため 1 回だけ
+        if ($itemName -ne 'Exclude' -and $configLineOf.ContainsKey($itemName)) {
+            Stop-WithConfigError $lineNumber ('{0} が 2 回書かれています（{1} 行目と {2} 行目）' -f $itemName, $configLineOf[$itemName], $lineNumber)
+        }
+        $configLineOf[$itemName] = $lineNumber
+
+        # パスの項目は、コマンドプロンプトで書くときと同じように %TEMP% などの環境変数を展開する
+        if ($itemName -eq 'Exclude') {
+            # "a,b" のように全体を囲む書き方と、"a","b" のように 1 つずつ囲む書き方のどちらも受け付ける
+            $source = if ($itemValue.Contains('"')) { $rawValue } else { $itemValue }
+            foreach ($part in ($source -split ',')) {
+                $pattern = Remove-ConfigQuote $part
+                if ($pattern.Contains('"')) { Stop-WithConfigError $lineNumber ('Exclude の値に引用符（"）が残っています: {0}' -f $pattern) }
+                if ($pattern) { $excludeItems.Add((Expand-ConfigVariable $lineNumber $pattern)) }
+            }
+        } elseif ($itemName -eq 'NoCsv') {
+            if ($itemValue -eq 'true') { $configValues['NoCsv'] = $true }
+            elseif ($itemValue -eq 'false') { $configValues['NoCsv'] = $false }
+            else { Stop-WithConfigError $lineNumber ('NoCsv は true か false で指定してください: {0}' -f $itemValue) }
+        } elseif ($configRanges.ContainsKey($itemName)) {
+            $range  = $configRanges[$itemName]
+            $number = 0
+            if (-not [int]::TryParse($itemValue, [Globalization.NumberStyles]::None, $Invariant, [ref]$number) -or
+                $number -lt $range[0] -or $number -gt $range[1]) {
+                Stop-WithConfigError $lineNumber ('{0} は {1}～{2} の数値で指定してください: {3}' -f $itemName, $range[0], $range[1], $itemValue)
+            }
+            $configValues[$itemName] = $number
+        } else {
+            if ($itemValue.Contains('"')) { Stop-WithConfigError $lineNumber ('{0} の値に引用符（"）が残っています: {1}' -f $itemName, $itemValue) }
+            $itemValue = Expand-ConfigVariable $lineNumber $itemValue
+            # 相対パスは、設定ファイルのあるフォルダを基準にする（タスクスケジューラでは現在のフォルダが System32 になるため）
+            if (-not (Test-RootedPath $itemValue)) {
+                $itemValue = $configDir.TrimEnd('\') + '\' + $itemValue
+                try { $itemValue = [IO.Path]::GetFullPath($itemValue) } catch { }
+            }
+            $configValues[$itemName] = $itemValue
+        }
+    }
+    if ($excludeItems.Count -gt 0) { $configValues['Exclude'] = $excludeItems.ToArray() }
+
+    # コマンドラインで指定した項目は、設定ファイルより優先する
+    foreach ($itemName in @($configValues.Keys)) {
+        if (-not $PSBoundParameters.ContainsKey($itemName)) {
+            Set-Variable -Name $itemName -Value $configValues[$itemName]
+            $configApplied[$itemName] = $configLineOf[$itemName]
+        }
+    }
+}
+
 #endregion
 
 #region 引数の確認
@@ -195,6 +379,7 @@ function Stop-WithQuoteError([string]$Name, [string]$Value) {
 $Path = Remove-Quote $Path
 if ($Path.Contains('"')) { Stop-WithQuoteError '-Path' $Path }
 if ($Path -match '^(\\\\\?\\)?[A-Za-z]:$') { $Path += '\' }
+$Path = Resolve-StartPath $Path
 
 # -File で起動すると配列を渡せないため、カンマ区切りの文字列も受け付ける。
 # コマンドプロンプトでは ' がそのまま届くため、'*\a,*\b' のように全体を囲んだ場合も、各要素の前後の ' を外す
@@ -220,6 +405,7 @@ $outputText = $null
 if ($OutputFolder) {
     $outputText = Remove-Quote $OutputFolder
     if ($outputText.Contains('"')) { Stop-WithQuoteError '-OutputFolder' $outputText }
+    $outputText = Resolve-StartPath $outputText
 }
 
 $target   = $null
@@ -237,11 +423,11 @@ if ($resolved -and $resolved.Provider.Name -eq 'FileSystem' -and (Test-Path -Lit
         if ([IO.Directory]::Exists((ConvertTo-LongPath $full))) { $target = $full }
     } catch { }
 }
-if (-not $target) { Stop-WithError ('指定したフォルダが見つかりません: {0}' -f $Path) }
+if (-not $target) { Stop-WithError (('指定したフォルダが見つかりません: {0}' -f $Path) + (Get-ConfigNote 'Path')) }
 if ($target -notmatch '^[A-Za-z]:\\$') { $target = $target.TrimEnd('\') }
 
 $startTime = Get-Date
-$useCutoff = $PSBoundParameters.ContainsKey('OlderThan')
+$useCutoff = $OlderThan -gt 0   # 指定しなかったときは 0（設定ファイルで指定した場合も含めて判定する）
 $cutoff    = $startTime.AddDays(-$OlderThan)
 $cutoffUtc = $cutoff.ToUniversalTime()
 
@@ -288,7 +474,7 @@ if (-not $NoCsv) {
         while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
         [void][IO.Directory]::CreateDirectory($runDir)
     } catch {
-        $saveWarning = '保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))
+        $saveWarning = ('保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))) + (Get-ConfigNote 'OutputFolder')
         $runDir = $null
         Write-Warning $saveWarning
     }
@@ -475,6 +661,7 @@ try {
     $lines = New-Object 'System.Collections.Generic.List[string]'
     $lines.Add((Format-Invariant '容量検索 (Get-DiskUsage {0})' $ScriptVersion))
     $lines.Add((Format-Invariant '対象: {0}   {1:yyyy-MM-dd HH:mm:ss}   {2}（管理者: {3}）' $target $startTime $env:COMPUTERNAME $(if ($isAdmin) { 'はい' } else { 'いいえ' })))
+    if ($configPath) { $lines.Add(('設定ファイル: {0}' -f $configPath)) }
     if ($useCutoff) { $lines.Add((Format-Invariant '条件: 最終更新が {0} 日以上前のファイルのみ（{1:yyyy-MM-dd HH:mm} より前）' $OlderThan $cutoff)) }
     if ($hasExclude) { $lines.Add(('除外: {0}' -f (($excludeRules | ForEach-Object { $_.Text }) -join ', '))) }
     if ($driveLine) { $lines.Add($driveLine) }
