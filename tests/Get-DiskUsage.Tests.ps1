@@ -4,10 +4,10 @@
 
 .DESCRIPTION
     一時フォルダにダミー環境（日本語のパス、260 文字を超えるパス、ジャンクションのループ、
-    読み取り禁止のフォルダ、古いファイルなど）を作り、Get-DiskUsage を実行して期待値と照合します。
-    ダミー環境は終了時に削除します。
+    読み取り禁止のフォルダ、古いファイル、文字コードや書き方の違う設定ファイルなど）を作り、
+    Get-DiskUsage を実行して期待値と照合します。ダミー環境は終了時に削除します。
 
-    「権限なし」を再現するため、テストが作ったフォルダにだけアクセス拒否を設定します（終了時に戻します）。
+    「権限なし」を再現するため、テストが作ったフォルダと設定ファイルにだけアクセス拒否を設定します（終了時に戻します）。
 
     通常は tests\Invoke-Tests.ps1 から呼び出します。終了コードは失敗した件数です。
 
@@ -176,6 +176,39 @@ function Test-DefaultResult($Run, [string]$Root) {
     }
 }
 
+# 設定ファイルを書く。文字コードの判定を確かめるため、文字コードを選べるようにする
+function New-ConfigFile([string]$FilePath, [string[]]$Lines, [Text.Encoding]$Encoding = (New-Object Text.UTF8Encoding $false)) {
+    $parent = $FilePath.Substring(0, $FilePath.LastIndexOf('\'))
+    [void][IO.Directory]::CreateDirectory('\\?\' + $parent)
+    [IO.File]::WriteAllText('\\?\' + $FilePath, ($Lines -join "`r`n"), $Encoding)
+    $FilePath
+}
+
+# 設定ファイルの OutputFolder や相対パスの基準を確かめるため、Invoke-Tool と違って -OutputFolder を足さず、
+# 指定したフォルダから起動する
+function Invoke-From([string]$WorkDir, [string[]]$ToolArgs) {
+    Push-Location -LiteralPath $WorkDir
+    try {
+        $log  = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool @ToolArgs 2>&1 | Out-String)
+        $code = $LASTEXITCODE
+    } finally {
+        Pop-Location
+    }
+    [pscustomobject]@{ Code = $code; Log = $log }
+}
+
+# 保存先のフォルダの下に作られた、結果のフォルダ
+function Get-RunDir([string]$Parent) {
+    $found = @(Get-ChildItem -LiteralPath $Parent -Directory -Filter 'DiskUsage_*' -ErrorAction SilentlyContinue)
+    if ($found.Count -gt 0) { return $found[0].FullName }
+    $null
+}
+
+# 画面の「対象」の行に出たフォルダ
+function Get-TargetText([string]$Log) { [regex]::Match($Log, '対象: (.+?)   \d{4}-').Groups[1].Value }
+
+function Get-FileCountText([string]$Log) { [regex]::Match($Log, 'ファイル \S+ 件').Value }
+
 #endregion
 
 $savedEncoding = $null
@@ -183,6 +216,9 @@ try { $savedEncoding = [Console]::OutputEncoding; [Console]::OutputEncoding = [T
 $script:denyApplied = $false
 $deniedDir = Join-Path $tree 'denied'
 $userSid   = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$cfgDir    = Join-Path $workRoot 'cfg\設定 フォルダ'
+$cfgLocked = Join-Path $cfgDir 'locked.ini'
+$script:cfgDenyApplied = $false
 
 try {
     Write-Section ('準備: ダミー環境を作成（{0}）' -f $workRoot)
@@ -406,6 +442,194 @@ try {
         Write-Skip '保存の途中で Ctrl+C' 'summary.txt ができる前に保存まで終わったため、途中で止められなかった'
     }
 
+    Write-Section '設定ファイル（-ConfigFile）'
+    $cwd = Join-Path $workRoot 'cwd'
+    [void][IO.Directory]::CreateDirectory($cwd)
+    $basic = New-ConfigFile "$cfgDir\basic.ini" @(
+        '# 設定ファイルのテスト（日本語のコメント）'
+        '; セミコロンのコメント'
+        'path = ..\..\tree'
+        'DEPTH=2'
+        'Top = 5'
+        'OlderThan ='
+        'Exclude = *\node_modules'
+        'Exclude = "*\LVL2"'
+        'OutputFolder = .\結果'
+        'NoCsv = false'
+    )
+    # 別のフォルダから起動して、相対パスが設定ファイルのフォルダを基準にすることを確かめる
+    $run = Invoke-From $cwd @('-ConfigFile', $basic)
+    Assert-Equal '終了コード' $run.Code 0
+    $runDir = Get-RunDir "$cfgDir\結果"
+    Assert-Equal '保存先は設定ファイルのフォルダが基準' (Get-ResultFileNames $runDir) $allFiles
+    Assert-Equal '起動したフォルダには保存しない' (Test-Path -LiteralPath "$cwd\結果") 'False'
+    $x = Read-Result $runDir
+    Assert-Equal 'ファイル数（Exclude を 2 行に分けて書く）' $x.Files.Count 6
+    Assert-Equal 'ファイルの合計バイト' (Get-ByteSum $x.Files) 5507234
+    Assert-Equal '除外指定の件数' @($x.Skipped | Where-Object { $_.'理由' -eq '除外指定' }).Count 3
+    Assert-Equal 'Depth と Top' ([regex]::IsMatch($x.Summary, '■ 大きいフォルダ（2 階層まで・上位 5）')) 'True'
+    Assert-Equal 'フォルダの階層は 2 まで' (($x.Folders | ForEach-Object { [int]$_.'階層' } | Measure-Object -Maximum).Maximum) 2
+    Assert-Equal '値が空の OlderThan は指定なし' $x.Summary.Contains('条件:') 'False'
+    Assert-Equal 'summary の 3 行目に設定ファイル' (($x.Summary -split '\r?\n')[2]) "設定ファイル: $basic"
+
+    # Windows 11 のメモ帳は BOM なしの UTF-8、Server 2016 / 2019 のメモ帳は Shift_JIS で保存する
+    $encodings = [ordered]@{
+        'UTF-8（BOM なし）' = New-Object Text.UTF8Encoding $false
+        'UTF-8（BOM 付き）' = New-Object Text.UTF8Encoding $true
+        'Shift_JIS'         = [Text.Encoding]::GetEncoding(932)
+        'UTF-16 LE'         = [Text.Encoding]::Unicode
+        'UTF-16 BE'         = [Text.Encoding]::BigEndianUnicode
+    }
+    $i = 0
+    foreach ($label in $encodings.Keys) {
+        $file = New-ConfigFile "$cfgDir\enc$i.ini" @('Path = ..\..\tree', 'NoCsv = true', 'Exclude = *\日本語 フォルダ') $encodings[$label]
+        $run  = Invoke-From $cwd @('-ConfigFile', $file)
+        Assert-Equal ('文字コード {0}: 日本語の Exclude が効く' -f $label) ('{0}/{1}/{2}' -f $run.Code, (Get-FileCountText $run.Log), [regex]::Match($run.Log, '除外したフォルダ \S+ 件').Value) '0/ファイル 7 件/除外したフォルダ 1 件'
+        $i++
+    }
+
+    New-SizedFile "$workRoot\cfg\t2\a#b;c\f.bin" 10
+    $variants = @(
+        @('項目名の大文字と小文字・= の前後に空白なし', @('PATH=..\..\tree\日本語 フォルダ', 'nocsv=TRUE'), 'ファイル 2 件'),
+        @('"…" で囲んだ、スペースを含むパス', @('Path = "..\..\tree\日本語 フォルダ"', 'NoCsv = true'), 'ファイル 2 件'),
+        @("'…' で囲んだパス", @("Path = '..\..\tree\日本語 フォルダ'", 'NoCsv = true'), 'ファイル 2 件'),
+        @('# と ; を含むフォルダ名', @('Path = ..\t2\a#b;c', 'NoCsv = true'), 'ファイル 1 件'),
+        @('Exclude の全体を "…" で囲む', @('Path = ..\..\tree', 'NoCsv = true', 'Exclude = "*\node_modules,*\LVL2"'), '除外したフォルダ 3 件'),
+        @('Exclude を 1 つずつ "…" で囲む', @('Path = ..\..\tree', 'NoCsv = true', 'Exclude = "*\node_modules", "*\LVL2"'), '除外したフォルダ 3 件'),
+        @('OlderThan', @('Path = ..\..\tree', 'NoCsv = true', 'OlderThan = 100'), '条件: 最終更新が 100 日以上前のファイルのみ')
+    )
+    for ($i = 0; $i -lt $variants.Count; $i++) {
+        $file = New-ConfigFile "$cfgDir\var$i.ini" $variants[$i][1]
+        $run  = Invoke-From $cwd @('-ConfigFile', $file)
+        Assert-Equal ('書き方: {0}' -f $variants[$i][0]) ('{0}/{1}' -f $run.Code, $run.Log.Contains($variants[$i][2])) '0/True'
+    }
+
+    # コマンドラインの値が優先する。-Exclude は置き換え（両方を合わせない）、-NoCsv は NoCsv = false より優先
+    $prio = New-ConfigFile "$cfgDir\prio.ini" @('Path = ..\..\tree\日本語 フォルダ', 'Top = 5', 'Exclude = *\node_modules', 'OutputFolder = .\prio-out', 'NoCsv = false')
+    $run  = Invoke-From $cwd @('-ConfigFile', $prio, '-Path', $tree, '-Top', '1', '-Exclude', '*\pkg', '-NoCsv')
+    Assert-Equal 'コマンドラインが優先: 終了コード' $run.Code 0
+    Assert-Equal 'コマンドラインが優先: -Path' (Get-TargetText $run.Log) $tree
+    Assert-Equal 'コマンドラインが優先: -Top' $run.Log.Contains('（3 階層まで・上位 1）') 'True'
+    Assert-Equal 'コマンドラインが優先: -Exclude は置き換え' ('{0}/{1}' -f (Get-FileCountText $run.Log), $run.Log.Contains('除外: *\pkg')) 'ファイル 8 件/True'
+    Assert-Equal 'コマンドラインが優先: -NoCsv' (Test-Path -LiteralPath "$cfgDir\prio-out") 'False'
+
+    # -ConfigFile の相対パスは、起動したフォルダが基準
+    $min = New-ConfigFile "$cfgDir\min.ini" @('Path = ..\..\tree', 'NoCsv = true')
+    $run = Invoke-From (Join-Path $workRoot 'cfg') @('-ConfigFile', '設定 フォルダ\min.ini')
+    Assert-Equal '相対パスの -ConfigFile' ('{0}/{1}/{2}' -f $run.Code, (Get-FileCountText $run.Log), $run.Log.Contains("設定ファイル: $min")) '0/ファイル 9 件/True'
+
+    $cmdIni = New-ConfigFile "$workRoot\cfg\cmd.ini" @('Path = ..\tree', 'NoCsv = true', 'Exclude = *\日本語 フォルダ')
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -ConfigFile "{2}"' -f $Exe, $tool, $cmdIni)
+    Assert-Equal 'コマンドプロンプトから -ConfigFile' ('{0}/{1}' -f $run.Code, (Get-FileCountText $run.Log)) '0/ファイル 7 件'
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -ConfigFile "{2}\" -NoCsv' -f $Exe, $tool, "$workRoot\cfg")
+    Assert-Equal 'cmd の -ConfigFile "…\" の後ろに引数' ('{0}/{1}' -f $run.Code, [regex]::IsMatch($run.Log, '最後に \\ を付けないでください')) '1/True'
+
+    $longIni = New-ConfigFile ("$workRoot\cfg\" + ('L' * 120) + '\' + ('M' * 120) + '\long.ini') @('Path = .', 'NoCsv = true')
+    $run = Invoke-From $cwd @('-ConfigFile', $longIni)
+    Assert-Equal '260 文字を超えるパスの設定ファイル' ('{0}/{1}/{2}' -f $run.Code, (Get-FileCountText $run.Log), $run.Log.Contains("設定ファイル: $longIni")) '0/ファイル 1 件/True'
+
+    Write-Section '設定ファイル: 書き間違い（調べ始める前に止まる）'
+    $mistakes = @(
+        @('知らない項目', @('Path = ..\..\tree', 'Exlude = *\a'), @('設定ファイルの 2 行目: 知らない項目です: Exlude', '使える項目: Path, Depth, Top, OlderThan, Exclude, OutputFolder, NoCsv')),
+        @('ConfigFile は書けない', @('ConfigFile = other.ini'), @('設定ファイルの 1 行目: 知らない項目です: ConfigFile')),
+        @('同じ項目を 2 回', @('Depth = 2', 'Top = 5', 'depth = 3'), @('設定ファイルの 3 行目: Depth が 2 回書かれています（1 行目と 3 行目）')),
+        @('値が空の行を挟んで 2 回', @('Depth = 2', 'Depth =', 'Depth = 3'), @('設定ファイルの 3 行目: Depth が 2 回書かれています（1 行目と 3 行目）')),
+        @('Depth が範囲外', @('Depth = 0'), @('設定ファイルの 1 行目: Depth は 1～100 の数値で指定してください: 0')),
+        @('Top が範囲外', @('Top = 1001'), @('Top は 1～1000 の数値で指定してください: 1001')),
+        @('OlderThan が数値でない', @('OlderThan = abc'), @('OlderThan は 1～36500 の数値で指定してください: abc')),
+        @('符号の付いた数値', @('Depth = +3'), @('Depth は 1～100 の数値で指定してください: +3')),
+        @('NoCsv が true / false 以外', @('NoCsv = yes'), @('NoCsv は true か false で指定してください: yes')),
+        @('= がない行', @('Depth 4'), @('「項目 = 値」の形になっていません: Depth 4')),
+        @('項目名がない行', @('= 4'), @('「項目 = 値」の形になっていません: = 4')),
+        @('セクションの見出し', @('[Get-DiskUsage]', 'Depth = 2'), @('設定ファイルの 1 行目: 「項目 = 値」の形になっていません: [Get-DiskUsage]')),
+        @('Path の引用符が片方だけ', @('Path = "D:\data'), @('Path の値に引用符（"）が残っています: "D:\data')),
+        @('Exclude の引用符が片方だけ', @('Exclude = "*\a'), @('Exclude の値に引用符（"）が残っています: "*\a')),
+        @('定義されていない環境変数（OutputFolder）', @('OutputFolder = \\server\share\%WORKBENCH_NO_SUCH_VAR%'), @('定義されていない環境変数です: %WORKBENCH_NO_SUCH_VAR%')),
+        @('定義されていない環境変数（Exclude）', @('Exclude = %WORKBENCH_NO_SUCH_VAR%\*'), @('定義されていない環境変数です: %WORKBENCH_NO_SUCH_VAR%'))
+    )
+    for ($i = 0; $i -lt $mistakes.Count; $i++) {
+        $file    = New-ConfigFile "$cfgDir\err$i.ini" $mistakes[$i][1]
+        $run     = Invoke-From $cwd @('-ConfigFile', $file)
+        $missing = @(@($mistakes[$i][2]) + "ファイル: $file" | Where-Object { -not $run.Log.Contains($_) })
+        # 終了コード / 表示に足りない文 / 調べ始めたか
+        Assert-Equal ('書き間違い: {0}' -f $mistakes[$i][0]) ('{0}/{1}/{2}' -f $run.Code, ($missing -join ' | '), $run.Log.Contains('■ 大きいフォルダ')) '1//False'
+    }
+    $run = Invoke-From $cwd @('-ConfigFile', "$cfgDir\nothing.ini")
+    Assert-Equal '設定ファイルが見つからない' ('{0}/{1}' -f $run.Code, $run.Log.Contains("設定ファイルが見つかりません: $cfgDir\nothing.ini")) '1/True'
+    $null = New-ConfigFile "$cfgDir\hidden.ini.txt" @('Depth = 2')
+    $run = Invoke-From $cwd @('-ConfigFile', "$cfgDir\hidden.ini")
+    Assert-Equal '拡張子が .txt になっている: ヒント' ('{0}/{1}' -f $run.Code, $run.Log.Contains("拡張子が .txt になっていませんか: $cfgDir\hidden.ini.txt")) '1/True'
+    $null = New-ConfigFile $cfgLocked @('Depth = 2')
+    $null = & icacls.exe $cfgLocked /deny "*${userSid}:(R)" 2>&1
+    $script:cfgDenyApplied = ($LASTEXITCODE -eq 0)
+    if ($script:cfgDenyApplied) {
+        $run = Invoke-From $cwd @('-ConfigFile', $cfgLocked)
+        Assert-Equal '設定ファイルを読めない' ('{0}/{1}' -f $run.Code, $run.Log.Contains("設定ファイルを読めません: $cfgLocked")) '1/True'
+        $null = & icacls.exe $cfgLocked /remove:d "*$userSid" 2>&1
+        $script:cfgDenyApplied = $false
+    } else {
+        Write-Skip '設定ファイルを読めない' 'アクセス拒否を設定できなかったため'
+    }
+
+    Write-Section '設定ファイル: レビューで見つかった問題の再発防止'
+    # %TEMP% などの環境変数が展開されず、%TEMP% という名前のフォルダに保存していた
+    $env:WORKBENCH_TEST_ROOT = $workRoot
+    $envIni = New-ConfigFile "$cfgDir\env.ini" @('Path = %WORKBENCH_TEST_ROOT%\tree', 'OutputFolder = %WORKBENCH_TEST_ROOT%\cfg-env-out', 'Exclude = %WORKBENCH_TEST_ROOT%\tree\node_modules')
+    $run = Invoke-From $cwd @('-ConfigFile', $envIni)
+    Assert-Equal '環境変数: 終了コード' $run.Code 0
+    Assert-Equal '環境変数: OutputFolder' (Get-ResultFileNames (Get-RunDir "$workRoot\cfg-env-out")) $allFiles
+    Assert-Equal '環境変数: Exclude' ([regex]::Match($run.Log, '除外したフォルダ \S+ 件').Value) '除外したフォルダ 1 件'
+    Assert-Equal '環境変数: %名前% のフォルダを作らない' (Test-Path -LiteralPath "$cfgDir\%WORKBENCH_TEST_ROOT%") 'False'
+
+    # URL エンコードされたフォルダ名（%E3%81%82）を、定義されていない環境変数と誤って止めていた
+    New-SizedFile "$workRoot\cfg\pe\%E3%81%82\f.bin" 10
+    $urlIni = New-ConfigFile "$cfgDir\urlenc.ini" @('Path = ..\pe\%E3%81%82', 'Exclude = *\%E3%81%82\none', 'NoCsv = true')
+    $run = Invoke-From $cwd @('-ConfigFile', $urlIni)
+    Assert-Equal 'URL エンコードされたフォルダ名' ('{0}/{1}' -f $run.Code, (Get-FileCountText $run.Log)) '0/ファイル 1 件'
+
+    # 値が空の行も「2 回書いた」に数え、ひな形の空の行の下に書き足すと止まっていた
+    $file = New-ConfigFile "$cfgDir\empty-then.ini" @('Path = ..\..\tree', 'NoCsv = true', 'Depth =', 'Depth = 1')
+    $run  = Invoke-From $cwd @('-ConfigFile', $file)
+    Assert-Equal '値が空の行の下に同じ項目' ('{0}/{1}' -f $run.Code, $run.Log.Contains('■ 大きいフォルダ（1 階層まで')) '0/True'
+
+    # 設定ファイルの Path が見つからない・OutputFolder に書き込めないとき、設定ファイルの値だと分からなかった
+    $noPath = New-ConfigFile "$cfgDir\nopath.ini" @('NoCsv = true', 'Path = .\nosuch')
+    $run = Invoke-From $cwd @('-ConfigFile', $noPath)
+    Assert-Equal '設定ファイルの Path が見つからない: 行番号' ('{0}/{1}' -f $run.Code, $run.Log.Contains("指定したフォルダが見つかりません: $cfgDir\nosuch（設定ファイルの 2 行目）")) '1/True'
+    $run = Invoke-From $cwd @('-ConfigFile', $noPath, '-Path', (Join-Path $workRoot 'no\such'))
+    Assert-Equal 'コマンドラインの -Path が見つからない: 行番号を付けない' ('{0}/{1}' -f $run.Code, $run.Log.Contains('設定ファイルの')) '1/False'
+    New-SizedFile "$workRoot\cfg\blocker.txt" 1
+    $badOut = New-ConfigFile "$cfgDir\badout.ini" @('Path = ..\..\tree\日本語 フォルダ', 'OutputFolder = ..\blocker.txt\sub')
+    $run = Invoke-From $cwd @('-ConfigFile', $badOut)
+    Assert-Equal '設定ファイルの OutputFolder に書き込めない: 行番号' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains('保存先に書き込めないため'), $run.Log.Contains('（設定ファイルの 2 行目）')) '0/True/True'
+
+    # 5.1 は、名前に [ ] を含むフォルダで起動すると、名前をワイルドカードとして扱い、別の場所（$PSHOME、
+    # 1 つだけ一致した隣のフォルダ、ドライブのルート）から始まる。-Path を省略すると、そこを黙って調べていた
+    $start = Join-Path $workRoot 'start'
+    $startCases = @(
+        @('一致するフォルダがない（$PSHOME から始まる）', 'br[1] x', @()),
+        @('隣に 1 つ一致するフォルダがある', 'sib\[a]', @('sib\a')),
+        @('[ が閉じていない（ドライブのルートから始まる）', 'ub\a[b', @('ub\ab')),
+        @('隣に 2 つ一致する（ドライブのルートから始まる）', 'mm\[ab]', @('mm\a', 'mm\b'))
+    )
+    foreach ($case in $startCases) {
+        New-SizedFile "$start\$($case[1])\f.bin" 11
+        foreach ($decoy in $case[2]) { New-SizedFile "$start\$decoy\decoy.bin" 22 }
+    }
+    foreach ($case in $startCases) {
+        $dir = "$start\$($case[1])"
+        $run = Invoke-From $dir @('-NoCsv')
+        Assert-Equal ('[ ] を含むフォルダから起動: {0}' -f $case[0]) ('{0}/{1}' -f (Get-TargetText $run.Log), (Get-FileCountText $run.Log)) "$dir/ファイル 1 件"
+    }
+    # 相対の -ConfigFile・-OutputFolder・-Path も、隣のフォルダではなく起動したフォルダを基準にする
+    $sibDir = "$start\sib\[a]"
+    $null = New-ConfigFile "$sibDir\rel.ini" @('NoCsv = false')
+    $run = Invoke-From $sibDir @('-ConfigFile', 'rel.ini', '-OutputFolder', 'out', '-Path', '.')
+    Assert-Equal '[ ] を含むフォルダから相対パス: 終了コード' $run.Code 0
+    Assert-Equal '[ ] を含むフォルダから相対パス: 設定ファイル' $run.Log.Contains("設定ファイル: $sibDir\rel.ini") 'True'
+    Assert-Equal '[ ] を含むフォルダから相対パス: 保存先' (Get-ResultFileNames (Get-RunDir "$sibDir\out")) $allFiles
+    Assert-Equal '[ ] を含むフォルダから相対パス: 隣のフォルダに保存しない' (Test-Path -LiteralPath "$start\sib\a\out") 'False'
+
     Write-Section '共有フォルダ経由（\\localhost\<ドライブ>$）'
     $uncTree = '\\localhost\{0}${1}' -f $tree.Substring(0, 1), $tree.Substring(2)
     if (Test-Path -LiteralPath $uncTree) {
@@ -431,6 +655,8 @@ try {
 } finally {
     # アクセス拒否を戻してから消す
     if ($script:denyApplied) { $null = & icacls.exe $deniedDir /remove:d "*$userSid" 2>&1 }
+    if ($script:cfgDenyApplied) { $null = & icacls.exe $cfgLocked /remove:d "*$userSid" 2>&1 }
+    Remove-Item Env:\WORKBENCH_TEST_ROOT -ErrorAction SilentlyContinue
     if ($KeepTemp) {
         Write-Section ('ダミー環境を残しました: {0}' -f $workRoot)
     } elseif (Test-Path -LiteralPath $workRoot) {
