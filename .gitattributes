@@ -1,0 +1,3 @@
+# 改行は LF にそろえる（Windows の core.autocrlf=true でも、作業ツリーを LF のままにする）
+# Windows PowerShell 5.1 は、LF の .ps1 も問題なく実行できる
+* text=auto eol=lf
