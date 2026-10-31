@@ -6,3 +6,6 @@ doc/
 
 # Get-DiskUsage の実行結果（既定ではスクリプトと同じフォルダに保存される）
 DiskUsage_*/
+
+# Mac の Finder が作るファイル
+.DS_Store
