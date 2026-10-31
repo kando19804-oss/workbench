@@ -535,7 +535,10 @@ $dirType      = [IO.DirectoryInfo]
 $rpFlag       = [IO.FileAttributes]::ReparsePoint
 $hiddenSystem = [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
 
-$rootNode = New-TreeNode $target $target 0 $true
+# 起点の行の名前は、CSV で ="..." の形にしたとき Excel の 255 文字の制限を超えないよう、フルパスではなく最後のフォルダ名にする（ドライブのルートはパスのまま）
+$rootName = [IO.Path]::GetFileName($target)
+if (-not $rootName) { $rootName = $target }
+$rootNode = New-TreeNode $rootName $target 0 $true
 
 # 再帰呼び出しは深い階層でスタックが尽きるため、自前のスタックでたどる。
 # 要素は (フォルダ, 階層, -Detail の合計を足すフォルダの記録, ツリーの行（Depth より下では $null）, リパースポイントかどうか)
