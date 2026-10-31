@@ -606,8 +606,28 @@ try {
     } else {
         Write-Skip '実行ユーザーを取る時間' ('この PC では差が出ないため（実行ファイルが取れないプロセス {0} 個）' -f $noPath.Count)
     }
-    # 2. 260 文字を超える -OutputFolder と -ConfigFile を 5.1 で使えなかった（上の「260 文字を超えるパス」で確かめている）
-    # 3. 末尾にピリオドが付いた保存先（上の「保存」で確かめている）
+    # 2. 1 の直しで、管理者のときに、Get-Process -IncludeUserName で取れない保護されたプロセス（lsass.exe など）の
+    #    実行ユーザーが空になっていた（GetOwner なら取れる）
+    $protectedRow = $null
+    if ($isAdmin) {
+        foreach ($proc in $noPath) {
+            $r = Invoke-CimMethod -InputObject $proc -MethodName GetOwner -ErrorAction SilentlyContinue
+            if (-not $r -or $r.ReturnValue -ne 0) { continue }
+            $port = @(@($listen | Where-Object { [int]$_.OwningProcess -eq [int]$proc.ProcessId } | ForEach-Object { $_.LocalPort }) +
+                @(Get-NetUDPEndpoint -OwningProcess $proc.ProcessId -ErrorAction SilentlyContinue | ForEach-Object { $_.LocalPort })) | Select-Object -First 1
+            if ($port) { $protectedRow = @($proc.ProcessId, $port, $(if ($r.Domain) { '{0}\{1}' -f $r.Domain, $r.User } else { $r.User })); break }
+        }
+    }
+    if ($protectedRow) {
+        $run = Invoke-Tool 'protected' @('-Port', "$($protectedRow[1])")
+        Assert-Equal ('管理者: 保護されたプロセスの実行ユーザー（PID {0}）' -f $protectedRow[0]) (Find-Row (Read-Result $run.Dir) { $_.'PID' -eq "$($protectedRow[0])" }).'実行ユーザー' $protectedRow[2]
+    } elseif ($isAdmin) {
+        Write-Skip '保護されたプロセスの実行ユーザー' '実行ファイルが取れないプロセスで待ち受けているポートがないため'
+    } else {
+        Write-Skip '保護されたプロセスの実行ユーザー' '管理者でないため（管理者のときだけ取れる）'
+    }
+    # 3. 260 文字を超える -OutputFolder と -ConfigFile を 5.1 で使えなかった（上の「260 文字を超えるパス」で確かめている）
+    # 4. 末尾にピリオドが付いた保存先（上の「保存」で確かめている）
 
     Write-Section '地域設定'
     # 日付の書式が、OS の地域設定によって変わらないこと
