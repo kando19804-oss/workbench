@@ -259,28 +259,37 @@ function ConvertFrom-CsvText([string]$Text) {
     $records    = New-Object 'System.Collections.Generic.List[object]'
     $fields     = New-Object 'System.Collections.Generic.List[string]'
     $current    = New-Object Text.StringBuilder
-    $quoted     = $false
+    $quoted     = $false   # いま "" で囲んだ値の中にいるか
+    $wasQuoted  = $false   # この値が "" で始まったか（閉じたあとの " は、ふつうの文字として扱う）
     $lineNumber = 1
     $startLine  = 1
     for ($i = 0; $i -le $Text.Length; $i++) {
         $atEnd = $i -eq $Text.Length
         $ch    = if ($atEnd) { [char]0 } else { $Text[$i] }
         if (-not $atEnd -and ($ch -eq "`n" -or ($ch -eq "`r" -and -not ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq "`n")))) { $lineNumber++ }
-        if ($quoted -and -not $atEnd) {
+        if ($atEnd -and $quoted) {
+            # 閉じていない " があると、後ろの行がすべて 1 つの値として読まれ、対象が黙って消えるため止める
+            throw (New-Object FormatException ('{0} 行目: 引用符（"）が閉じていません' -f $startLine))
+        }
+        if ($quoted) {
             if ($ch -eq '"') {
                 if ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq '"') { [void]$current.Append('"'); $i++ } else { $quoted = $false }
             } else {
                 [void]$current.Append($ch)
             }
-        } elseif ($ch -eq '"') {
-            $quoted = $true
+        } elseif ($ch -eq '"' -and $current.Length -eq 0 -and -not $wasQuoted) {
+            # Excel と同じく、値の先頭の " だけを引用符の始まりとみなす（19" ラック の " は文字のまま）
+            $quoted    = $true
+            $wasQuoted = $true
         } elseif ($ch -eq ',') {
             $fields.Add($current.ToString())
             [void]$current.Clear()
+            $wasQuoted = $false
         } elseif ($atEnd -or $ch -eq "`r" -or $ch -eq "`n") {
             # CRLF は、CR のところでレコードを閉じ、LF は空のレコードとして読み飛ばす
             $fields.Add($current.ToString())
             [void]$current.Clear()
+            $wasQuoted = $false
             $isBlank = $fields.Count -eq 1 -and $fields[0].Trim() -eq ''
             if (-not $isBlank) { $records.Add([pscustomobject]@{ Line = $startLine; Fields = $fields.ToArray() }) }
             $fields.Clear()
@@ -717,6 +726,10 @@ if ($List) {
     try {
         $listRecords = ConvertFrom-CsvText (Read-ConfigText $listPath)
     } catch {
+        $readError = Get-InnerException $_.Exception
+        if ($readError -is [FormatException]) {
+            Stop-WithError (('対象の CSV の {0}' -f $readError.Message) + "`r`n" + ('ファイル: {0}' -f $listPath))
+        }
         Stop-WithError ('対象の CSV を読めません: {0}（{1}）' -f $listPath, (Get-ErrorText (Get-InnerException $_.Exception)))
     }
 
