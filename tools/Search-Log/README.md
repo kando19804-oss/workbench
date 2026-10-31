@@ -1,0 +1,175 @@
+# Search-Log（ログ横断検索）
+
+複数のログファイルから、指定した文字列を含む行を、前後の行と一緒に探し出します。結果は画面に表示し、テキストと CSV にも保存します。
+
+「障害の時間帯に、どのログにエラーが出ているかをまとめて探したい」「いくつものサーバーから集めたログを、一度に調べたい」というときのための道具です。ログの文字コード（UTF-8・Shift_JIS・UTF-16）は、ファイルごとに自動で判定します。ログを変更することはありません。
+
+## 使い方
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path D:\logs -Pattern "timeout"
+```
+
+実行ポリシーなど、起動方法の詳しい説明は[リポジトリの README](../../README.md#使い方) を参照してください。
+
+### 例
+
+```powershell
+# D:\logs の下の *.log と *.txt から、"timeout" か "refused" を含む行を探す
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path D:\logs -Pattern "timeout|refused"
+
+# 2 時間以内に更新されたログだけを探す
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path D:\logs -Pattern "ERROR" -Since 2h
+
+# 大文字の ERROR だけを探し、healthcheck を含む行は除く
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path D:\logs -Pattern "ERROR" -CaseSensitive -IgnorePattern "healthcheck"
+
+# 正規表現で探す（HTTP のステータス 500～599）
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path C:\inetpub\logs -Pattern " 5\d\d " -Regex
+
+# 前後 5 行を表示する。拡張子が .csv のログも対象にする
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path D:\logs -Pattern "timeout" -Context 5 -Filter "*.log,*.csv"
+
+# 前 2 行・後ろ 15 行を表示する（例外のスタックトレースを最後まで見たいとき）
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path D:\logs -Pattern "Exception" -Context "2,15"
+
+# 2 台のサーバーのログ（共有フォルダ）をまとめて探す
+powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path "\\ap01\logs,\\ap02\logs" -Pattern "OutOfMemory"
+```
+
+## パラメーター
+
+| パラメーター | 内容 | 既定値 |
+| --- | --- | --- |
+| `-Path` | 探すフォルダかファイル。フォルダを指定すると、サブフォルダも含めて探します。複数指定するときは、`"D:\logs,E:\applog"` のようにカンマで区切って1つの文字列にします | 現在のフォルダ |
+| `-Pattern` | 探す文字列。`"timeout\|refused"` のように `\|` で区切ると、どれかを含む行を探します（[探す文字列の書き方](#探す文字列の書き方)を参照） | なし（必須） |
+| `-Regex` | `-Pattern` と `-IgnorePattern` を正規表現として扱います | なし（書いた文字のまま探す） |
+| `-CaseSensitive` | 大文字と小文字を区別します | なし（区別しない） |
+| `-IgnorePattern` | `-Pattern` に一致しても、この文字列を含む行は結果から除きます。書き方は `-Pattern` と同じです | 指定なし |
+| `-Filter` | 探すファイルの名前の条件。ワイルドカード（`*` と `?`）で、`"*.log,*.txt"` のようにカンマで区切って書けます。`-Path` にファイルを直接指定したときは使いません | `*.log,*.txt` |
+| `-Exclude` | 探さないフォルダやファイル。フルパスに対して、ワイルドカード（`*`）で指定します。書き方は [Get-DiskUsage の -Exclude](../Get-DiskUsage/README.md#パラメーター) と同じです | 指定なし |
+| `-Since` | 最終更新がこの日時以降のファイルだけを探します。`"2026-10-31 09:00"` のような日時か、`2h`（2 時間前）・`30m`（30 分前）・`3d`（3 日前）のような今からの時間で書きます | 指定なし（すべてのファイル） |
+| `-Context` | 一致した行の前後に表示する行数（0～50）。`3` なら前後 3 行ずつ、`"2,10"` なら前 2 行・後ろ 10 行です | 2（前後 2 行ずつ） |
+| `-OutputFolder` | 結果の保存先 | スクリプトと同じフォルダ |
+| `-NoSave` | 結果を保存せず、画面表示だけにします | なし |
+| `-ConfigFile` | 設定ファイルのパス（[設定ファイル](#設定ファイル)を参照）。コマンドラインで指定した値は、設定ファイルより優先します | 指定なし |
+
+## 探す文字列の書き方
+
+- 既定では、書いた文字をそのまま探します。`.` や `(`、`\` も、ただの文字として扱います（`192.168.1.10` や `C:\data` もそのまま書けます）
+- `"timeout|refused"` のように `|` で区切ると、それぞれを「語」として、どれかを含む行を探します。語ごとの件数も集計します
+- `-Regex` を指定すると、正規表現（.NET の書き方）として扱います。このときは `|` で語に分けず、全体を 1 つの語として数えます
+- `|` そのものを探したいときや、正規表現の中で語を分けて数えたいときは、設定ファイルに `Pattern` の行を複数書きます。設定ファイルでは、1 行が 1 つの語です（`|` で分けません）
+- 大文字と小文字は、`-CaseSensitive` を指定しない限り区別しません
+
+## 画面の表示例
+
+```
+ログ横断検索 (Search-Log 1.0.0)
+対象: D:\logs（*.log, *.txt）   2026-10-31 15:30:00   SERVER01
+検索: timeout | refused（大文字と小文字を区別しない）   前 2 行・後ろ 2 行
+結果: 一致 5 行（3 ファイル）   調べたファイル 42 件   所要 1.2秒
+
+■ 語ごとの件数
+  timeout   4 行（2 ファイル）
+  refused   1 行（1 ファイル）
+
+■ D:\logs\app\app_20261031.log（UTF-8・3 行）
+   118  2026-10-31 09:12:01 INFO  request start id=4411
+   119  2026-10-31 09:12:03 INFO  calling db01
+>  120  2026-10-31 09:12:33 ERROR DB connection timeout (30s)
+   121  2026-10-31 09:12:33 INFO  retry 1/3
+   122  2026-10-31 09:12:34 INFO  calling db01
+  --
+>  245  2026-10-31 11:40:02 ERROR DB connection timeout (30s)
+...
+
+■ D:\logs\batch\job.txt（Shift_JIS・1 行）
+...
+
+保存先: C:\tools\SearchLog_SERVER01_20261031_153000
+```
+
+- 一致した行には `>` を付け、一致した部分を色で目立たせます。前後の行が続いていないところには `--` を入れます
+- 一致した行が近くにあって前後の行が重なるときは、同じ行を 2 回表示せず、1 つのまとまりにします
+- 画面に表示する一致は 200 行までです。超えた分は「（ほか 1,234 行は matches.txt を参照してください）」と表示します。保存するファイルには、すべてを書きます。`-NoSave` のときと保存できなかったときは、すべて表示します
+- 1 行が 500 文字を超えるときは、画面では 500 文字までにして `…` を付けます。保存するファイルには、そのまま書きます
+- 一致がなかったときは「一致なし」と表示します
+- 条件によって、次の行も表示します
+  - `-ConfigFile` を指定したとき：「対象」の次の行に「設定ファイル: D:\tools\search.ini」
+  - `-IgnorePattern` を指定したとき：「除く: healthcheck」
+  - `-Since` を指定したとき：「条件: 最終更新が 2026-10-31 13:30 以降のファイル（除いたファイル 120 件）」
+  - `-Exclude` を指定したとき：「除外: *\archive」
+  - 飛ばしたファイルがあったとき：「スキップ 3 件（権限なし 1・バイナリ 2）」
+
+## 保存されるファイル
+
+実行するたびに、保存先に `SearchLog_<ホスト名>_<日時>` というフォルダを作り、次のファイルを保存します。
+
+| ファイル | 内容 |
+| --- | --- |
+| `summary.txt` | 条件、語ごとの件数、ファイルごとの件数 |
+| `matches.txt` | 画面と同じ形の、すべての一致（前後の行付き） |
+| `matches.csv` | 一致した行の一覧 |
+| `skipped.csv` | 調べられなかったファイル・フォルダと、その理由 |
+
+テキストと CSV は BOM 付き UTF-8 で保存します。保存先に書き込めないときは警告を表示し、画面表示だけで終了します。
+
+### CSV の列
+
+| ファイル | 列 |
+| --- | --- |
+| `matches.csv` | ファイル、行番号、一致した語、一致した行、文字コード、最終更新日時 |
+| `skipped.csv` | 理由、パス、詳細 |
+
+- 一致した語は、1 つの行が複数の語に一致したときは `, ` で区切って書きます
+- 一致した行は、Excel の 1 つのセルに入る長さ（32,000 文字）までにします。`=` `+` `-` `@` で始まる行は、Excel で数式として扱われないようにして書きます
+- `skipped.csv` の理由は、「権限なし」「バイナリ」「リンク」「除外指定」「その他のエラー」のいずれかです
+
+## ファイルの読み方
+
+- **文字コード**：ファイルごとに判定します。BOM があればそれに従います。BOM がなければ、先頭の 1 MB が UTF-8 として正しければ UTF-8、そうでなければ Shift_JIS とみなします。先頭の 1 MB が英数字だけで、その後ろに Shift_JIS の日本語があるファイルは、日本語が化けることがあります
+- **書き込み中のログ**：ほかのプログラムが書き込んでいる最中のファイルも読めるように開きます。書き込みを妨げることはありません。読んでいる間に書き足された行は、含まれないことがあります
+- **大きなファイル**：1 行ずつ読むので、数 GB のログでもメモリを多く使いません
+- **バイナリファイル**：先頭の 8 KB に NUL（値が 0 のバイト）を含むファイルは、バイナリとみなして飛ばします。BOM のない UTF-16 のファイルも、ここで飛ばされます。圧縮ファイル（.zip、.gz）の中は探しません
+- **飛ばすもの**：ジャンクションやシンボリックリンクはたどりません。権限がなくて読めないフォルダやファイルは飛ばして、件数を表示します
+- **このツールの結果**：探すフォルダの中に、このツールの結果のフォルダ（`SearchLog_*`）があっても、その中は探しません（前回の結果に一致して、結果が増えていくのを防ぐためです）
+- 260 文字を超える長いパスや、名前に `[` `]` を含むフォルダ・ファイルも探せます
+
+## 設定ファイル
+
+同じ条件で繰り返し探すときは、パラメーターを設定ファイルにまとめておけます。設定ファイルを使わなくても、パラメーターだけで動きます。
+
+```ini
+# Search-Log の設定ファイル
+Path = \\ap01\logs
+Path = \\ap02\logs
+Filter = *.log
+# Pattern は 1 行に 1 語。| で分けないので、| そのものも探せる
+Pattern = timeout
+Pattern = connection refused
+Pattern = status=5|
+IgnorePattern = healthcheck
+Since = 1d
+Context = 2,10
+```
+
+- 書ける項目は、`Path`、`Pattern`、`Regex`、`CaseSensitive`、`IgnorePattern`、`Filter`、`Exclude`、`Since`、`Context`、`OutputFolder`、`NoSave` です
+- `Path`、`Pattern`、`IgnorePattern`、`Exclude` は、複数の行に分けて書けます（すべての行を合わせて使います）。`Pattern` と `IgnorePattern` は、1 行が 1 つの語です
+- `Regex`、`CaseSensitive`、`NoSave` は `true` か `false` で書きます
+- コマンドラインで `-Pattern` を指定すると、設定ファイルの `Pattern` は使いません（両方を合わせることはしません）。`-Path`、`-IgnorePattern`、`-Exclude` も同じです
+- そのほかの書き方と、書き間違いがあったときの動きは、[Get-DiskUsage の設定ファイル](../Get-DiskUsage/README.md#設定ファイル)と同じです
+
+## 終了コード
+
+| 終了コード | 意味 |
+| --- | --- |
+| 0 | 一致した行があった |
+| 2 | 一致した行がなかった |
+| 1 | 引数の誤りなどで、探せなかった |
+
+バッチファイルやタスクスケジューラから、「エラーが出ていたら通知する」といった判定に使えます。
+
+## 動作環境
+
+[リポジトリの README の「システム要件」](../../README.md#システム要件)を参照してください。管理者権限は不要です（読めないログがあるときは、管理者として実行してください）。
