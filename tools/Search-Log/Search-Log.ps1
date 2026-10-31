@@ -94,7 +94,7 @@ param(
 
     [string]$Since,
 
-    [string]$Context = '2',
+    [string[]]$Context = @('2'),
 
     [string]$OutputFolder,
 
@@ -117,6 +117,7 @@ $OutputPrefix  = 'SearchLog_'
 $Invariant     = [Globalization.CultureInfo]::InvariantCulture
 $Utf8Bom       = New-Object Text.UTF8Encoding $true
 $OnWindows     = [IO.Path]::DirectorySeparatorChar -eq '\'   # 開発用に Mac の pwsh でも動かせるようにするため
+$SniffBuffer   = New-Object 'byte[]' $SniffBytes   # 文字コードの判定に使う。ファイルごとに作ると、小さなファイルが多いときに遅いため使い回す
 
 #region 補助関数
 
@@ -282,7 +283,7 @@ function New-Wildcard([string]$Text, [bool]$AllowQuestion) {
 # 文字コードを判定する。BOM があればそれに従い、先頭に NUL があればバイナリ（$null）、
 # 先頭の SniffBytes が UTF-8 として正しければ UTF-8、そうでなければ Shift_JIS とみなす
 function Get-LogEncoding([IO.Stream]$Stream) {
-    $buffer = New-Object 'byte[]' $SniffBytes
+    $buffer = $SniffBuffer
     $read   = 0
     while ($read -lt $buffer.Length) {
         $n = $Stream.Read($buffer, $read, $buffer.Length - $read)
@@ -392,7 +393,7 @@ if ($ConfigFile) {
         if ($itemName -eq 'Pattern' -or $itemName -eq 'IgnorePattern') {
             # 1 行が 1 語。| では分けない（| そのものを探せるようにするため）
             if (-not $multiValues.ContainsKey($itemName)) { $multiValues[$itemName] = New-Object 'System.Collections.Generic.List[string]' }
-            $multiValues[$itemName].Add($rawValue.Trim().Trim('"'))
+            $multiValues[$itemName].Add($itemValue)
             continue
         }
         if ($itemName -eq 'Path' -or $itemName -eq 'Exclude' -or $itemName -eq 'OutputFolder') {
@@ -433,30 +434,8 @@ if ($ConfigFile) {
 
 #region 引数の確認
 
-$regexOptions = [Text.RegularExpressions.RegexOptions]'CultureInvariant, Compiled'
-if (-not $CaseSensitive) { $regexOptions = $regexOptions -bor [Text.RegularExpressions.RegexOptions]::IgnoreCase }
-
-# 探す語。設定ファイルの Pattern は 1 行が 1 語、コマンドラインの -Pattern は | で分ける（-Regex のときは分けない）
-$terms = @()
-if ($configTerms.ContainsKey('Pattern')) { $terms = @($configTerms['Pattern'] | Where-Object { $_ -ne '' }) }
-elseif ($Pattern) { $terms = Split-Term $Pattern }
-if ($terms.Count -eq 0) { Stop-WithError '探す文字列を -Pattern で指定してください（例: -Pattern "timeout|refused"）' }
-$termRegexes = @(foreach ($term in $terms) { New-TermRegex $term 'Pattern' })
-$matcherSource = (@(foreach ($r in $termRegexes) { '(?:' + $r.ToString() + ')' })) -join '|'
-$matcher = New-Object Text.RegularExpressions.Regex ($matcherSource, $regexOptions)
-
-$ignoreTerms = @()
-if ($configTerms.ContainsKey('IgnorePattern')) { $ignoreTerms = @($configTerms['IgnorePattern'] | Where-Object { $_ -ne '' }) }
-elseif ($IgnorePattern) { $ignoreTerms = Split-Term $IgnorePattern }
-$hasIgnore = $ignoreTerms.Count -gt 0
-$ignorer   = $null
-if ($hasIgnore) {
-    $ignoreSource = (@(foreach ($term in $ignoreTerms) { '(?:' + (New-TermRegex $term 'IgnorePattern').ToString() + ')' })) -join '|'
-    $ignorer = New-Object Text.RegularExpressions.Regex ($ignoreSource, $regexOptions)
-}
-
 # 前後の行数。"3" なら前後 3 行ずつ、"2,10" なら前 2 行・後ろ 10 行
-$contextText = (Remove-Quote $Context).Trim("'")
+$contextText = (Remove-Quote ($Context -join ',')).Trim("'")
 if ($contextText -notmatch '^\s*(\d{1,2})\s*(?:,\s*(\d{1,2})\s*)?$') {
     Stop-WithError (('-Context は 0～50 の数値か、"2,10" のように前と後ろの行数で指定してください: {0}' -f $contextText) + (Get-ConfigNote 'Context'))
 }
@@ -517,7 +496,8 @@ $pathTexts = @(
     if ($configApplied.ContainsKey('Path')) { $Path }
     else { foreach ($item in $Path) { foreach ($part in ($item -split ',')) { $part } } }
 )
-$roots = New-Object 'System.Collections.Generic.List[object]'
+$roots        = New-Object 'System.Collections.Generic.List[object]'
+$missingPaths = New-Object 'System.Collections.Generic.List[string]'
 foreach ($rawPath in $pathTexts) {
     $text = (Remove-Quote $rawPath).Trim("'")
     if ($text -eq '') { continue }
@@ -536,16 +516,49 @@ foreach ($rawPath in $pathTexts) {
     } elseif ($full -and [IO.File]::Exists((ConvertTo-LongPath $full))) {
         $roots.Add([pscustomobject]@{ Path = $full; IsFile = $true })
     } else {
-        Stop-WithError (('指定したフォルダかファイルが見つかりません: {0}' -f $text) + (Get-ConfigNote 'Path'))
+        $missingPaths.Add($text)
     }
 }
+if ($roots.Count -eq 0 -and $missingPaths.Count -gt 0) {
+    Stop-WithError (('指定したフォルダかファイルが見つかりません: {0}' -f ($missingPaths -join ', ')) + (Get-ConfigNote 'Path'))
+}
 if ($roots.Count -eq 0) { Stop-WithError '探すフォルダかファイルを -Path で指定してください' }
+foreach ($missing in $missingPaths) { Write-Warning ('見つからないため、探しません: {0}' -f $missing) }
 
 $outputText = $null
 if ($OutputFolder) {
     $outputText = Remove-Quote $OutputFolder
     if ($outputText.Contains('"')) { Stop-WithQuoteError '-OutputFolder' $outputText }
     $outputText = Resolve-StartPath $outputText
+}
+
+$regexOptions = [Text.RegularExpressions.RegexOptions]'CultureInvariant, Compiled'
+if (-not $CaseSensitive) { $regexOptions = $regexOptions -bor [Text.RegularExpressions.RegexOptions]::IgnoreCase }
+
+# 探す語。設定ファイルの Pattern は 1 行が 1 語、コマンドラインの -Pattern は | で分ける（-Regex のときは分けない）
+$terms = @()
+if ($configTerms.ContainsKey('Pattern')) { $terms = @($configTerms['Pattern'] | Where-Object { $_ -ne '' }) }
+elseif ($Pattern) { $terms = Split-Term $Pattern }
+if ($terms.Count -eq 0) { Stop-WithError '探す文字列を -Pattern で指定してください（例: -Pattern "timeout|refused"）' }
+$termRegexes = @(foreach ($term in $terms) { New-TermRegex $term 'Pattern' })
+# 正規表現の語が 2 つ以上あるときは、まとめると後方参照（\1 など）の番号がずれるため、1 つずつ試す
+$checkEach = $Regex -and $terms.Count -gt 1
+$matcherSource = (@(foreach ($r in $termRegexes) { '(?:' + $r.ToString() + ')' })) -join '|'
+$matcher = $null
+try { $matcher = New-Object Text.RegularExpressions.Regex ($matcherSource, $regexOptions) } catch { $checkEach = $true }
+
+$ignoreTerms = @()
+if ($configTerms.ContainsKey('IgnorePattern')) { $ignoreTerms = @($configTerms['IgnorePattern'] | Where-Object { $_ -ne '' }) }
+elseif ($IgnorePattern) { $ignoreTerms = Split-Term $IgnorePattern }
+$hasIgnore = $ignoreTerms.Count -gt 0
+$ignorer   = $null
+$ignoreRegexes = @()
+$ignoreEach    = $false
+if ($hasIgnore) {
+    $ignoreRegexes = @(foreach ($term in $ignoreTerms) { New-TermRegex $term 'IgnorePattern' })
+    $ignoreSource  = (@(foreach ($r in $ignoreRegexes) { '(?:' + $r.ToString() + ')' })) -join '|'
+    $ignoreEach = $Regex -and $ignoreTerms.Count -gt 1
+    try { $ignorer = New-Object Text.RegularExpressions.Regex ($ignoreSource, $regexOptions) } catch { $ignoreEach = $true }
 }
 
 #endregion
@@ -579,7 +592,7 @@ if (-not $NoSave) {
 #region 探す
 
 $skipped       = New-Object 'System.Collections.Generic.List[object]'
-$skipKinds     = [ordered]@{ '権限なし' = 0; 'バイナリ' = 0; 'その他のエラー' = 0 }
+$skipKinds     = [ordered]@{ '権限なし' = 0; 'バイナリ' = 0; '見つからない' = 0; 'その他のエラー' = 0 }
 $linkCount     = 0
 $excludedCount = 0
 $sinceSkipped  = 0
@@ -589,14 +602,23 @@ $matchFiles    = 0L    # 一致した行のあるファイル
 $termLines     = New-Object 'long[]' $terms.Count
 $termFiles     = New-Object 'long[]' $terms.Count
 $fileSummary   = New-Object 'System.Collections.Generic.List[object]'   # 一致のあったファイルごとの件数
-$screenBlocks  = New-Object 'System.Collections.Generic.List[object]'   # 画面に出すまとまり
-$screenLeft    = if ($runDir) { $ScreenMatches } else { [int]::MaxValue }
-$hiddenMatches = 0L
+
+# 画面には、保存するときは ScreenMatches 行まで出す。超えたら、その一致の後ろの行までは出して止める（screenTail）
+$screenLimit  = if ($runDir) { [long]$ScreenMatches } else { [long]::MaxValue }
+$screenOn     = $true
+$screenTail   = $false
+$shownMatches = 0L
 
 $dirType = [IO.DirectoryInfo]
 $rpFlag  = [IO.FileAttributes]::ReparsePoint
 $hsFlag  = [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
 $seen    = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+# Excel が数式・数値・日付に変える値（= + - @ で始まる、または数字と区切りの記号だけ）
+$excelRisk = New-Object Text.RegularExpressions.Regex ('^(?:[=+\-@]|[\d\s.,/:+\-]+$)')
+# 語が 1 つのときの「一致した語」の列（CSV の値として "" を重ねたもの）は、毎回同じなので先に作っておく
+$singleTermCell = $terms[0]
+if ($excelRisk.IsMatch($singleTermCell)) { $singleTermCell = '="' + $singleTermCell.Replace('"', '""') + '"' }
+$singleTermCell = $singleTermCell.Replace('"', '""')
 
 function Add-Skip([string]$Reason, [string]$ItemPath, [string]$Detail) {
     $skipped.Add([pscustomobject]@{ '理由' = $Reason; 'パス' = $ItemPath; '詳細' = $Detail })
@@ -608,8 +630,73 @@ function Add-SkipError([Exception]$Exception, [string]$ItemPath) {
     else { Add-Skip 'その他のエラー' $ItemPath (Get-ErrorText $Exception) }
 }
 
+# リパースポイントのうち、リンクと判定できたものの種類を返す（OneDrive のファイルやフォルダもリパースポイントなので、それ以外は $null）
+function Get-LinkName($Entry) {
+    if (($Entry.Attributes -band $rpFlag) -ne $rpFlag) { return $null }
+    $linkType = $null
+    try { $linkType = $Entry.LinkType } catch { }
+    if ($linkType -eq 'Junction') { return 'ジャンクション' }
+    if ($linkType -eq 'SymbolicLink') { return 'シンボリックリンク' }
+    # Windows が互換用に作ったリンク（All Users、Application Data など）は、5.1 では種類を判定できない。どれも隠し・システム属性付き
+    if ($Entry -is $dirType -and ($Entry.Attributes -band $hsFlag) -eq $hsFlag) { return 'Windows の互換用リンク' }
+    return $null
+}
+
+# 画面に 1 行出す。一致した行は、一致した部分を色で目立たせる（画面に出す行は限られるので、ここは関数でよい）
+function Show-Entry([string]$Kind, [long]$Number, [string]$Text) {
+    if ($Kind -eq 's') { Write-Host '  --' -ForegroundColor DarkGray; return }
+    if ($Text.Length -gt $ScreenWidth) { $Text = $Text.Substring(0, $ScreenWidth) + '…' }
+    if ($Kind -eq 'c') { Write-Host (' ' + $Number.ToString($Invariant).PadLeft(6) + '  ' + $Text); return }
+    Write-Host ('>' + $Number.ToString($Invariant).PadLeft(6) + '  ') -NoNewline -ForegroundColor Yellow
+    # 語ごとに一致した範囲を集め、重なりを除いて左から色を付ける
+    $ranges = @(foreach ($r in $termRegexes) { foreach ($m in $r.Matches($Text)) { if ($m.Length -gt 0) { , @($m.Index, $m.Length) } } })
+    $ranges = @($ranges | Sort-Object -Property @{ Expression = { $_[0] } }, @{ Expression = { $_[1] }; Descending = $true })
+    $pos = 0
+    foreach ($range in $ranges) {
+        if ($range[0] -lt $pos) { continue }
+        if ($range[0] -gt $pos) { Write-Host $Text.Substring($pos, $range[0] - $pos) -NoNewline }
+        Write-Host $Text.Substring($range[0], $range[1]) -NoNewline -ForegroundColor Yellow
+        $pos = $range[0] + $range[1]
+    }
+    Write-Host $Text.Substring($pos)
+}
+
 $textWriter = $null
 $csvWriter  = $null
+
+# 保存の途中で書けなくなったら、書きかけの結果は残さない（最後にフォルダごと消す）。
+# 画面の上限は外し、ここから先の一致はすべて画面に出す
+function Stop-Saving([Exception]$Exception) {
+    $script:saveError = Get-ErrorText (Get-InnerException $Exception)
+    if ($script:textWriter) { try { $script:textWriter.Dispose() } catch { } }
+    if ($script:csvWriter) { try { $script:csvWriter.Dispose() } catch { } }
+    $script:textWriter  = $null
+    $script:csvWriter   = $null
+    $script:screenLimit = [long]::MaxValue
+    if (-not $script:screenOn -or $script:screenTail) {
+        $script:screenOn   = $true
+        $script:screenTail = $false
+        Write-Host ''
+        Write-Host '（保存できなくなったため、ここから先の一致はすべて画面に表示します）' -ForegroundColor Yellow
+    }
+}
+
+# 条件は先に表示し、結果の件数は探し終わってから表示する（一致は見つけしだい表示する）
+$header = New-Object 'System.Collections.Generic.List[string]'
+$header.Add((Format-Invariant 'ログ横断検索 (Search-Log {0})' $ScriptVersion))
+$targetText = ($roots | ForEach-Object { $_.Path }) -join ', '
+if (@($roots | Where-Object { -not $_.IsFile }).Count -gt 0) { $targetText += '（{0}）' -f (($filterRules | ForEach-Object { $_.Text }) -join ', ') }
+$header.Add((Format-Invariant '対象: {0}   {1:yyyy-MM-dd HH:mm:ss}   {2}' $targetText $startTime $machineName))
+if ($configPath) { $header.Add(('設定ファイル: {0}' -f $configPath)) }
+$modeText = $(if ($CaseSensitive) { '大文字と小文字を区別する' } else { '大文字と小文字を区別しない' })
+if ($Regex) { $modeText = '正規表現・' + $modeText }
+$header.Add(('検索: {0}（{1}）   前 {2} 行・後ろ {3} 行' -f ($terms -join ' | '), $modeText, $beforeCount, $afterCount))
+if ($hasIgnore) { $header.Add(('除く: {0}' -f ($ignoreTerms -join ' | '))) }
+if ($sinceTime) { $header.Add((Format-Invariant '条件: 最終更新が {0:yyyy-MM-dd HH:mm} 以降のファイル' $sinceTime)) }
+if ($hasExclude) { $header.Add(('除外: {0}' -f (($excludeRules | ForEach-Object { $_.Text }) -join ', '))) }
+foreach ($line in $header) { Write-Host $line }
+foreach ($missing in $missingPaths) { Add-Skip '見つからない' $missing '指定したフォルダかファイルが見つかりません' }
+
 $sw           = [Diagnostics.Stopwatch]::StartNew()
 $nextProgress = 0L
 $finished     = $false
@@ -620,7 +707,7 @@ try {
             $csvWriter  = New-Object IO.StreamWriter ((Join-Path $runDir 'matches.csv'), $false, $Utf8Bom)
             $csvWriter.WriteLine('"ファイル","行番号","一致した語","一致した行","文字コード","最終更新日時"')
         } catch {
-            $saveError = Get-ErrorText (Get-InnerException $_.Exception)
+            Stop-Saving $_.Exception
         }
     }
 
@@ -642,29 +729,23 @@ try {
                 }
                 foreach ($entry in $entries) {
                     $entryPath = ConvertTo-DisplayPath $entry.FullName
-                    if ($entry -is $dirType) {
-                        # このツールの結果のフォルダは探さない（前回の結果に一致して、結果が増えていくのを防ぐため）
-                        if ($entry.Name.StartsWith($OutputPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
-                        if (($entry.Attributes -band $rpFlag) -eq $rpFlag) {
-                            # OneDrive のフォルダもリパースポイントなので、リンクと判定できたものだけを飛ばす
-                            $linkType = $null
-                            try { $linkType = $entry.LinkType } catch { }
-                            $linkName = $null
-                            if ($linkType -eq 'Junction') { $linkName = 'ジャンクション' }
-                            elseif ($linkType -eq 'SymbolicLink') { $linkName = 'シンボリックリンク' }
-                            elseif (($entry.Attributes -band $hsFlag) -eq $hsFlag) { $linkName = 'Windows の互換用リンク' }
-                            if ($linkName) { $linkCount++; Add-Skip 'リンク' $entryPath $linkName; continue }
-                        }
-                    }
+                    $isDir     = $entry -is $dirType
+                    # このツールの結果のフォルダは探さない（前回の結果に一致して、結果が増えていくのを防ぐため）
+                    if ($isDir -and $entry.Name.StartsWith($OutputPrefix, [StringComparison]::OrdinalIgnoreCase)) { continue }
                     if ($hasExclude) {
                         $matched = $null
                         foreach ($rule in $excludeRules) { if ($rule.Matcher.IsMatch($entryPath)) { $matched = $rule.Text; break } }
                         if ($matched) { $excludedCount++; Add-Skip '除外指定' $entryPath $matched; continue }
                     }
-                    if ($entry -is $dirType) { $stack.Push($entry); continue }
-                    $nameOk = $false
-                    foreach ($rule in $filterRules) { if ($rule.Matcher.IsMatch($entry.Name)) { $nameOk = $true; break } }
-                    if ($nameOk) { $files.Add($entry) }
+                    if (-not $isDir) {
+                        $nameOk = $false
+                        foreach ($rule in $filterRules) { if ($rule.Matcher.IsMatch($entry.Name)) { $nameOk = $true; break } }
+                        if (-not $nameOk) { continue }
+                    }
+                    # フォルダもファイルも、リンクはたどらない（同じ内容を二重に数えたり、探す範囲の外を読んだりしないため）
+                    $linkName = Get-LinkName $entry
+                    if ($linkName) { $linkCount++; Add-Skip 'リンク' $entryPath $linkName; continue }
+                    if ($isDir) { $stack.Push($entry) } else { $files.Add($entry) }
                 }
             }
         }
@@ -701,40 +782,99 @@ try {
                     continue
                 }
                 $encodingName = $encodingInfo[1]
-                $modifiedText = $file.LastWriteTime.ToString('yyyy/MM/dd HH:mm:ss', $Invariant)
                 [void]$stream.Seek(0, [IO.SeekOrigin]::Begin)
                 $reader = New-Object IO.StreamReader ($stream, $encodingInfo[0], $true, 65536)
                 $fileCount++
 
-                # 1 行ずつ読む。行の数が多いため、この中では関数を呼ばない
-                $entries    = New-Object 'System.Collections.Generic.List[object]'   # (種類, 行番号, 内容, 一致した語)
-                $prevNos    = New-Object 'System.Collections.Generic.Queue[long]'
-                $prevTexts  = New-Object 'System.Collections.Generic.Queue[string]'
-                $lineNo     = 0L
-                $lastShown  = 0L
-                $afterLeft  = 0
-                $fileHits   = 0L
+                # CSV の行のうち、ファイルごとに同じ部分は先に作っておく
+                $titleLine = '■ ' + $displayPath + '（' + $encodingName + '）'
+                $csvHead   = '"' + $displayPath.Replace('"', '""') + '","'
+                $csvTail   = '","' + $encodingName + '","' + $file.LastWriteTime.ToString('yyyy/MM/dd HH:mm:ss', $Invariant) + '"'
+
+                # 1 行ずつ読む。行の数が多いため、この中では関数を呼ばず、一致したらすぐに書き出す（画面に出す行だけ関数を呼ぶ）
+                $prevNos     = New-Object 'System.Collections.Generic.Queue[long]'
+                $prevTexts   = New-Object 'System.Collections.Generic.Queue[string]'
+                $lineNo      = 0L
+                $lastShown   = 0L
+                $afterLeft   = 0
+                $fileHits    = 0L
                 $fileTermHit = New-Object 'bool[]' $terms.Count
                 while ($null -ne ($line = $reader.ReadLine())) {
                     $lineNo++
-                    if ($matcher.IsMatch($line) -and -not ($hasIgnore -and $ignorer.IsMatch($line))) {
+                    if (($lineNo -band 0xFFFF) -eq 0 -and $sw.ElapsedMilliseconds -ge $nextProgress) {
+                        # 大きなファイルでも止まって見えないよう、読んでいる途中でも進捗を出す
+                        Write-Progress -Activity 'ログ横断検索' -Status ('ファイル {0:N0} 件 / 一致 {1:N0} 行' -f $fileCount, ($matchTotal + $fileHits)) -CurrentOperation ('{0}（{1:N0} 行目）' -f $displayPath, $lineNo)
+                        $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
+                    }
+                    if ($checkEach) {
+                        $hit = $false
+                        foreach ($r in $termRegexes) { if ($r.IsMatch($line)) { $hit = $true; break } }
+                    } else {
+                        $hit = $matcher.IsMatch($line)
+                    }
+                    if ($hit -and $hasIgnore) {
+                        if ($ignoreEach) { foreach ($r in $ignoreRegexes) { if ($r.IsMatch($line)) { $hit = $false; break } } }
+                        elseif ($ignorer.IsMatch($line)) { $hit = $false }
+                    }
+
+                    if ($hit) {
+                        # 画面の上限に達したあとは、その一致の後ろの行まで出したら止める
+                        if ($screenTail) { $screenOn = $false; $screenTail = $false }
+                        if ($fileHits -eq 0) {
+                            if ($textWriter) { try { $textWriter.WriteLine($titleLine) } catch { Stop-Saving $_.Exception } }
+                            if ($screenOn) { Write-Host ''; Write-Host $titleLine -ForegroundColor Cyan }
+                        }
                         $firstNo = if ($prevNos.Count -gt 0) { $prevNos.Peek() } else { $lineNo }
-                        if ($lastShown -gt 0 -and $firstNo -gt $lastShown + 1) { $entries.Add(@('s', 0L, '', '')) }
-                        while ($prevNos.Count -gt 0) { $entries.Add(@('c', $prevNos.Dequeue(), $prevTexts.Dequeue(), '')) }
-                        $hitTerms = @()
-                        for ($t = 0; $t -lt $termRegexes.Count; $t++) {
-                            if ($termRegexes[$t].IsMatch($line)) {
-                                $hitTerms += $terms[$t]
-                                $termLines[$t]++
-                                $fileTermHit[$t] = $true
+                        if ($lastShown -gt 0 -and $firstNo -gt $lastShown + 1) {
+                            if ($textWriter) { try { $textWriter.WriteLine('  --') } catch { Stop-Saving $_.Exception } }
+                            if ($screenOn) { Show-Entry 's' 0 '' }
+                        }
+                        while ($prevNos.Count -gt 0) {
+                            $no   = $prevNos.Dequeue()
+                            $text = $prevTexts.Dequeue()
+                            if ($textWriter) { try { $textWriter.WriteLine(' ' + $no.ToString($Invariant).PadLeft(6) + '  ' + $text) } catch { Stop-Saving $_.Exception } }
+                            if ($screenOn) { Show-Entry 'c' $no $text }
+                        }
+
+                        # 一致した語。語が 1 つなら数えるだけにして、一致の多いログでも遅くならないようにする
+                        if ($terms.Count -eq 1) {
+                            $termLines[0]++
+                            $fileTermHit[0] = $true
+                            $termCell = $singleTermCell
+                        } else {
+                            $termText = ''
+                            for ($t = 0; $t -lt $termRegexes.Count; $t++) {
+                                if ($termRegexes[$t].IsMatch($line)) {
+                                    $termText = if ($termText) { $termText + ', ' + $terms[$t] } else { $terms[$t] }
+                                    $termLines[$t]++
+                                    $fileTermHit[$t] = $true
+                                }
+                            }
+                            if ($excelRisk.IsMatch($termText)) { $termText = '="' + $termText.Replace('"', '""') + '"' }
+                            $termCell = $termText.Replace('"', '""')
+                        }
+                        if ($textWriter) {
+                            try {
+                                $textWriter.WriteLine('>' + $lineNo.ToString($Invariant).PadLeft(6) + '  ' + $line)
+                                # Excel のセルに入る長さにし、数式・数値・日付に変わる値は ="..." で囲む（式に書けない 255 文字を超える値は、先頭に空白を足す）
+                                $cell = if ($line.Length -gt $CellLimit) { $line.Substring(0, $CellLimit) } else { $line }
+                                if ($excelRisk.IsMatch($cell)) { if ($cell.Length -le 255) { $cell = '="' + $cell.Replace('"', '""') + '"' } else { $cell = ' ' + $cell } }
+                                $csvWriter.WriteLine($csvHead + $lineNo.ToString($Invariant) + '","' + $termCell + '","' + $cell.Replace('"', '""') + $csvTail)
+                            } catch {
+                                Stop-Saving $_.Exception
                             }
                         }
-                        $entries.Add(@('m', $lineNo, $line, ($hitTerms -join ', ')))
+                        if ($screenOn) {
+                            Show-Entry 'm' $lineNo $line
+                            $shownMatches++
+                            if ($shownMatches -ge $screenLimit) { $screenTail = $true }
+                        }
                         $fileHits++
                         $lastShown = $lineNo
                         $afterLeft = $afterCount
                     } elseif ($afterLeft -gt 0) {
-                        $entries.Add(@('c', $lineNo, $line, ''))
+                        if ($textWriter) { try { $textWriter.WriteLine(' ' + $lineNo.ToString($Invariant).PadLeft(6) + '  ' + $line) } catch { Stop-Saving $_.Exception } }
+                        if ($screenOn) { Show-Entry 'c' $lineNo $line }
                         $lastShown = $lineNo
                         $afterLeft--
                     } elseif ($beforeCount -gt 0) {
@@ -745,47 +885,11 @@ try {
                 }
                 if ($fileHits -eq 0) { continue }
 
+                if ($textWriter) { try { $textWriter.WriteLine('') } catch { Stop-Saving $_.Exception } }
                 $matchTotal += $fileHits
                 $matchFiles++
                 for ($t = 0; $t -lt $terms.Count; $t++) { if ($fileTermHit[$t]) { $termFiles[$t]++ } }
-                $blockTitle = Format-Invariant '■ {0}（{1}・{2:N0} 行）' $displayPath $encodingName $fileHits
                 $fileSummary.Add([pscustomobject]@{ Path = $displayPath; Encoding = $encodingName; Hits = $fileHits })
-
-                # 保存するファイルには、すべてを書く
-                if ($textWriter -and -not $saveError) {
-                    try {
-                        $textWriter.WriteLine($blockTitle)
-                        foreach ($e in $entries) {
-                            if ($e[0] -eq 's') { $textWriter.WriteLine('  --'); continue }
-                            $textWriter.WriteLine((Format-Invariant '{0}{1,6}  {2}' $(if ($e[0] -eq 'm') { '>' } else { ' ' }) $e[1] $e[2]))
-                            if ($e[0] -eq 'm') {
-                                $cell = if ($e[2].Length -gt $CellLimit) { $e[2].Substring(0, $CellLimit) } else { $e[2] }
-                                $csvWriter.WriteLine(((ConvertTo-CsvField $displayPath $false), (ConvertTo-CsvField ([string]$e[1]) $false),
-                                    (ConvertTo-CsvField $e[3] $true), (ConvertTo-CsvField $cell $true),
-                                    (ConvertTo-CsvField $encodingName $false), (ConvertTo-CsvField $modifiedText $false)) -join ',')
-                            }
-                        }
-                        $textWriter.WriteLine('')
-                    } catch {
-                        $saveError = Get-ErrorText (Get-InnerException $_.Exception)
-                    }
-                }
-
-                # 画面には ScreenMatches 行まで。超えたところで、そのファイルの残りも打ち切る
-                if ($screenLeft -gt 0) {
-                    $shown = New-Object 'System.Collections.Generic.List[object]'
-                    foreach ($e in $entries) {
-                        if ($e[0] -eq 'm') {
-                            if ($screenLeft -le 0) { break }
-                            $screenLeft--
-                        }
-                        $shown.Add($e)
-                    }
-                    $screenBlocks.Add([pscustomobject]@{ Title = $blockTitle; Entries = $shown })
-                    $hiddenMatches += $fileHits - @($shown | Where-Object { $_[0] -eq 'm' }).Count
-                } else {
-                    $hiddenMatches += $fileHits
-                }
             } catch {
                 Add-SkipError (Get-InnerException $_.Exception) $displayPath
             } finally {
@@ -798,35 +902,26 @@ try {
 
     #region 結果のまとめ
 
-    $header = New-Object 'System.Collections.Generic.List[string]'
-    $header.Add((Format-Invariant 'ログ横断検索 (Search-Log {0})' $ScriptVersion))
-    $targetText = ($roots | ForEach-Object { $_.Path }) -join ', '
-    if (@($roots | Where-Object { -not $_.IsFile }).Count -gt 0) { $targetText += '（{0}）' -f (($filterRules | ForEach-Object { $_.Text }) -join ', ') }
-    $header.Add((Format-Invariant '対象: {0}   {1:yyyy-MM-dd HH:mm:ss}   {2}' $targetText $startTime $machineName))
-    if ($configPath) { $header.Add(('設定ファイル: {0}' -f $configPath)) }
-    $modeText = $(if ($CaseSensitive) { '大文字と小文字を区別する' } else { '大文字と小文字を区別しない' })
-    if ($Regex) { $modeText = '正規表現・' + $modeText }
-    $header.Add(('検索: {0}（{1}）   前 {2} 行・後ろ {3} 行' -f ($terms -join ' | '), $modeText, $beforeCount, $afterCount))
-    if ($hasIgnore) { $header.Add(('除く: {0}' -f ($ignoreTerms -join ' | '))) }
-    if ($sinceTime) { $header.Add((Format-Invariant '条件: 最終更新が {0:yyyy-MM-dd HH:mm} 以降のファイル（除いたファイル {1:N0} 件）' $sinceTime $sinceSkipped)) }
-    if ($hasExclude) { $header.Add(('除外: {0}' -f (($excludeRules | ForEach-Object { $_.Text }) -join ', '))) }
+    $footer = New-Object 'System.Collections.Generic.List[string]'
     if ($matchTotal -gt 0) {
-        $header.Add((Format-Invariant '結果: 一致 {0:N0} 行（{1:N0} ファイル）   調べたファイル {2:N0} 件   所要 {3}' $matchTotal $matchFiles $fileCount (Format-Duration $elapsed)))
+        $footer.Add((Format-Invariant '結果: 一致 {0:N0} 行（{1:N0} ファイル）   調べたファイル {2:N0} 件   所要 {3}' $matchTotal $matchFiles $fileCount (Format-Duration $elapsed)))
     } else {
-        $header.Add((Format-Invariant '結果: 一致なし   調べたファイル {0:N0} 件   所要 {1}' $fileCount (Format-Duration $elapsed)))
+        $footer.Add((Format-Invariant '結果: 一致なし   調べたファイル {0:N0} 件   所要 {1}' $fileCount (Format-Duration $elapsed)))
     }
     $notes = @()
     $kinds = @(foreach ($k in $skipKinds.Keys) { if ($skipKinds[$k] -gt 0) { , @($k, $skipKinds[$k]) } })
     if ($kinds.Count -gt 0) {
-        $total = 0; foreach ($k in $kinds) { $total += $k[1] }
+        $total = 0
+        foreach ($k in $kinds) { $total += $k[1] }
         if ($kinds.Count -eq 1) { $notes += Format-Invariant 'スキップ {0:N0} 件（{1}）' $total $kinds[0][0] }
         else { $notes += Format-Invariant 'スキップ {0:N0} 件（{1}）' $total (($kinds | ForEach-Object { Format-Invariant '{0} {1:N0}' $_[0] $_[1] }) -join '・') }
     }
     if ($linkCount -gt 0) { $notes += Format-Invariant 'たどらなかったリンク {0:N0} 件' $linkCount }
     if ($excludedCount -gt 0) { $notes += Format-Invariant '除外したフォルダ・ファイル {0:N0} 件' $excludedCount }
-    if ($notes.Count -gt 0) { $header.Add($notes -join '  ') }
+    if ($sinceTime) { $notes += Format-Invariant '最終更新で除いたファイル {0:N0} 件' $sinceSkipped }
+    if ($notes.Count -gt 0) { $footer.Add($notes -join '  ') }
 
-    # 語ごとの件数（語が 2 つ以上のとき）
+    # 語ごとの件数（語が 2 つ以上で、一致があったとき）
     $termTable = New-Object 'System.Collections.Generic.List[string]'
     if ($terms.Count -gt 1 -and $matchTotal -gt 0) {
         $width = 0
@@ -842,69 +937,56 @@ try {
 
     #region 保存
 
-    if ($runDir) {
+    if ($runDir -and -not $saveError) {
         try {
-            if ($textWriter) { $textWriter.Dispose(); $textWriter = $null }
-            if ($csvWriter) { $csvWriter.Dispose(); $csvWriter = $null }
-            if (-not $saveError) {
-                $summary = New-Object 'System.Collections.Generic.List[string]'
-                $summary.AddRange([string[]]$header)
-                if ($termTable.Count -gt 0) { $summary.Add(''); $summary.AddRange([string[]]$termTable) }
-                $summary.Add('')
-                $summary.Add('■ ファイルごとの件数')
-                if ($fileSummary.Count -eq 0) { $summary.Add('  （一致なし）') }
-                foreach ($f in $fileSummary) { $summary.Add((Format-Invariant '  {0,8:N0} 行  {1,-9}  {2}' $f.Hits $f.Encoding $f.Path)) }
-                [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$summary, $Utf8Bom)
+            $textWriter.Dispose(); $textWriter = $null
+            $csvWriter.Dispose(); $csvWriter = $null
 
-                $lines = @('"理由","パス","詳細"') + @(foreach ($s in $skipped) {
-                    ((ConvertTo-CsvField $s.'理由' $false), (ConvertTo-CsvField $s.'パス' $false), (ConvertTo-CsvField $s.'詳細' $false)) -join ','
-                })
-                [IO.File]::WriteAllLines((Join-Path $runDir 'skipped.csv'), [string[]]$lines, $Utf8Bom)
-            }
+            $summary = New-Object 'System.Collections.Generic.List[string]'
+            $summary.AddRange([string[]]$header)
+            $summary.AddRange([string[]]$footer)
+            if ($termTable.Count -gt 0) { $summary.Add(''); $summary.AddRange([string[]]$termTable) }
+            $summary.Add('')
+            $summary.Add('■ ファイルごとの件数')
+            if ($fileSummary.Count -eq 0) { $summary.Add('  （一致なし）') }
+            foreach ($f in $fileSummary) { $summary.Add((Format-Invariant '  {0,8:N0} 行  {1,-9}  {2}' $f.Hits $f.Encoding $f.Path)) }
+            [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$summary, $Utf8Bom)
+
+            $lines = @('"理由","パス","詳細"') + @(foreach ($s in $skipped) {
+                '"' + $s.'理由' + '","' + $s.'パス'.Replace('"', '""') + '","' + $s.'詳細'.Replace('"', '""') + '"'
+            })
+            [IO.File]::WriteAllLines((Join-Path $runDir 'skipped.csv'), [string[]]$lines, $Utf8Bom)
         } catch {
             $saveError = Get-ErrorText (Get-InnerException $_.Exception)
         }
-        if ($saveError) {
-            # 書きかけの結果は残さない。消すのは、このツールが作った保存先のフォルダだけ
-            try { [IO.Directory]::Delete($runDir, $true) } catch { }
-        }
+    }
+    if ($runDir -and $saveError) {
+        # 書きかけの結果は残さない。消すのは、このツールが作った保存先のフォルダだけ
+        if ($textWriter) { try { $textWriter.Dispose() } catch { } }
+        if ($csvWriter) { try { $csvWriter.Dispose() } catch { } }
+        $textWriter = $null
+        $csvWriter  = $null
+        try { [IO.Directory]::Delete($runDir, $true) } catch { }
     }
 
     #endregion
 
-    #region 画面表示
+    #region 結果の表示
 
-    foreach ($line in $header) { Write-Host $line }
+    $hiddenMatches = $matchTotal - $shownMatches
+    if ($hiddenMatches -gt 0) {
+        Write-Host ''
+        if ($saveError) {
+            Write-Host (Format-Invariant '（保存できなかったため、ほか {0:N0} 行は表示していません）' $hiddenMatches) -ForegroundColor Yellow
+        } else {
+            Write-Host (Format-Invariant '（ほか {0:N0} 行は matches.txt を参照してください）' $hiddenMatches) -ForegroundColor Yellow
+        }
+    }
+    Write-Host ''
+    foreach ($line in $footer) { Write-Host $line }
     if ($termTable.Count -gt 0) {
         Write-Host ''
         foreach ($line in $termTable) { if ($line.StartsWith('■')) { Write-Host $line -ForegroundColor Cyan } else { Write-Host $line } }
-    }
-    foreach ($block in $screenBlocks) {
-        Write-Host ''
-        Write-Host $block.Title -ForegroundColor Cyan
-        foreach ($e in $block.Entries) {
-            if ($e[0] -eq 's') { Write-Host '  --' -ForegroundColor DarkGray; continue }
-            $text = $e[2]
-            if ($text.Length -gt $ScreenWidth) { $text = $text.Substring(0, $ScreenWidth) + '…' }
-            if ($e[0] -eq 'c') { Write-Host (Format-Invariant ' {0,6}  {1}' $e[1] $text); continue }
-            # 一致した行は、一致した部分を色で目立たせる
-            Write-Host (Format-Invariant '>{0,6}  ' $e[1]) -NoNewline -ForegroundColor Yellow
-            $pos = 0
-            foreach ($m in $matcher.Matches($text)) {
-                if ($m.Length -eq 0) { continue }
-                if ($m.Index -gt $pos) { Write-Host $text.Substring($pos, $m.Index - $pos) -NoNewline }
-                Write-Host $m.Value -NoNewline -ForegroundColor Yellow
-                $pos = $m.Index + $m.Length
-            }
-            Write-Host $text.Substring($pos)
-        }
-    }
-    if ($hiddenMatches -gt 0 -and $runDir -and -not $saveError) {
-        Write-Host ''
-        Write-Host (Format-Invariant '（ほか {0:N0} 行は matches.txt を参照してください）' $hiddenMatches) -ForegroundColor Yellow
-    } elseif ($hiddenMatches -gt 0) {
-        Write-Host ''
-        Write-Host (Format-Invariant '（保存できなかったため、ほか {0:N0} 行は表示していません）' $hiddenMatches) -ForegroundColor Yellow
     }
 
     #endregion
@@ -920,6 +1002,8 @@ try {
         Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow
     }
 }
+
+#endregion
 
 if ($saveError) {
     Write-Host ''
