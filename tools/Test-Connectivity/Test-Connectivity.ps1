@@ -101,6 +101,15 @@ $Utf8Bom       = New-Object Text.UTF8Encoding $true
 $Utf8NoBom     = New-Object Text.UTF8Encoding $false
 $Columns       = @('No', '判定', 'ホスト', 'IP アドレス', 'ping', '応答時間(ms)', 'ポート', 'TCP', '接続時間(ms)', 'メモ', '確認日時', '詳細')
 $ChangeColumns = @('日時', 'No', 'ホスト', 'ポート', '変化前', '変化後', '詳細')
+$clock         = [Diagnostics.Stopwatch]::StartNew()   # 接続時間などを測る共通の時計
+
+# .NET Framework の名前解決はスレッドプールの上で 1 件ずつ止まって待つため、応答の遅い名前が多いと
+# スレッドが足りなくなり、後ろの正常な名前まで待ち時間を超えてしまう。同時に確かめる数だけ、スレッドを先に用意しておく
+try {
+    $minWorker = 0; $minIo = 0
+    [Threading.ThreadPool]::GetMinThreads([ref]$minWorker, [ref]$minIo)
+    if ($minWorker -lt $BatchSize * 2) { [void][Threading.ThreadPool]::SetMinThreads($BatchSize * 2, $minIo) }
+} catch { }
 
 #region 補助関数
 
@@ -137,9 +146,10 @@ function Get-ErrorText([Exception]$Exception) {
 }
 
 # Excel は「001」「2026-10-31」のような値を数値や日付に変えてしまうため、文字のまま見せたい値は ="..." の形で出す
+# 値の中の " は "" に重ねる。Excel の式に書ける文字列は 255 文字までなので、それより長い値は囲まずにそのまま出す
 function ConvertTo-ExcelText([string]$Text) {
-    if ($Text -eq '') { return '' }
-    return '="' + $Text + '"'
+    if ($Text -eq '' -or $Text.Length -gt 255) { return $Text }
+    return '="' + $Text.Replace('"', '""') + '"'
 }
 
 # 5.1 と 7 のどちらでも BOM 付き UTF-8 で保存する（Export-Csv の -Encoding UTF8 は 7 だと BOM なしになる）。
@@ -242,17 +252,23 @@ function Expand-ConfigVariable([int]$LineNumber, [string]$Text) {
     return $expanded
 }
 
-# CSV の 1 行を列に分ける。"" で囲んだ値（カンマや "" を含む値）にも対応する。
+# CSV の全体を、レコード（Line = 始まりの行番号、Fields = 列の値）に分ける。
+# "" で囲んだ値の中のカンマ・""・改行（Excel のセル内改行）にも対応するため、行に分けてからではなく 1 文字ずつ読む。
 # ConvertFrom-Csv は、Excel が付ける空の見出しが 2 つ以上あると止まり、何行目かも分からないため使わない
-function Split-CsvLine([string]$Line) {
-    $fields  = New-Object 'System.Collections.Generic.List[string]'
-    $current = New-Object Text.StringBuilder
-    $quoted  = $false
-    for ($i = 0; $i -lt $Line.Length; $i++) {
-        $ch = $Line[$i]
-        if ($quoted) {
+function ConvertFrom-CsvText([string]$Text) {
+    $records    = New-Object 'System.Collections.Generic.List[object]'
+    $fields     = New-Object 'System.Collections.Generic.List[string]'
+    $current    = New-Object Text.StringBuilder
+    $quoted     = $false
+    $lineNumber = 1
+    $startLine  = 1
+    for ($i = 0; $i -le $Text.Length; $i++) {
+        $atEnd = $i -eq $Text.Length
+        $ch    = if ($atEnd) { [char]0 } else { $Text[$i] }
+        if (-not $atEnd -and ($ch -eq "`n" -or ($ch -eq "`r" -and -not ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq "`n")))) { $lineNumber++ }
+        if ($quoted -and -not $atEnd) {
             if ($ch -eq '"') {
-                if ($i + 1 -lt $Line.Length -and $Line[$i + 1] -eq '"') { [void]$current.Append('"'); $i++ } else { $quoted = $false }
+                if ($i + 1 -lt $Text.Length -and $Text[$i + 1] -eq '"') { [void]$current.Append('"'); $i++ } else { $quoted = $false }
             } else {
                 [void]$current.Append($ch)
             }
@@ -261,12 +277,37 @@ function Split-CsvLine([string]$Line) {
         } elseif ($ch -eq ',') {
             $fields.Add($current.ToString())
             [void]$current.Clear()
+        } elseif ($atEnd -or $ch -eq "`r" -or $ch -eq "`n") {
+            # CRLF は、CR のところでレコードを閉じ、LF は空のレコードとして読み飛ばす
+            $fields.Add($current.ToString())
+            [void]$current.Clear()
+            $isBlank = $fields.Count -eq 1 -and $fields[0].Trim() -eq ''
+            if (-not $isBlank) { $records.Add([pscustomobject]@{ Line = $startLine; Fields = $fields.ToArray() }) }
+            $fields.Clear()
+            $startLine = $lineNumber
         } else {
             [void]$current.Append($ch)
         }
     }
-    $fields.Add($current.ToString())
-    return , $fields.ToArray()
+    return , $records.ToArray()
+}
+
+# IP アドレスとして書かれた値なら IPAddress を、そうでなければ $null を返す（$null のときは名前解決する）。
+# IPAddress.TryParse は「001」を 0.0.0.1 と、「192.168.001.010」を 8 進数として 192.168.1.8 と読むため、
+# IPv4 は 4 つの数字を 10 進数として自分で読む。IPv6 は : を含むものだけを TryParse に任せる
+function ConvertTo-IPAddress([string]$Text) {
+    if ($Text -match '^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$') {
+        $bytes = New-Object 'byte[]' 4
+        for ($i = 0; $i -lt 4; $i++) {
+            $part = [int]::Parse($Matches[$i + 1], $Invariant)
+            if ($part -gt 255) { return $null }
+            $bytes[$i] = [byte]$part
+        }
+        return New-Object Net.IPAddress (, $bytes)
+    }
+    $parsed = $null
+    if ($Text.Contains(':') -and [Net.IPAddress]::TryParse($Text, [ref]$parsed)) { return $parsed }
+    return $null
 }
 
 # ポートは 1～65535 の数値だけを受け付ける（+80 や 80.0 のような書き方は誤りとして扱う）
@@ -298,18 +339,18 @@ function Format-Cell([string]$Text, [int]$Width, [bool]$AlignRight) {
 
 #region 確かめる処理
 
-# 非同期の処理（Task）を、待ち時間まで見回り、終わったときの経過時間を記録する。
-# Task.Wait は例外の起きた Task で止まるうえ、終わった時刻も分からないため、短い間隔で IsCompleted を見る
+# 非同期の処理（Task）を、待ち時間まで見回り、始めてから終わるまでの時間（Started からの差）を記録する。
+# Task.Wait は例外の起きた Task で止まるうえ、終わった時刻も分からないため、短い間隔で IsCompleted を見る（誤差は PollMs ほど）
 function Wait-AsyncTask($Jobs, [int]$WaitMs) {
-    $sw      = [Diagnostics.Stopwatch]::StartNew()
-    $pending = @($Jobs | Where-Object { $_.Task })
+    $deadline = $clock.ElapsedMilliseconds + $WaitMs
+    $pending  = @($Jobs | Where-Object { $_.Task })
     while ($pending.Count -gt 0) {
         $rest = @()
         foreach ($job in $pending) {
-            if ($job.Task.IsCompleted) { $job.Elapsed = $sw.ElapsedMilliseconds } else { $rest += $job }
+            if ($job.Task.IsCompleted) { $job.Elapsed = $clock.ElapsedMilliseconds - $job.Started } else { $rest += $job }
         }
         $pending = $rest
-        if ($pending.Count -eq 0 -or $sw.ElapsedMilliseconds -ge $WaitMs) { break }
+        if ($pending.Count -eq 0 -or $clock.ElapsedMilliseconds -ge $deadline) { break }
         [Threading.Thread]::Sleep($PollMs)
     }
 }
@@ -327,15 +368,14 @@ function Invoke-CheckRound($Items) {
         $jobs = @(
             foreach ($item in $batch) {
                 $job = [pscustomobject]@{
-                    Item = $item; Task = $null; Elapsed = $null; Address = $null; Detail = ''
+                    Item = $item; Task = $null; Started = 0L; Elapsed = $null; Address = $null; Detail = ''
                     Ping = '-'; PingMs = $null; Tcp = '-'; TcpMs = $null
                 }
-                # IPAddress.TryParse は「001」を 0.0.0.1 と読むなど省略した形も受け付けるため、
-                # 4 つの数字の IPv4 と、: を含む IPv6 だけを IP アドレスとして扱い、ほかはホスト名として名前解決する
-                $parsed = $null
-                if (($item.Host -match '^\d{1,3}(\.\d{1,3}){3}$' -or $item.Host.Contains(':')) -and [Net.IPAddress]::TryParse($item.Host, [ref]$parsed)) {
+                $parsed = ConvertTo-IPAddress $item.Host
+                if ($parsed) {
                     $job.Address = $parsed
                 } else {
+                    $job.Started = $clock.ElapsedMilliseconds
                     try { $job.Task = [Net.Dns]::GetHostAddressesAsync($item.Host) } catch { $job.Detail = '名前解決: ' + (Get-ErrorText (Get-InnerException $_.Exception)) }
                 }
                 $job
@@ -362,12 +402,12 @@ function Invoke-CheckRound($Items) {
         foreach ($job in $jobs) {
             if (-not $job.Address) { continue }
             $pinger = New-Object Net.NetworkInformation.Ping
-            $pingJob = [pscustomobject]@{ Kind = 'ping'; Owner = $job; Handle = $pinger; Task = $null; Elapsed = $null; Error = $null }
+            $pingJob = [pscustomobject]@{ Kind = 'ping'; Owner = $job; Handle = $pinger; Task = $null; Started = $clock.ElapsedMilliseconds; Elapsed = $null; Error = $null }
             try { $pingJob.Task = $pinger.SendPingAsync($job.Address, $waitMs) } catch { $pingJob.Error = Get-InnerException $_.Exception }
             $netJobs.Add($pingJob)
             if ($job.Item.Port) {
                 $client = New-Object Net.Sockets.TcpClient ($job.Address.AddressFamily)
-                $tcpJob = [pscustomobject]@{ Kind = 'tcp'; Owner = $job; Handle = $client; Task = $null; Elapsed = $null; Error = $null }
+                $tcpJob = [pscustomobject]@{ Kind = 'tcp'; Owner = $job; Handle = $client; Task = $null; Started = $clock.ElapsedMilliseconds; Elapsed = $null; Error = $null }
                 try { $tcpJob.Task = $client.ConnectAsync($job.Address, $job.Item.Port) } catch { $tcpJob.Error = Get-InnerException $_.Exception }
                 $netJobs.Add($tcpJob)
             }
@@ -675,20 +715,18 @@ if ($List) {
         Stop-WithError $message
     }
     try {
-        $listLines = (Read-ConfigText $listPath) -split '\r\n|\n|\r'
+        $listRecords = ConvertFrom-CsvText (Read-ConfigText $listPath)
     } catch {
         Stop-WithError ('対象の CSV を読めません: {0}（{1}）' -f $listPath, (Get-ErrorText (Get-InnerException $_.Exception)))
     }
 
-    $hostCol    = -1
-    $portCol    = -1
-    $memoCol    = -1
-    $lineNumber = 0
-    $fromList   = 0
-    foreach ($rawLine in $listLines) {
-        $lineNumber++
-        if ($rawLine.Trim() -eq '') { continue }
-        $fields = Split-CsvLine $rawLine
+    $hostCol  = -1
+    $portCol  = -1
+    $memoCol  = -1
+    $fromList = 0
+    foreach ($record in $listRecords) {
+        $lineNumber = $record.Line
+        $fields     = $record.Fields
         if ($hostCol -lt 0) {
             # 最初の空でない行は見出し。日本語と英語のどちらの見出しも受け付ける
             for ($i = 0; $i -lt $fields.Count; $i++) {
@@ -705,7 +743,8 @@ if ($List) {
         $hostText = if ($hostCol -lt $fields.Count) { $fields[$hostCol].Trim() } else { '' }
         if ($hostText -eq '' -or $hostText.StartsWith('#')) { continue }
         $portText = if ($portCol -ge 0 -and $portCol -lt $fields.Count) { $fields[$portCol].Trim() } else { '' }
-        $memoText = if ($memoCol -ge 0 -and $memoCol -lt $fields.Count) { $fields[$memoCol].Trim() } else { '' }
+        # セル内改行は、画面の表がくずれないよう空白にする
+        $memoText = if ($memoCol -ge 0 -and $memoCol -lt $fields.Count) { ($fields[$memoCol] -replace '\s*[\r\n]+\s*', ' ').Trim() } else { '' }
         $port = 0
         if ($portText -ne '') {
             $port = ConvertTo-Port $portText
@@ -815,6 +854,7 @@ if (-not $NoSave) {
 $itemArray = $items.ToArray()
 $finished  = $false
 $saveError = $null
+$pathShown = $false
 try {
     $sw = [Diagnostics.Stopwatch]::StartNew()
     Write-Progress -Activity '疎通一括確認' -Status ('{0:N0} 件を確かめています' -f $itemArray.Count)
@@ -936,6 +976,12 @@ if ($Repeat) {
             } catch {
                 $saveError = Get-ErrorText (Get-InnerException $_.Exception)
             }
+            # 入力をリダイレクトしていると、Ctrl+C でここから先に進まずに終わるため、保存先はここで表示する
+            if (-not $saveError) {
+                Write-Host ''
+                Write-Host ('保存先: {0}' -f $runDir)
+                $pathShown = $true
+            }
         }
     }
 }
@@ -945,7 +991,7 @@ if ($Repeat) {
 if ($saveError) {
     Write-Host ''
     Write-Warning ('結果を保存できませんでした: {0}' -f $saveError)
-} elseif ($runDir) {
+} elseif ($runDir -and -not $pathShown) {
     Write-Host ''
     Write-Host ('保存先: {0}' -f $runDir)
 } elseif ($saveWarning) {
