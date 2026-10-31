@@ -1,3 +1,7 @@
 # 改行は LF にそろえる（Windows の core.autocrlf=true でも、作業ツリーを LF のままにする）
 # Windows PowerShell 5.1 は、LF の .ps1 も問題なく実行できる
 * text=auto eol=lf
+
+# cmd.exe は、改行が LF だけのバッチファイルで goto やラベルを読み違えることがあるため、CRLF にする
+*.cmd text eol=crlf
+*.bat text eol=crlf
