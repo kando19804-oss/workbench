@@ -649,6 +649,8 @@ try {
         $x = Read-Result $run.Dir
         Assert-Equal 'All Users を順位に載せない' @($x.Folders | Where-Object { $_.'フォルダ' -eq $allUsers }).Count 0
         Assert-Equal 'All Users はリンクとして飛ばす' (@($x.Skipped | Where-Object { $_.'パス' -eq $allUsers }) | ForEach-Object { $_.'理由' }) 'リンク'
+        # 5.1 は読み取りが禁止されたリンクの種類を判定できない。7 は判定できるが、5.1 と同じ結果になるよう互換用リンクとする
+        Assert-Equal 'All Users の詳細（5.1 と 7 で同じ）' (@($x.Skipped | Where-Object { $_.'パス' -eq $allUsers }) | ForEach-Object { $_.'詳細' }) 'Windows の互換用リンク'
     } else {
         Write-Skip 'All Users' 'このPCにないため'
     }
