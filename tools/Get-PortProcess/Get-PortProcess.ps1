@@ -102,9 +102,18 @@ function Get-InnerException([Exception]$Exception) {
     return $Exception
 }
 
+# 例外メッセージに含まれる \\?\ 付きのパスを、表示用のパスに戻す。
 # .NET のメッセージは途中や末尾に改行が入ることがあるため、1 行にまとめる
 function Get-ErrorText([Exception]$Exception) {
-    return ($Exception.Message -replace '\s*[\r\n]+\s*', ' ').Trim()
+    $text = $Exception.Message.Replace('\\?\UNC\', '\\').Replace('\\?\', '')
+    return ($text -replace '\s*[\r\n]+\s*', ' ').Trim()
+}
+
+# 5.1 は 260 文字を超えるパスを通常の書き方では読めないため、ファイルを読み書きするときは \\?\ 付きのパスを使う
+function ConvertTo-LongPath([string]$FullPath) {
+    if ($FullPath.StartsWith('\\?\')) { return $FullPath }
+    if ($FullPath.StartsWith('\\')) { return '\\?\UNC\' + $FullPath.Substring(2) }
+    return '\\?\' + $FullPath
 }
 
 # Excel は = + - @ で始まる値を数式として扱うため、その形の値は ="..." で囲む。
@@ -279,14 +288,14 @@ if ($ConfigFile) {
         $configPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($configText)
         $configPath = [IO.Path]::GetFullPath($configPath)
     } catch { }
-    if (-not [IO.File]::Exists($configPath)) {
+    if (-not [IO.File]::Exists((ConvertTo-LongPath $configPath))) {
         # エクスプローラーで拡張子を表示していないと、メモ帳で port.ini.txt として保存してしまうことがある
         $message = '設定ファイルが見つかりません: {0}' -f $configPath
-        if ([IO.File]::Exists($configPath + '.txt')) { $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $configPath) }
+        if ([IO.File]::Exists((ConvertTo-LongPath ($configPath + '.txt')))) { $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $configPath) }
         Stop-WithError $message
     }
     try {
-        $configLines = (Read-ConfigText $configPath) -split '\r\n|\n|\r'
+        $configLines = (Read-ConfigText (ConvertTo-LongPath $configPath)) -split '\r\n|\n|\r'
     } catch {
         Stop-WithError ('設定ファイルを読めません: {0}（{1}）' -f $configPath, (Get-ErrorText (Get-InnerException $_.Exception)))
     }
@@ -441,6 +450,18 @@ $sorted = @($entries | Sort-Object -Property `
 $pidSet = New-Object 'System.Collections.Generic.HashSet[int]'
 foreach ($e in $sorted) { [void]$pidSet.Add($e.ProcessId) }
 
+# PID → 実行ユーザー。Win32_Process の GetOwner は、呼ぶたびにすべてのプロセスを調べ直すため、1 回 0.3 秒ほどかかる。
+# Get-Process -IncludeUserName はまとめて取れるので、こちらを先に使う（5.1 では、管理者でないと使えない）
+$owners     = @{}
+$ownerByWmi = $false
+try {
+    foreach ($gp in @(Get-Process -IncludeUserName -ErrorAction Stop)) {
+        if ($pidSet.Contains($gp.Id) -and $gp.UserName) { $owners[$gp.Id] = [string]$gp.UserName }
+    }
+} catch {
+    $ownerByWmi = $true
+}
+
 # PID → プロセスの情報。管理者でないと、ほかのユーザーのプロセスの実行ファイル・コマンドライン・実行ユーザーは取れない
 $processes = @{}
 try {
@@ -448,10 +469,16 @@ try {
         $processId = [int]$p.ProcessId
         if (-not $pidSet.Contains($processId)) { continue }
         $owner = ''
-        try {
-            $result = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
-            if ($result.ReturnValue -eq 0 -and $result.User) { $owner = $(if ($result.Domain) { '{0}\{1}' -f $result.Domain, $result.User } else { $result.User }) }
-        } catch { }
+        if ($owners.ContainsKey($processId)) {
+            $owner = $owners[$processId]
+        } elseif ($ownerByWmi -and $p.ExecutablePath) {
+            # 実行ファイルが取れないプロセス（ほかのユーザーのものなど）は、ほとんどが GetOwner も失敗し、
+            # 7 の Get-Process -IncludeUserName でも取れない。時間を短くし、5.1 と 7 で結果をそろえるため、呼ばない
+            try {
+                $result = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
+                if ($result.ReturnValue -eq 0 -and $result.User) { $owner = $(if ($result.Domain) { '{0}\{1}' -f $result.Domain, $result.User } else { $result.User }) }
+            } catch { }
+        }
         $processes[$processId] = [pscustomobject]@{
             Name        = [string]$p.Name
             Path        = [string]$p.ExecutablePath
@@ -575,12 +602,17 @@ try {
         $baseDir = if ($outputText) { $outputText } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
         try {
             $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
+            # \\?\ 付きのパスでは末尾のピリオドや空白が残るため、先に通常の書き方で整える（260 文字を超えると例外になるので、そのときはそのまま）
+            try { $baseDir = [IO.Path]::GetFullPath($baseDir) } catch { }
             $runName = Format-Invariant 'PortProcess_{0}_{1:yyyyMMdd_HHmmss}' $machineName $startTime
             $runDir  = Join-Path $baseDir $runName
             # 失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
             $suffix = 1
-            while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-            [void][IO.Directory]::CreateDirectory($runDir)
+            while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) {
+                $suffix++
+                $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix)
+            }
+            [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
         } catch {
             $saveError = ('保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))) + (Get-ConfigNote 'OutputFolder')
             $runDir = $null
@@ -590,7 +622,7 @@ try {
                 $summary = New-Object 'System.Collections.Generic.List[string]'
                 $summary.AddRange([string[]]$header)
                 foreach ($line in $body) { if ($line.StartsWith('■')) { $summary.Add('') }; $summary.Add($line) }
-                [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$summary, $Utf8Bom)
+                [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$summary, $Utf8Bom)
 
                 $csvRows = @(
                     foreach ($e in $sorted) {
@@ -612,10 +644,10 @@ try {
                         }
                     }
                 )
-                Save-Csv $csvRows $Columns (Join-Path $runDir 'ports.csv')
+                Save-Csv $csvRows $Columns (ConvertTo-LongPath (Join-Path $runDir 'ports.csv'))
             } catch {
                 $saveError = '結果を保存できませんでした: {0}' -f (Get-ErrorText (Get-InnerException $_.Exception))
-                try { [IO.Directory]::Delete($runDir, $true) } catch { }
+                try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { }
                 $runDir = $null
             }
         }
@@ -627,7 +659,7 @@ try {
 } finally {
     if (-not $finished) {
         # 消すのは、このツールが作った保存先のフォルダだけ
-        if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
+        if ($runDir) { try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { } }
         Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow
     }
 }
