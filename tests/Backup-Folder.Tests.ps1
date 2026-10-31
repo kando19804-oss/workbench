@@ -255,12 +255,15 @@ try { $savedInputEncoding = [Console]::InputEncoding; [Console]::InputEncoding =
 $savedTmp   = $env:TMP
 $savedTemp  = $env:TEMP
 $userSid    = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$isElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 $denied     = New-Object 'System.Collections.Generic.List[string]'   # アクセス拒否を設定したフォルダ（終了時に戻す）
 $readOnly   = New-Object 'System.Collections.Generic.List[string]'   # 読み取り専用にしたファイル（消す前に戻す）
 $sparseFiles = New-Object 'System.Collections.Generic.List[string]'
 $substDrive = $null
 
 try {
+    # 5.1 の Read-Host は、確認の文を標準出力ではなくコンソールに直接書くため、テストでは受け取れず画面に出る
+    Write-Host '（このテストは確認の質問に自動で答えます。「コピーしますか？」が画面に出ても、そのまま待ってください）' -ForegroundColor DarkGray
     Write-Section ('準備: ダミー環境を作成（{0}）' -f $workRoot)
     [void][IO.Directory]::CreateDirectory((Split-Path $tool))
     Copy-Item -LiteralPath $repoTool -Destination $tool
@@ -421,7 +424,10 @@ try {
     $dn = Join-Path $workRoot 'dn'
     New-TestFile "$dn\ok.txt" 1
     New-TestFile "$dn\denied\secret.txt" 2
-    if (Add-Deny "$dn\denied" '(RD)') {
+    if ($isElevated) {
+        # 管理者のときの robocopy は、バックアップの特権でアクセス拒否を越えて読むため、読めないフォルダにならない
+        Write-Skip '読めないフォルダ' '管理者として実行しているため（robocopy がアクセス拒否を越えて読む）'
+    } elseif (Add-Deny "$dn\denied" '(RD)') {
         $run = Invoke-Tool 'dn-list' @($dn, "$workRoot\dn-dst", '-ListOnly')
         Assert-Equal '-ListOnly: 終了コード' $run.Code 0
         Assert-Equal '-ListOnly: ※ の行' $run.Log.Contains('※ 読めなかったフォルダが 1 件あります。そのフォルダの中はコピーされません（skipped.csv を確認してください）') 'True'
@@ -848,6 +854,8 @@ try {
     }
     if ($savedEncoding) { try { [Console]::OutputEncoding = $savedEncoding } catch { } }
     if ($savedInputEncoding) { try { [Console]::InputEncoding = $savedInputEncoding } catch { } }
+    # 画面に出た確認の文は改行で終わらないため、後に続く結果の表示がつながらないようにする
+    Write-Host ''
 }
 
 exit $script:failCount
