@@ -122,7 +122,7 @@ OutputFolder = \\fileserver\evidence\%COMPUTERNAME%
 ## 情報の取り方と注意
 
 - ポートの一覧は、Windows に最初から入っている `Get-NetTCPConnection` と `Get-NetUDPEndpoint` で取ります。プロセスとサービスの情報は、CIM（`Win32_Process`、`Win32_Service`）で取ります。どちらも Windows Management Instrumentation（WMI）のサービスを使うため、このサービスが止まっていると動きません
-- 実行ユーザーは、`Get-Process -IncludeUserName` でまとめて取ります。Windows PowerShell 5.1 では管理者でないとこの方法を使えないため、実行ファイルが取れたプロセスについてだけ、CIM の `GetOwner` で 1 つずつ取ります
+- 実行ユーザーは、`Get-Process -IncludeUserName` でまとめて取り、取れなかったプロセス（lsass.exe などの保護されたプロセス）だけ、CIM の `GetOwner` で 1 つずつ取ります。`GetOwner` は 1 回 0.3 秒ほどかかるため、管理者でないときは、実行ファイルが取れたプロセスだけを対象にします（ほかのユーザーのプロセスでは失敗するため）。Windows PowerShell 5.1 では、管理者でないと `Get-Process -IncludeUserName` を使えないため、`GetOwner` だけで取ります
 - ポートの一覧とプロセスの情報は、少しずれた時刻に取ります。その間にプロセスが終わったり、ポートを閉じたりすることがあります
 - 管理者として実行しないと、ほかのユーザー（SYSTEM やサービスのアカウントを含む）のプロセスの実行ユーザー・実行ファイル・コマンドラインが取れないことがあります。PID とプロセス名、サービス名は取れます
 - 終了コードは、調べ終わったら 0、引数の誤りや一覧を取れなかったときは 1 です。該当がなくても 0 です

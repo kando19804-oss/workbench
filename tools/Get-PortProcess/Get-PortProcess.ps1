@@ -451,16 +451,14 @@ $pidSet = New-Object 'System.Collections.Generic.HashSet[int]'
 foreach ($e in $sorted) { [void]$pidSet.Add($e.ProcessId) }
 
 # PID → 実行ユーザー。Win32_Process の GetOwner は、呼ぶたびにすべてのプロセスを調べ直すため、1 回 0.3 秒ほどかかる。
-# Get-Process -IncludeUserName はまとめて取れるので、こちらを先に使う（5.1 では、管理者でないと使えない）
-$owners     = @{}
-$ownerByWmi = $false
+# Get-Process -IncludeUserName はまとめて取れるので、こちらを先に使い、取れなかったプロセスだけ GetOwner で取る
+# （5.1 では、管理者でないと Get-Process -IncludeUserName を使えないので、すべて GetOwner で取る）
+$owners = @{}
 try {
     foreach ($gp in @(Get-Process -IncludeUserName -ErrorAction Stop)) {
         if ($pidSet.Contains($gp.Id) -and $gp.UserName) { $owners[$gp.Id] = [string]$gp.UserName }
     }
-} catch {
-    $ownerByWmi = $true
-}
+} catch { }
 
 # PID → プロセスの情報。管理者でないと、ほかのユーザーのプロセスの実行ファイル・コマンドライン・実行ユーザーは取れない
 $processes = @{}
@@ -471,9 +469,11 @@ try {
         $owner = ''
         if ($owners.ContainsKey($processId)) {
             $owner = $owners[$processId]
-        } elseif ($ownerByWmi -and $p.ExecutablePath) {
-            # 実行ファイルが取れないプロセス（ほかのユーザーのものなど）は、ほとんどが GetOwner も失敗し、
-            # 7 の Get-Process -IncludeUserName でも取れない。時間を短くし、5.1 と 7 で結果をそろえるため、呼ばない
+        } elseif ($processId -gt 4 -and ($isAdmin -or $p.ExecutablePath)) {
+            # 管理者なら、Get-Process で取れない保護されたプロセス（lsass.exe など）も GetOwner で取れる。
+            # 管理者でないときは、実行ファイルが取れないプロセス（ほかのユーザーのものなど）では GetOwner もほとんど失敗し、
+            # 7 の Get-Process -IncludeUserName でも取れない。時間を短くし、5.1 と 7 で結果をそろえるため、呼ばない。
+            # PID 0 と 4 は、管理者でも取れない
             try {
                 $result = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction Stop
                 if ($result.ReturnValue -eq 0 -and $result.User) { $owner = $(if ($result.Domain) { '{0}\{1}' -f $result.Domain, $result.User } else { $result.User }) }
