@@ -23,6 +23,28 @@ if (-not $hasBom -and -not $isUtf16) {
 }
 
 # 2. 5.1 の構文チェック。5.1 のエラーメッセージは日本語なので、文字化けしないようにファイル経由で受け取る
+# Mac など powershell.exe がない環境では、7 の構文解析で文法エラーと 5.1 にない文法を探す（5.1 の確認は Windows で行う）
+if (-not (Get-Command powershell.exe -ErrorAction SilentlyContinue)) {
+    $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($file, [ref]$null, [ref]$parseErrors)
+    $errors = @($parseErrors | ForEach-Object { '{0} 行目: {1}' -f $_.Extent.StartLineNumber, $_.Message })
+    $newSyntax = $ast.FindAll({
+        param($n)
+        $n.GetType().Name -in 'TernaryExpressionAst', 'PipelineChainAst' -or
+        ($n.GetType().Name -eq 'BinaryExpressionAst' -and "$($n.Operator)" -eq 'QuestionQuestion') -or
+        ($n.GetType().Name -eq 'AssignmentStatementAst' -and "$($n.Operator)" -eq 'QuestionQuestionEquals') -or
+        ($n.GetType().Name -in 'MemberExpressionAst', 'InvokeMemberExpressionAst', 'IndexExpressionAst' -and $n.NullConditional) -or
+        ($n.GetType().Name -eq 'NamedBlockAst' -and "$($n.BlockKind)" -eq 'Clean')
+    }, $true)
+    $errors += @($newSyntax | ForEach-Object { '{0} 行目: 5.1 にない文法です: {1}' -f $_.Extent.StartLineNumber, ($_.Extent.Text -split "`n")[0].Trim() })
+    if ($errors.Count -gt 0) {
+        [Console]::Error.WriteLine(('PowerShell 7 の構文解析で問題が見つかりました（5.1 の確認は Windows で行ってください）: {0}' -f $file))
+        foreach ($line in $errors) { [Console]::Error.WriteLine('  ' + $line) }
+        exit 2
+    }
+    exit 0
+}
+
 $resultFile = [IO.Path]::GetTempFileName()
 try {
     $target = $file.Replace("'", "''")
