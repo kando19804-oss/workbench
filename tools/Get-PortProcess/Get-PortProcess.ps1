@@ -238,6 +238,22 @@ function Format-Table([string[]]$Head, [bool[]]$Right, $Rows) {
     return , $lines.ToArray()
 }
 
+# ポートの指定 1 つ（80 や 8000-8100）を、@(開始, 終了) にする。書き方が誤っていれば $null
+function ConvertTo-PortRange([string]$Text) {
+    $from = 0
+    $to   = 0
+    if ($Text -match '^(\d+)\s*-\s*(\d+)$') {
+        if (-not [int]::TryParse($Matches[1], [ref]$from) -or -not [int]::TryParse($Matches[2], [ref]$to)) { return $null }
+    } elseif ($Text -match '^\d+$') {
+        if (-not [int]::TryParse($Text, [ref]$from)) { return $null }
+        $to = $from
+    } else {
+        return $null
+    }
+    if ($from -lt 1 -or $to -gt 65535 -or $from -gt $to) { return $null }
+    return , @($from, $to)
+}
+
 # IPv6 のアドレスは、ポートと区別できるよう [ ] で囲む
 function Format-Endpoint([string]$Address, [int]$PortNumber) {
     if ($Address.Contains(':')) { return '[{0}]:{1}' -f $Address, $PortNumber }
@@ -304,6 +320,13 @@ if ($ConfigFile) {
         if (-not $configLineOf.ContainsKey($itemName)) { $configLineOf[$itemName] = $lineNumber }
 
         if ($itemName -eq 'Port') {
+            # Port は複数の行に書けるため、どの行の誤りかが分かるよう、ここで行ごとに確かめる
+            foreach ($part in ($itemValue -split ',')) {
+                $text = $part.Trim()
+                if ($text -and -not (ConvertTo-PortRange $text)) {
+                    Stop-WithConfigError $lineNumber ('Port は 1～65535 の数値か、8000-8100 のような範囲で指定してください: {0}' -f $text)
+                }
+            }
             $portItems.Add($itemValue)
         } elseif ($configSwitch -contains $itemName) {
             if ($itemValue -eq 'true') { $configValues[$itemName] = $true }
@@ -343,21 +366,15 @@ foreach ($entry in $Port) {
     foreach ($part in ($entry -split ',')) {
         $text = (Remove-Quote $part).Trim("'").Trim()
         if ($text -eq '') { continue }
-        $bad = '-Port は 1～65535 の数値か、8000-8100 のような範囲で指定してください: {0}{1}' -f $text, (Get-ConfigNote 'Port')
-        $from = 0
-        $to   = 0
-        if ($text -match '^(\d+)\s*-\s*(\d+)$') {
-            if (-not [int]::TryParse($Matches[1], [ref]$from) -or -not [int]::TryParse($Matches[2], [ref]$to)) { Stop-WithError $bad }
-        } elseif ($text -match '^\d+$') {
-            if (-not [int]::TryParse($text, [ref]$from)) { Stop-WithError $bad }
-            $to = $from
-        } else {
-            Stop-WithError $bad
-        }
-        if ($from -lt 1 -or $to -gt 65535 -or $from -gt $to) { Stop-WithError $bad }
-        for ($n = $from; $n -le $to; $n++) { [void]$portSet.Add($n) }
-        $portTexts += $(if ($from -eq $to) { [string]$from } else { '{0}-{1}' -f $from, $to })
+        $range = ConvertTo-PortRange $text
+        if (-not $range) { Stop-WithError ('-Port は 1～65535 の数値か、8000-8100 のような範囲で指定してください: {0}' -f $text) }
+        for ($n = $range[0]; $n -le $range[1]; $n++) { [void]$portSet.Add($n) }
+        $portTexts += $(if ($range[0] -eq $range[1]) { [string]$range[0] } else { '{0}-{1}' -f $range[0], $range[1] })
     }
+}
+# "," のように、値はあるのにポートが 1 つもないときは、絞り込みが消えて全件になるのを防ぐため止める
+if ($portSet.Count -eq 0 -and @($Port | Where-Object { "$_".Trim() -ne '' }).Count -gt 0) {
+    Stop-WithError ('-Port にポートがありません: {0}' -f ($Port -join ','))
 }
 $hasPortFilter = $portSet.Count -gt 0
 
@@ -510,7 +527,7 @@ try {
     } else {
         $header.Add('該当なし')
     }
-    if ($missingInfo) { $header.Add('※ 管理者として実行すると、ほかのユーザーのプロセスの実行ユーザー・実行ファイル・コマンドラインも表示できます') }
+    if ($missingInfo) { $header.Add('※ 管理者として実行すると、ほかのユーザーのプロセスの実行ユーザー・実行ファイル・コマンドラインも取れます（コマンドラインは CSV にだけ書きます）') }
 
     $body = New-Object 'System.Collections.Generic.List[string]'
     if ($sorted.Count -gt 0) {
