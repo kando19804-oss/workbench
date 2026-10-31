@@ -608,6 +608,7 @@ $screenLimit  = if ($runDir) { [long]$ScreenMatches } else { [long]::MaxValue }
 $screenOn     = $true
 $screenTail   = $false
 $shownMatches = 0L
+$needTitle    = $false   # 保存できなくなって画面に切り替えたあと、いまのファイルの見出しを出し直すか
 
 $dirType = [IO.DirectoryInfo]
 $rpFlag  = [IO.FileAttributes]::ReparsePoint
@@ -661,6 +662,15 @@ function Show-Entry([string]$Kind, [long]$Number, [string]$Text) {
     Write-Host $Text.Substring($pos)
 }
 
+# 一致のあったファイルの件数をまとめる（ファイルの終わりで、または途中で読めなくなったときに 1 回だけ呼ぶ）
+function Add-FileResult([string]$ItemPath, [string]$EncodingName, [long]$Hits, [bool[]]$TermHit) {
+    if ($script:textWriter) { try { $script:textWriter.WriteLine('') } catch { Stop-Saving $_.Exception } }
+    $script:matchTotal += $Hits
+    $script:matchFiles++
+    for ($t = 0; $t -lt $TermHit.Count; $t++) { if ($TermHit[$t]) { $termFiles[$t]++ } }
+    $fileSummary.Add([pscustomobject]@{ Path = $ItemPath; Encoding = $EncodingName; Hits = $Hits })
+}
+
 $textWriter = $null
 $csvWriter  = $null
 
@@ -676,6 +686,7 @@ function Stop-Saving([Exception]$Exception) {
     if (-not $script:screenOn -or $script:screenTail) {
         $script:screenOn   = $true
         $script:screenTail = $false
+        $script:needTitle  = $true
         Write-Host ''
         Write-Host '（保存できなくなったため、ここから先の一致はすべて画面に表示します）' -ForegroundColor Yellow
     }
@@ -770,8 +781,10 @@ try {
                 $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
             }
 
-            $stream = $null
-            $reader = $null
+            $stream      = $null
+            $reader      = $null
+            $fileHits    = 0L
+            $fileTermHit = New-Object 'bool[]' $terms.Count
             try {
                 # 書き込み中のログも読めるよう、書き込みと削除を妨げない共有モードで開く
                 $stream = New-Object IO.FileStream ($file.FullName, [IO.FileMode]::Open, [IO.FileAccess]::Read,
@@ -797,8 +810,6 @@ try {
                 $lineNo      = 0L
                 $lastShown   = 0L
                 $afterLeft   = 0
-                $fileHits    = 0L
-                $fileTermHit = New-Object 'bool[]' $terms.Count
                 while ($null -ne ($line = $reader.ReadLine())) {
                     $lineNo++
                     if (($lineNo -band 0xFFFF) -eq 0 -and $sw.ElapsedMilliseconds -ge $nextProgress) {
@@ -822,8 +833,9 @@ try {
                         if ($screenTail) { $screenOn = $false; $screenTail = $false }
                         if ($fileHits -eq 0) {
                             if ($textWriter) { try { $textWriter.WriteLine($titleLine) } catch { Stop-Saving $_.Exception } }
-                            if ($screenOn) { Write-Host ''; Write-Host $titleLine -ForegroundColor Cyan }
+                            if ($screenOn) { Write-Host ''; Write-Host $titleLine -ForegroundColor Cyan; $needTitle = $false }
                         }
+                        if ($needTitle -and $screenOn) { Write-Host ''; Write-Host $titleLine -ForegroundColor Cyan; $needTitle = $false }
                         $firstNo = if ($prevNos.Count -gt 0) { $prevNos.Peek() } else { $lineNo }
                         if ($lastShown -gt 0 -and $firstNo -gt $lastShown + 1) {
                             if ($textWriter) { try { $textWriter.WriteLine('  --') } catch { Stop-Saving $_.Exception } }
@@ -865,6 +877,7 @@ try {
                             }
                         }
                         if ($screenOn) {
+                            if ($needTitle) { Write-Host ''; Write-Host $titleLine -ForegroundColor Cyan; $needTitle = $false }
                             Show-Entry 'm' $lineNo $line
                             $shownMatches++
                             if ($shownMatches -ge $screenLimit) { $screenTail = $true }
@@ -874,7 +887,10 @@ try {
                         $afterLeft = $afterCount
                     } elseif ($afterLeft -gt 0) {
                         if ($textWriter) { try { $textWriter.WriteLine(' ' + $lineNo.ToString($Invariant).PadLeft(6) + '  ' + $line) } catch { Stop-Saving $_.Exception } }
-                        if ($screenOn) { Show-Entry 'c' $lineNo $line }
+                        if ($screenOn) {
+                            if ($needTitle) { Write-Host ''; Write-Host $titleLine -ForegroundColor Cyan; $needTitle = $false }
+                            Show-Entry 'c' $lineNo $line
+                        }
                         $lastShown = $lineNo
                         $afterLeft--
                     } elseif ($beforeCount -gt 0) {
@@ -883,15 +899,16 @@ try {
                         if ($prevNos.Count -gt $beforeCount) { [void]$prevNos.Dequeue(); [void]$prevTexts.Dequeue() }
                     }
                 }
-                if ($fileHits -eq 0) { continue }
-
-                if ($textWriter) { try { $textWriter.WriteLine('') } catch { Stop-Saving $_.Exception } }
-                $matchTotal += $fileHits
-                $matchFiles++
-                for ($t = 0; $t -lt $terms.Count; $t++) { if ($fileTermHit[$t]) { $termFiles[$t]++ } }
-                $fileSummary.Add([pscustomobject]@{ Path = $displayPath; Encoding = $encodingName; Hits = $fileHits })
+                if ($fileHits -gt 0) { Add-FileResult $displayPath $encodingName $fileHits $fileTermHit }
             } catch {
-                Add-SkipError (Get-InnerException $_.Exception) $displayPath
+                $failure = Get-InnerException $_.Exception
+                if ($fileHits -gt 0) {
+                    # 一致は見つけしだい書き出しているので、途中で読めなくなっても、それまでの一致は件数に入れる
+                    Add-FileResult $displayPath $encodingName $fileHits $fileTermHit
+                    Add-Skip 'その他のエラー' $displayPath (Format-Invariant '途中まで読んだ（一致 {0:N0} 行は結果に含む）: {1}' $fileHits (Get-ErrorText $failure))
+                } else {
+                    Add-SkipError $failure $displayPath
+                }
             } finally {
                 if ($reader) { $reader.Dispose() } elseif ($stream) { $stream.Dispose() }
             }
