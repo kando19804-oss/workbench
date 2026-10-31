@@ -96,6 +96,7 @@ $ErrorActionPreference = 'Stop'
 $ScriptVersion = '1.0.0'
 $BatchSize     = 50    # 同時に確かめる対象の数（相手やネットワークに負荷をかけすぎないため）
 $PollMs        = 10    # 非同期の処理が終わったかを見回る間隔（ミリ秒）
+$SioTcpInitialRto = 0x98000011   # SIO_TCP_INITIAL_RTO（SYN を送り直す回数を、このツールの接続だけ変える。Windows 8 / Server 2012 から）
 $Invariant     = [Globalization.CultureInfo]::InvariantCulture
 $Utf8Bom       = New-Object Text.UTF8Encoding $true
 $Utf8NoBom     = New-Object Text.UTF8Encoding $false
@@ -121,6 +122,13 @@ function Remove-Quote([string]$Text) {
     return $t
 }
 
+# 5.1 は 260 文字を超えるパスを通常の書き方では読めないため、ファイルを読み書きするときは \\?\ 付きのパスを使う
+function ConvertTo-LongPath([string]$FullPath) {
+    if ($FullPath.StartsWith('\\?\')) { return $FullPath }
+    if ($FullPath.StartsWith('\\')) { return '\\?\UNC\' + $FullPath.Substring(2) }
+    return '\\?\' + $FullPath
+}
+
 # 日付や数値の区切り文字が、OS の地域設定によって変わらないようにする
 function Format-Invariant([string]$Format) {
     return [string]::Format($Invariant, $Format, [object[]]$args)
@@ -140,9 +148,11 @@ function Get-InnerException([Exception]$Exception) {
     return $Exception
 }
 
+# 例外メッセージに含まれる \\?\ 付きのパスを、表示用のパスに戻す。
 # .NET のメッセージは途中や末尾に改行が入ることがあるため、1 行にまとめる
 function Get-ErrorText([Exception]$Exception) {
-    return ($Exception.Message -replace '\s*[\r\n]+\s*', ' ').Trim()
+    $text = $Exception.Message.Replace('\\?\UNC\', '\\').Replace('\\?\', '')
+    return ($text -replace '\s*[\r\n]+\s*', ' ').Trim()
 }
 
 # Excel は「001」「2026-10-31」のような値を数値や日付に変えてしまうため、文字のまま見せたい値は ="..." の形で出す
@@ -368,6 +378,11 @@ function Wait-AsyncTask($Jobs, [int]$WaitMs) {
 function Invoke-CheckRound($Items) {
     $waitMs  = $Timeout * 1000
     $results = New-Object 'System.Collections.Generic.List[object]'
+    # Windows は、拒否（RST）が返ってきても SYN を送り直すため、既定では「拒否された」と分かるまでに 2 秒ほどかかり、
+    # 待ち時間が短いと「タイムアウト」になってしまう。送り直す回数を n 回にすると、拒否は 0.5×n 秒ほどで分かり、
+    # 応答のない相手は 3 秒（1 回）・7 秒（2 回）・15 秒（3 回）・63 秒（5 回）であきらめる。待ち時間より先にあきらめない最小の回数にする
+    $synRetries = if ($Timeout -le 3) { 1 } elseif ($Timeout -le 7) { 2 } elseif ($Timeout -le 15) { 3 } else { 5 }
+    $rtoOption  = [byte[]](0xE8, 0x03, $synRetries, 0)   # 最初に送り直すまでの時間（1000 ミリ秒）と、送り直す回数
     for ($offset = 0; $offset -lt $Items.Count; $offset += $BatchSize) {
         $last  = [math]::Min($offset + $BatchSize, $Items.Count) - 1
         $batch = @($Items[$offset..$last])
@@ -416,6 +431,8 @@ function Invoke-CheckRound($Items) {
             $netJobs.Add($pingJob)
             if ($job.Item.Port) {
                 $client = New-Object Net.Sockets.TcpClient ($job.Address.AddressFamily)
+                # 使えない OS では、Windows の既定の回数のままにする
+                try { [void]$client.Client.IOControl($SioTcpInitialRto, $rtoOption, $null) } catch { }
                 $tcpJob = [pscustomobject]@{ Kind = 'tcp'; Owner = $job; Handle = $client; Task = $null; Started = $clock.ElapsedMilliseconds; Elapsed = $null; Error = $null }
                 try { $tcpJob.Task = $client.ConnectAsync($job.Address, $job.Item.Port) } catch { $tcpJob.Error = Get-InnerException $_.Exception }
                 $netJobs.Add($tcpJob)
@@ -580,8 +597,8 @@ function Save-Report($Header, $Table, $Results, $ChangeLines) {
         $lines.Add('■ 判定が変わった記録')
         if ($ChangeLines.Count -eq 0) { $lines.Add('（変化なし）') } else { $lines.AddRange([string[]]$ChangeLines.ToArray()) }
     }
-    [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
-    Save-Csv @($Results | ForEach-Object { ConvertTo-ResultRow $_ }) $Columns (Join-Path $runDir 'results.csv')
+    [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$lines, $Utf8Bom)
+    Save-Csv @($Results | ForEach-Object { ConvertTo-ResultRow $_ }) $Columns (ConvertTo-LongPath (Join-Path $runDir 'results.csv'))
 }
 
 #endregion
@@ -598,14 +615,14 @@ if ($ConfigFile) {
     $configText = Remove-Quote $ConfigFile
     if ($configText.Contains('"')) { Stop-WithQuoteError '-ConfigFile' $configText }
     $configPath = Get-FullPath (Resolve-StartPath $configText)
-    if (-not [IO.File]::Exists($configPath)) {
+    if (-not [IO.File]::Exists((ConvertTo-LongPath $configPath))) {
         # エクスプローラーで拡張子を表示していないと、メモ帳で check.ini.txt として保存してしまうことがある
         $message = '設定ファイルが見つかりません: {0}' -f $configPath
-        if ([IO.File]::Exists($configPath + '.txt')) { $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $configPath) }
+        if ([IO.File]::Exists((ConvertTo-LongPath ($configPath + '.txt')))) { $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $configPath) }
         Stop-WithError $message
     }
     try {
-        $configLines = (Read-ConfigText $configPath) -split '\r\n|\n|\r'
+        $configLines = (Read-ConfigText (ConvertTo-LongPath $configPath)) -split '\r\n|\n|\r'
     } catch {
         Stop-WithError ('設定ファイルを読めません: {0}（{1}）' -f $configPath, (Get-ErrorText (Get-InnerException $_.Exception)))
     }
@@ -678,13 +695,22 @@ if ($ConfigFile) {
 
 #endregion
 
+# コマンドプロンプトで -OutputFolder "C:\out\" -Target web01 と書くと、後ろの引数まで保存先の値になり、
+# 「確かめる対象がない」などの別の誤りに見えるため、ほかの誤りより先に確かめる
+$outputText = $null
+if ($OutputFolder) {
+    $outputText = Remove-Quote $OutputFolder
+    if ($outputText.Contains('"')) { Stop-WithQuoteError '-OutputFolder' $outputText }
+    $outputText = Resolve-StartPath $outputText
+}
+
 #region ひな形を作る（-NewList）
 
 if ($NewList) {
     $newText = Remove-Quote $NewList
     if ($newText.Contains('"')) { Stop-WithQuoteError '-NewList' $newText }
     $newPath = Get-FullPath (Resolve-StartPath $newText)
-    if ([IO.File]::Exists($newPath) -or [IO.Directory]::Exists($newPath)) {
+    if ([IO.File]::Exists((ConvertTo-LongPath $newPath)) -or [IO.Directory]::Exists((ConvertTo-LongPath $newPath))) {
         Stop-WithError ('同じ名前のファイルがあるため、ひな形を作りません（上書きしません）: {0}' -f $newPath)
     }
     $template = @(
@@ -696,7 +722,7 @@ if ($NewList) {
     )
     try {
         # Excel でダブルクリックして開けるよう、BOM 付き UTF-8 で書く。既存のファイルは上書きしない
-        $stream = New-Object IO.FileStream ($newPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+        $stream = New-Object IO.FileStream ((ConvertTo-LongPath $newPath), [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
         $writer = New-Object IO.StreamWriter ($stream, $Utf8Bom)
         try { foreach ($line in $template) { $writer.WriteLine($line) } } finally { $writer.Dispose() }
     } catch {
@@ -718,13 +744,13 @@ if ($List) {
     $listText = Remove-Quote $List
     if ($listText.Contains('"')) { Stop-WithQuoteError '-List' $listText }
     $listPath = Get-FullPath (Resolve-StartPath $listText)
-    if (-not [IO.File]::Exists($listPath)) {
+    if (-not [IO.File]::Exists((ConvertTo-LongPath $listPath))) {
         $message = ('対象の CSV が見つかりません: {0}' -f $listPath) + (Get-ConfigNote 'List')
-        if ([IO.File]::Exists($listPath + '.txt')) { $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $listPath) }
+        if ([IO.File]::Exists((ConvertTo-LongPath ($listPath + '.txt')))) { $message += "`r`n" + ('拡張子が .txt になっていませんか: {0}.txt' -f $listPath) }
         Stop-WithError $message
     }
     try {
-        $listRecords = ConvertFrom-CsvText (Read-ConfigText $listPath)
+        $listRecords = ConvertFrom-CsvText (Read-ConfigText (ConvertTo-LongPath $listPath))
     } catch {
         $readError = Get-InnerException $_.Exception
         if ($readError -is [FormatException]) {
@@ -805,13 +831,6 @@ if ($fromTarget -gt 0) { $sourceTexts += Format-Invariant '-Target（{0:N0} 件�
 if (-not $List -and $Target.Count -eq 0) { Stop-WithError '確かめる対象を、-List（CSV ファイル）か -Target で指定してください。ひな形は -NewList で作れます。' }
 if ($items.Count -eq 0) { Stop-WithError '確かめる対象がありません' }
 
-$outputText = $null
-if ($OutputFolder) {
-    $outputText = Remove-Quote $OutputFolder
-    if ($outputText.Contains('"')) { Stop-WithQuoteError '-OutputFolder' $outputText }
-    $outputText = Resolve-StartPath $outputText
-}
-
 #endregion
 
 #region 実行元の情報
@@ -847,12 +866,17 @@ if (-not $NoSave) {
     $baseDir = if ($outputText) { $outputText } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
+        # \\?\ 付きのパスでは末尾のピリオドや空白が残るため、先に通常の書き方で整える（260 文字を超えると例外になるので、そのときはそのまま）
+        try { $baseDir = [IO.Path]::GetFullPath($baseDir) } catch { }
         $runName = Format-Invariant 'Connectivity_{0}_{1:yyyyMMdd_HHmmss}' $machineName $startTime
         $runDir  = Join-Path $baseDir $runName
         # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
         $suffix = 1
-        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-        [void][IO.Directory]::CreateDirectory($runDir)
+        while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) {
+            $suffix++
+            $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix)
+        }
+        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
     } catch {
         $saveWarning = ('保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))) + (Get-ConfigNote 'OutputFolder')
         $runDir = $null
@@ -884,7 +908,7 @@ try {
     Write-Progress -Activity '疎通一括確認' -Completed
     if (-not $finished -or $saveError) {
         # 消すのは、このツールが作った保存先のフォルダだけ
-        if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
+        if ($runDir) { try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { } }
         if (-not $finished) { Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow }
     }
 }
@@ -899,7 +923,7 @@ if ($Repeat) {
     $changeLines = New-Object 'System.Collections.Generic.List[string]'
     $changesPath = $null
     if ($runDir) {
-        $changesPath = Join-Path $runDir 'changes.csv'
+        $changesPath = ConvertTo-LongPath (Join-Path $runDir 'changes.csv')
         try { Save-Csv @() $ChangeColumns $changesPath } catch { $saveError = Get-ErrorText (Get-InnerException $_.Exception); $changesPath = $null }
     }
 
@@ -938,7 +962,6 @@ if ($Repeat) {
 
             # 1 回の確認が -Repeat より長くかかったときは、終わってすぐに次を始める
             $nextStart = (Get-Date).AddSeconds($Repeat)
-            $round++
             $sw = [Diagnostics.Stopwatch]::StartNew()
             $newResults = Invoke-CheckRound $itemArray
             $roundTime  = $sw.Elapsed
@@ -970,6 +993,8 @@ if ($Repeat) {
                 }
             }
             $results = $newResults
+            # 回数は、結果を受け取ってから増やす（入力をリダイレクトしていると確認の途中でも止まり、保存する表と回数がずれるため）
+            $round++
 
             $okNow  = @($results | Where-Object { $_.Ok }).Count
             $status = Format-Invariant '（確認 {0:N0} 回目  OK {1:N0} 件  NG {2:N0} 件）' $round $okNow ($results.Count - $okNow)
