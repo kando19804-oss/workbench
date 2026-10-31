@@ -564,18 +564,21 @@ try {
             if ($entry -is $dirType) {
                 $entryIsReparse = ($entry.Attributes -band $rpFlag) -eq $rpFlag
                 if ($entryIsReparse) {
-                    # OneDrive のフォルダもリパースポイントなので、リンクと判定できたものだけを飛ばす
-                    $linkType = $null
-                    try { $linkType = $entry.LinkType } catch { }
+                    # OneDrive のフォルダもリパースポイントなので、リンクと判定できたものだけを飛ばす。
+                    # Windows が互換用に作ったリンク（All Users、Application Data など）は読み取りが禁止されていて、
+                    # 5.1 では種類を判定できない。どれも隠し・システム属性付きなので、それを目印にする。
+                    # 7 は種類を判定できるが、5.1 と同じ結果になるよう、この目印を先に見る
                     $linkName = $null
-                    if ($linkType -eq 'Junction') {
-                        $linkName = 'ジャンクション'
-                    } elseif ($linkType -eq 'SymbolicLink') {
-                        $linkName = 'シンボリックリンク'
-                    } elseif (($entry.Attributes -band $hiddenSystem) -eq $hiddenSystem) {
-                        # Windows が互換用に作ったリンク（All Users、Application Data など）は読み取りが禁止されていて、
-                        # 5.1 では種類を判定できない。どれも隠し・システム属性付きなので、それを目印にする
+                    if (($entry.Attributes -band $hiddenSystem) -eq $hiddenSystem) {
                         $linkName = 'Windows の互換用リンク'
+                    } else {
+                        $linkType = $null
+                        try { $linkType = $entry.LinkType } catch { }
+                        if ($linkType -eq 'Junction') {
+                            $linkName = 'ジャンクション'
+                        } elseif ($linkType -eq 'SymbolicLink') {
+                            $linkName = 'シンボリックリンク'
+                        }
                     }
                     if ($linkName) {
                         $linkCount++
