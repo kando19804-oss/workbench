@@ -40,6 +40,22 @@ if ($testFiles.Count -eq 0) {
     exit 1
 }
 
+# BOM のない .ps1 は、5.1 が Shift_JIS として読むため日本語が壊れる。フックを通らない編集（Mac のエディタなど）で落ちることがあるので、最初に確かめる
+$repoRoot   = Split-Path -Parent $PSScriptRoot
+$noBomFiles = @(foreach ($dir in 'tools', 'tests') {
+    Get-ChildItem -LiteralPath (Join-Path $repoRoot $dir) -Filter '*.ps1' -File -Recurse | Where-Object {
+        $head   = New-Object byte[] 3
+        $stream = [IO.File]::OpenRead($_.FullName)
+        try { $read = $stream.Read($head, 0, 3) } finally { $stream.Dispose() }
+        -not ($read -eq 3 -and $head[0] -eq 0xEF -and $head[1] -eq 0xBB -and $head[2] -eq 0xBF)
+    }
+})
+if ($noBomFiles.Count -gt 0) {
+    Write-Host ''
+    Write-Host '===== BOM の確認' -ForegroundColor Cyan
+    foreach ($f in $noBomFiles) { Write-Host ('  FAIL BOM がありません: {0}' -f $f.FullName) -ForegroundColor Red }
+}
+
 $results = foreach ($file in $testFiles) {
     $testName = $file.Name -replace '\.Tests\.ps1$', ''
     foreach ($target in $targets) {
@@ -84,8 +100,10 @@ foreach ($r in $results) {
     $color = if ($r.Fail -gt 0) { 'Red' } else { 'Green' }
     Write-Host ('{0} / {1}: 合格 {2}  失敗 {3}  スキップ {4}（{5} 秒）' -f $r.Test, $r.Target, $r.Pass, $r.Fail, $r.Skip, $r.Seconds) -ForegroundColor $color
 }
+$bomColor = if ($noBomFiles.Count -gt 0) { 'Red' } else { 'Green' }
+Write-Host ('BOM の確認: BOM のない .ps1 {0} 件' -f $noBomFiles.Count) -ForegroundColor $bomColor
 
-$totalFail = 0
+$totalFail = $noBomFiles.Count
 foreach ($r in $results) { $totalFail += $r.Fail }
 if ($totalFail -gt 0) { exit 1 }
 exit 0
