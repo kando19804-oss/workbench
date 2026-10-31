@@ -152,19 +152,6 @@ function Format-Invariant([string]$Format) {
     return [string]::Format($Invariant, $Format, [object[]]$args)
 }
 
-# Excel は「.1」「2026」のような値を数値に変えてしまうため、数値として読める値は ="..." の形で出す
-function ConvertTo-ExcelText([string]$Text) {
-    # 全角の数字も Excel は数値にするため、半角にそろえてから判定する。
-    # 壊れた文字（対になっていないサロゲート）を含むと Normalize が例外を出すので、そのときはそのまま判定する
-    $normalized = $Text
-    try { $normalized = $Text.Normalize([Text.NormalizationForm]::FormKC) } catch { }
-    $number = 0.0
-    if ([double]::TryParse($normalized.TrimEnd('%'), [Globalization.NumberStyles]::Float, $Invariant, [ref]$number)) {
-        return '="' + $Text + '"'
-    }
-    return $Text
-}
-
 function Format-Duration([TimeSpan]$Span) {
     if ($Span.TotalSeconds -lt 60) { return [string]::Format($Invariant, '{0:N1}秒', $Span.TotalSeconds) }
     if ($Span.TotalHours -lt 1) { return '{0}分{1}秒' -f $Span.Minutes, $Span.Seconds }
@@ -278,6 +265,14 @@ function Expand-ConfigVariable([int]$LineNumber, [string]$Text) {
 
 # ツリーの 1 行分（フォルダかファイル）。Children と FileChildren は、表示するときに名前の順に並べる
 function New-TreeNode([string]$Name, [string]$FullPath, [int]$Level, [bool]$IsDir) {
+    # ファイル数が多いと遅くなるため、New-Object ではなく ::new で作り、ファイルの行には作らない。
+    # $(if ...) の中に書くと空のリストが展開されて $null になるため、変数に入れてから渡す
+    $dirs  = $null
+    $leafs = $null
+    if ($IsDir) {
+        $dirs  = [Collections.Generic.List[object]]::new()
+        $leafs = [Collections.Generic.List[object]]::new()
+    }
     return [pscustomobject]@{
         Name         = $Name
         Path         = $FullPath
@@ -289,10 +284,14 @@ function New-TreeNode([string]$Name, [string]$FullPath, [int]$Level, [bool]$IsDi
         FileCount    = 0L
         Time         = $null
         HasMore      = $false
-        Children     = New-Object 'System.Collections.Generic.List[object]'
-        FileChildren = New-Object 'System.Collections.Generic.List[object]'
+        Children     = $dirs
+        FileChildren = $leafs
     }
 }
+
+# 並べ替えのたびにスクリプトブロックをデリゲートに変えると遅いため、1 回だけ作って使い回す
+$DigitRun         = [Text.RegularExpressions.Regex]::new('[0-9]+')
+$NaturalEvaluator = [Text.RegularExpressions.MatchEvaluator]{ param($m) $m.Value.TrimStart('0').PadLeft(20, '0') }
 
 # エクスプローラーと同じく、名前の中の数字は数値として比べる（file2 が file10 より先）。
 # 数字の並びを 0 で桁をそろえた文字列に置き換えて、序数で比べる。5.1 と 7 で並びが変わらないよう、カルチャには頼らない。
@@ -303,7 +302,7 @@ function Get-SortedNode($Nodes) {
     if ($items.Count -lt 2) { return , $items }
     $keys = New-Object 'string[]' $items.Count
     for ($i = 0; $i -lt $items.Count; $i++) {
-        $natural = [regex]::Replace($items[$i].Name, '[0-9]+', { param($m) $m.Value.TrimStart('0').PadLeft(20, '0') })
+        $natural = $DigitRun.Replace($items[$i].Name, $NaturalEvaluator)
         $keys[$i] = $natural + [char]0 + $items[$i].Name + [char]0 + $i
     }
     [Array]::Sort($keys, [StringComparer]::OrdinalIgnoreCase)
@@ -314,7 +313,7 @@ function Get-SortedNode($Nodes) {
 
 # 子の行を、フォルダ・ファイル・「この先にもある」印の順に返す
 function Get-ChildList($Node) {
-    $list = New-Object 'System.Collections.Generic.List[object]'
+    $list = [Collections.Generic.List[object]]::new()
     $list.AddRange([object[]](Get-SortedNode $Node.Children))
     $list.AddRange([object[]](Get-SortedNode $Node.FileChildren))
     if ($Node.HasMore) { $list.Add([pscustomobject]@{ IsMore = $true }) }
@@ -593,6 +592,7 @@ try {
 
         if ($Detail -and $node) { $chain = $chain + $node }
         $showChildren = $node -and $level -lt $Depth   # 子をツリーに出すか（出さないときは「この先にもある」かだけを見る）
+        $countBelow   = $showChildren -or $Detail      # 子のリンクや除外を、件数と skipped.csv に入れるか
         $dirSize      = 0L
         $dirFiles     = 0L
         foreach ($entry in $entries) {
@@ -601,6 +601,24 @@ try {
             $entryPath = ConvertTo-DisplayPath $entry.FullName
 
             if ($entry -is $dirType) {
+                # 除外は、リンクかどうかより先に判定する（除外したリンクを [リンク] として表示しないため）
+                if ($hasExclude) {
+                    $matched = $null
+                    foreach ($rule in $excludeRules) {
+                        if ($rule.Matcher.IsMatch($entryPath)) { $matched = $rule.Text; break }
+                    }
+                    if ($matched) {
+                        if ($countBelow) {
+                            $excludedCount++
+                            $skipped.Add([pscustomobject]@{ '理由' = '除外指定'; 'パス' = $entryPath; '詳細' = $matched })
+                        }
+                        continue
+                    }
+                }
+                if ($node -and -not $showChildren) { $node.HasMore = $true }
+                # Depth より下で -Detail もないときは、「この先にもある」かを決めるだけで、件数には入れない
+                if (-not $countBelow) { continue }
+
                 $entryIsReparse = ($entry.Attributes -band $rpFlag) -eq $rpFlag
                 $linkName = $null
                 if ($entryIsReparse) {
@@ -617,19 +635,6 @@ try {
                         $linkName = 'Windows の互換用リンク'
                     }
                 }
-                if (-not $linkName -and $hasExclude) {
-                    $matched = $null
-                    foreach ($rule in $excludeRules) {
-                        if ($rule.Matcher.IsMatch($entryPath)) { $matched = $rule.Text; break }
-                    }
-                    if ($matched) {
-                        $excludedCount++
-                        $skipped.Add([pscustomobject]@{ '理由' = '除外指定'; 'パス' = $entryPath; '詳細' = $matched })
-                        continue
-                    }
-                }
-                if ($node -and -not $showChildren) { $node.HasMore = $true }
-
                 $childNode = $null
                 if ($showChildren) {
                     $childNode = New-TreeNode $entry.Name $entryPath ($level + 1) $true
@@ -711,12 +716,13 @@ try {
             $childPrefix = ''
         }
 
-        # Excel の「標準」書式は 12 桁以上の数値を指数で表示するため、数値は 3 桁区切りで出す
+        # Excel の「標準」書式は 12 桁以上の数値を指数で表示するため、数値は 3 桁区切りで出す。
+        # 名前は「2026-10-31」が日付に、「-old」が数式に変わるなど、数値以外でも別の値になるため、常に ="..." の形で出す
         $showSize = -not $item.Status -and ($Detail -or -not $item.IsDir)
         $itemRows.Add([pscustomobject]@{
             '種類'         = $(if ($item.IsDir) { 'フォルダ' } else { 'ファイル' })
             'パス'         = $item.Path
-            '名前'         = (ConvertTo-ExcelText $item.Name)
+            '名前'         = '="' + $item.Name + '"'
             '階層'         = $item.Level
             'サイズ(MB)'   = $(if ($showSize) { ($item.Size / 1MB).ToString('N2', $Invariant) } else { '' })
             'サイズ(バイト)' = $(if ($showSize) { $item.Size.ToString('N0', $Invariant) } else { '' })
@@ -733,7 +739,7 @@ try {
 
     #endregion
 
-    #region 画面表示
+    #region ヘッダー
 
     $conditions = @(('{0} 階層まで' -f $Depth), $(if ($Files) { 'フォルダとファイル' } else { 'フォルダのみ' }))
     if ($Hidden) { $conditions += '隠し項目を含む' }
@@ -764,18 +770,11 @@ try {
     if ($notes.Count -gt 0) { $header.Add($notes -join '  ') }
     if ($deniedCount -gt 0 -and -not $isAdmin) { $header.Add('※ 管理者として実行すると、読める範囲が広がります') }
 
-    foreach ($line in $header) { Write-Host $line }
-    Write-Host ''
-    # 保存しないときは、ほかに見る場所がないので全部表示する
-    $shown = if ($runDir -and $treeLines.Count -gt $ScreenLines) { $ScreenLines } else { $treeLines.Count }
-    for ($i = 0; $i -lt $shown; $i++) { Write-Host $treeLines[$i] }
-    if ($shown -lt $treeLines.Count) {
-        Write-Host (Format-Invariant '（ほか {0:N0} 行は tree.txt を参照してください）' ($treeLines.Count - $shown)) -ForegroundColor Yellow
-    }
-
     #endregion
 
     #region 保存
+
+    # 画面で「続きは tree.txt を」と案内するため、表示より先に保存して、保存できたかを確かめておく
 
     if ($runDir) {
         Write-Progress -Activity 'フォルダツリー出力' -Status '結果を保存しています'
@@ -788,6 +787,19 @@ try {
             $saveError = Get-ErrorText (Get-InnerException $_.Exception)
         }
         Write-Progress -Activity 'フォルダツリー出力' -Completed
+    }
+
+    #endregion
+
+    #region 画面表示
+
+    foreach ($line in $header) { Write-Host $line }
+    Write-Host ''
+    # 保存できなかったときは、ほかに見る場所がないので全部表示する
+    $shown = if ($runDir -and -not $saveError -and $treeLines.Count -gt $ScreenLines) { $ScreenLines } else { $treeLines.Count }
+    for ($i = 0; $i -lt $shown; $i++) { Write-Host $treeLines[$i] }
+    if ($shown -lt $treeLines.Count) {
+        Write-Host (Format-Invariant '（ほか {0:N0} 行は tree.txt を参照してください）' ($treeLines.Count - $shown)) -ForegroundColor Yellow
     }
 
     #endregion
