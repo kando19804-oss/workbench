@@ -360,7 +360,7 @@ if ($Until) { $untilInfo = ConvertTo-PointInTime $Until '-Until' }
 $endTime = if ($untilInfo) { $untilInfo.Time } else { $startTime }
 if ($sinceInfo.Time -ge $endTime) {
     $endLabel = if ($untilInfo) { '-Until の日時' } else { '今' }
-    Stop-WithError (Format-Invariant '-Since の日時（{0:yyyy-MM-dd HH:mm}）が、{1}（{2:yyyy-MM-dd HH:mm}）より後になっています' $sinceInfo.Time $endLabel $endTime)
+    Stop-WithError (Format-Invariant '-Since の日時（{0:yyyy-MM-dd HH:mm}）が、{1}（{2:yyyy-MM-dd HH:mm}）と同じか、それより後になっています' $sinceInfo.Time $endLabel $endTime)
 }
 
 # レベル
