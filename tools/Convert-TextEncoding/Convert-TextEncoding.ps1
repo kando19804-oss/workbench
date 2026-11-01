@@ -280,19 +280,8 @@ function Split-List([string[]]$Items) {
     return , $list
 }
 
-# バイト列の中に、指定したバイトの並びがあるか
-function Test-ByteSequence([byte[]]$Bytes, [int]$Count, [byte[]]$Pattern) {
-    $first = $Pattern[0]
-    $index = [Array]::IndexOf($Bytes, $first, 0, $Count)
-    while ($index -ge 0 -and $index -le $Count - $Pattern.Length) {
-        $match = $true
-        for ($j = 1; $j -lt $Pattern.Length; $j++) { if ($Bytes[$index + $j] -ne $Pattern[$j]) { $match = $false; break } }
-        if ($match) { return $true }
-        if ($index + 1 -ge $Count) { break }
-        $index = [Array]::IndexOf($Bytes, $first, $index + 1, $Count - $index - 1)
-    }
-    return $false
-}
+# JIS（ISO-2022-JP）のエスケープ（ESC $ B、ESC $ @、ESC ( I、ESC $ ( D）があるか。1 件ずつ探すと遅いため、正規表現で 1 回だけ探す
+$jisEscape = New-Object Text.RegularExpressions.Regex ('\x1B(?:\$[B@]|\(I|\$\(D)')
 
 # EUC-JP として正しいか（0x80 以上のバイトが、2 バイト文字・半角カナ・補助漢字の形になっているか）。
 # 1 バイトずつ調べると 5.1 では遅いため、バイトをそのまま文字にしたものから、正しい並びを正規表現で取り除き、残りがあるかで判定する。
@@ -301,7 +290,7 @@ $eucToken = New-Object Text.RegularExpressions.Regex ('[\x00-\x7F]+|[\xA1-\xFE][
 function Test-EucJp([string]$Raw, [bool]$Partial) {
     $rest = $eucToken.Replace($Raw, '')
     if ($rest.Length -eq 0) { return $true }
-    return $Partial -and $rest.Length -le 2 -and $Raw.EndsWith($rest)
+    return $Partial -and $rest.Length -le 2 -and $Raw.EndsWith($rest, [StringComparison]::Ordinal)
 }
 
 # 末尾の何バイトかを外して、厳密に文字に直す（大きなファイルを先頭だけ読んだとき、末尾で文字が切れていることがあるため）
@@ -340,8 +329,7 @@ function Get-TextInfo([byte[]]$Bytes, [int]$Count, [bool]$Partial) {
     } elseif ([Array]::IndexOf($Bytes, [byte]0, 0, [math]::Min($Count, $BinaryBytes)) -ge 0) {
         $info.Name = $NameBinary
         return $info
-    } elseif ((Test-ByteSequence $Bytes $Count ([byte[]](0x1B, 0x24, 0x42))) -or (Test-ByteSequence $Bytes $Count ([byte[]](0x1B, 0x24, 0x40))) -or
-              (Test-ByteSequence $Bytes $Count ([byte[]](0x1B, 0x28, 0x49))) -or (Test-ByteSequence $Bytes $Count ([byte[]](0x1B, 0x24, 0x28, 0x44)))) {
+    } elseif ([Array]::IndexOf($Bytes, [byte]0x1B, 0, $Count) -ge 0 -and $jisEscape.IsMatch($latin1.GetString($Bytes, 0, $Count))) {
         $info.Name = $NameJis
     } else {
         # ASCII だけのファイルは UTF-8 としても正しいので、UTF-8 として読めたら、0x80 以上の文字があるかで分ける
@@ -394,10 +382,11 @@ function Get-TargetEncoding([string]$Key, $Info) {
     return @{ Name = $NameUtf8; Encoding = $strictUtf8; Preamble = [byte[]]@() }
 }
 
-# バイト列が同じか。1 バイトずつ比べると 5.1 では遅いため、バイトをそのまま文字にして比べる
+# バイト列が同じか。1 バイトずつ比べると 5.1 では遅いため、バイトをそのまま文字にして比べる。
+# -ceq は NUL や C1 制御文字（0x80～0x9F）を無視して比べるため、序数で比べる
 function Test-SameBytes([byte[]]$A, [byte[]]$B) {
     if ($A.Length -ne $B.Length) { return $false }
-    return $latin1.GetString($A) -ceq $latin1.GetString($B)
+    return [string]::Equals($latin1.GetString($A), $latin1.GetString($B), [StringComparison]::Ordinal)
 }
 
 # 改行をそろえる
@@ -554,13 +543,13 @@ if (-not $NoSave) {
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
         # 末尾のピリオドや .. を整えておく（\\?\ 付きで書く backup と、通常の書き方で書く summary が、別の場所に分かれないように）
-        $baseDir = [IO.Path]::GetFullPath($baseDir)
+        try { $baseDir = [IO.Path]::GetFullPath($baseDir) } catch { }
         $runName = Format-Invariant '{0}{1}_{2:yyyyMMdd_HHmmss}' $OutputPrefix $machineName $startTime
         $runDir  = Join-Path $baseDir $runName
-        # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
+        # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする。長いパスでも作れるよう \\?\ を付ける
         $suffix = 1
-        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-        [void][IO.Directory]::CreateDirectory($runDir)
+        while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
+        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
     } catch {
         $reason = Get-ErrorText (Get-InnerException $_.Exception)
         $runDir = $null
@@ -820,7 +809,14 @@ try {
                 $cannotCount++
                 continue
             }
-            $conv = Get-Conversion $bytes
+            try {
+                $conv = Get-Conversion $bytes
+            } catch {
+                $file.Result = '変換できない'
+                $file.Note = '変換の準備でエラーになりました: ' + (Get-ErrorText (Get-InnerException $_.Exception))
+                $cannotCount++
+                continue
+            }
             switch ($conv.Status) {
                 '対象外' { $file.Result = '対象外'; $file.Note = $conv.Note; $outCount++ }
                 '変換できない' { $file.Result = '変換できない'; $file.Note = $conv.Note; $cannotCount++ }
@@ -919,15 +915,24 @@ try {
                         continue
                     }
                     try {
-                        $bytes = Read-StreamBytes $stream
+                        # 1 件読めなくても、ほかのファイルの変換は続ける
+                        try {
+                            $bytes = Read-StreamBytes $stream
+                            $sameAsPlan = (Get-BytesHash $bytes) -eq $file.Hash
+                            if ($sameAsPlan) { $conv = Get-Conversion $bytes }
+                        } catch {
+                            $file.Result = '失敗'
+                            $file.Note = '読めないため、変換していません: ' + (Get-ErrorText (Get-InnerException $_.Exception))
+                            $failCount++
+                            continue
+                        }
                         # 予定を立てた後（確認を待っている間など）に変わったファイルは、追記した分などを消さないよう、書かない
-                        if ((Get-BytesHash $bytes) -ne $file.Hash) {
+                        if (-not $sameAsPlan) {
                             $file.Result = '失敗'
                             $file.Note = '調べた後に変更されたため、変換していません'
                             $failCount++
                             continue
                         }
-                        $conv = Get-Conversion $bytes
                         # 元のファイルを控える。控えられなければ変換しない
                         $relative = $file.Path.Substring([math]::Min($basePrefixLen, $file.Path.Length))
                         if ($targetIsFile) { $relative = Split-Path -Leaf $file.Path }
@@ -954,7 +959,7 @@ try {
                             $same = Test-SameBytes $check $conv.NewBytes
                             if ($same -and $null -ne $conv.NewText) {
                                 $preambleLength = $conv.Target.Preamble.Length
-                                $same = $conv.Target.Encoding.GetString($check, $preambleLength, $check.Length - $preambleLength) -ceq $conv.NewText
+                                $same = [string]::Equals($conv.Target.Encoding.GetString($check, $preambleLength, $check.Length - $preambleLength), $conv.NewText, [StringComparison]::Ordinal)
                             }
                             if (-not $same) { throw '読み直した内容が、変換した内容と一致しません' }
                             $file.Result = '変換した'
