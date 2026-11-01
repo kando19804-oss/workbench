@@ -574,12 +574,17 @@ if (-not $NoSave) {
     $baseDir = if ($outputText) { $outputText } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
+        # \\?\ 付きのパスでは末尾のピリオドや空白が残るため、先に通常の書き方で整える（260 文字を超えると例外になるので、そのときはそのまま）
+        try { $baseDir = [IO.Path]::GetFullPath($baseDir) } catch { }
         $runName = Format-Invariant '{0}{1}_{2:yyyyMMdd_HHmmss}' $OutputPrefix $machineName $startTime
         $runDir  = Join-Path $baseDir $runName
         # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
         $suffix = 1
-        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-        [void][IO.Directory]::CreateDirectory($runDir)
+        while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) {
+            $suffix++
+            $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix)
+        }
+        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
     } catch {
         $saveWarning = ('保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))) + (Get-ConfigNote 'OutputFolder')
         $runDir = $null
@@ -714,8 +719,8 @@ $finished     = $false
 try {
     if ($runDir) {
         try {
-            $textWriter = New-Object IO.StreamWriter ((Join-Path $runDir 'matches.txt'), $false, $Utf8Bom)
-            $csvWriter  = New-Object IO.StreamWriter ((Join-Path $runDir 'matches.csv'), $false, $Utf8Bom)
+            $textWriter = New-Object IO.StreamWriter ((ConvertTo-LongPath (Join-Path $runDir 'matches.txt')), $false, $Utf8Bom)
+            $csvWriter  = New-Object IO.StreamWriter ((ConvertTo-LongPath (Join-Path $runDir 'matches.csv')), $false, $Utf8Bom)
             $csvWriter.WriteLine('"ファイル","行番号","一致した語","一致した行","文字コード","最終更新日時"')
         } catch {
             Stop-Saving $_.Exception
@@ -967,12 +972,12 @@ try {
             $summary.Add('■ ファイルごとの件数')
             if ($fileSummary.Count -eq 0) { $summary.Add('  （一致なし）') }
             foreach ($f in $fileSummary) { $summary.Add((Format-Invariant '  {0,8:N0} 行  {1,-9}  {2}' $f.Hits $f.Encoding $f.Path)) }
-            [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$summary, $Utf8Bom)
+            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$summary, $Utf8Bom)
 
             $lines = @('"理由","パス","詳細"') + @(foreach ($s in $skipped) {
                 '"' + $s.'理由' + '","' + $s.'パス'.Replace('"', '""') + '","' + $s.'詳細'.Replace('"', '""') + '"'
             })
-            [IO.File]::WriteAllLines((Join-Path $runDir 'skipped.csv'), [string[]]$lines, $Utf8Bom)
+            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'skipped.csv')), [string[]]$lines, $Utf8Bom)
         } catch {
             $saveError = Get-ErrorText (Get-InnerException $_.Exception)
         }
@@ -983,7 +988,7 @@ try {
         if ($csvWriter) { try { $csvWriter.Dispose() } catch { } }
         $textWriter = $null
         $csvWriter  = $null
-        try { [IO.Directory]::Delete($runDir, $true) } catch { }
+        try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { }
     }
 
     #endregion
@@ -1015,7 +1020,7 @@ try {
     if ($csvWriter) { try { $csvWriter.Dispose() } catch { } }
     if (-not $finished) {
         # 消すのは、このツールが作った保存先のフォルダだけ
-        if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
+        if ($runDir) { try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { } }
         Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow
     }
 }
