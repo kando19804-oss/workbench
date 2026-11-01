@@ -710,6 +710,100 @@ try {
         Write-Skip '変換の途中で中断' '止める前に変換し終わったか、5.1 の Stop() が効かなかったため（3 回試した）'
     }
 
+    Write-Section 'Ctrl+C（変換するときは、コンソールのキーの入力として受け取って止める）'
+    # 新しい（見えない）コンソールでツールを動かし、そのコンソールの入力に Ctrl+C のキーを書き込む
+    $keyScript = New-HelperScript 'send-ctrlc.ps1' @(
+        'param([int]$TargetPid)'
+        'Add-Type -TypeDefinition @'''
+        'using System;'
+        'using System.Runtime.InteropServices;'
+        'public static class WorkbenchConsoleKeys {'
+        '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool FreeConsole();'
+        '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool AttachConsole(uint pid);'
+        '    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);'
+        '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool WriteConsoleInputW(IntPtr handle, INPUT_RECORD[] records, uint length, out uint written);'
+        '    [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);'
+        '    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetConsoleMode(IntPtr handle, out uint mode);'
+        '    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct KEY_EVENT_RECORD { public int KeyDown; public ushort RepeatCount; public ushort VirtualKeyCode; public ushort VirtualScanCode; public char UnicodeChar; public uint ControlKeyState; }'
+        '    [StructLayout(LayoutKind.Explicit)] struct INPUT_RECORD { [FieldOffset(0)] public ushort EventType; [FieldOffset(4)] public KEY_EVENT_RECORD KeyEvent; }'
+        '    public static string SendCtrlC(uint pid) {'
+        '        FreeConsole();'
+        '        if (!AttachConsole(pid)) { return "AttachConsole " + Marshal.GetLastWin32Error(); }'
+        '        IntPtr input = CreateFileW("CONIN$", 0xC0000000, 3, IntPtr.Zero, 3, 0, IntPtr.Zero);'
+        '        if (input == new IntPtr(-1)) { FreeConsole(); return "CONIN$ " + Marshal.GetLastWin32Error(); }'
+        '        // Ctrl+C をキーの入力として受け取るときは、入力のモードから ENABLE_PROCESSED_INPUT（1）が外れている'
+        '        uint mode;'
+        '        if (!GetConsoleMode(input, out mode)) { mode = 0xFFFFFFFF; }'
+        '        INPUT_RECORD[] records = new INPUT_RECORD[2];'
+        '        for (int i = 0; i < 2; i++) {'
+        '            records[i].EventType = 1;'
+        '            records[i].KeyEvent.KeyDown = i == 0 ? 1 : 0;'
+        '            records[i].KeyEvent.RepeatCount = 1;'
+        '            records[i].KeyEvent.VirtualKeyCode = 0x43;'
+        '            records[i].KeyEvent.VirtualScanCode = 0x2E;'
+        '            records[i].KeyEvent.UnicodeChar = (char)3;'
+        '            records[i].KeyEvent.ControlKeyState = 0x0008;'
+        '        }'
+        '        uint written;'
+        '        bool ok = WriteConsoleInputW(input, records, 2, out written);'
+        '        int error = Marshal.GetLastWin32Error();'
+        '        CloseHandle(input);'
+        '        FreeConsole();'
+        '        return (ok ? "ok" : "WriteConsoleInput " + error) + "|" + mode;'
+        '    }'
+        '}'
+        '''@'
+        '$parts = [WorkbenchConsoleKeys]::SendCtrlC([uint32]$TargetPid).Split(''|'')'
+        '''RESULT='' + $parts[0]'
+        '''MODE='' + $(if ($parts.Count -gt 1) { $parts[1] } else { '''' })'
+    )
+    # $Wait: scan（結果のフォルダができたら＝調べ始めたら）か convert（backup ができたら＝変換を始めたら）
+    function Invoke-ConsoleStop([string]$Label, [string]$Wait) {
+        for ($i = 1; $i -le 1500; $i++) { [IO.File]::WriteAllBytes((Join-Path $many ('f{0:0000}.txt' -f $i)), $manyText) }
+        $out  = Join-Path $workRoot "out\$Label"
+        $proc = Start-Process -FilePath (Get-Command $Exe).Source -WindowStyle Hidden -PassThru -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"{0}"' -f $tool), '-Path', ('"{0}"' -f $many), '-LineEnding', 'CRLF', '-Force', '-OutputFolder', ('"{0}"' -f $out))
+        $null = $proc.Handle   # 終了コードを受け取れるように、終わる前にハンドルを開いておく
+        $pattern = if ($Wait -eq 'convert') { '*\backup' } else { '*\TextEncoding_*' }
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        $ready = $false
+        while (-not $ready -and -not $proc.HasExited -and $watch.Elapsed.TotalSeconds -lt 60) {
+            $ready = @(Get-ChildItem -LiteralPath $out -Directory -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.FullName -like $pattern }).Count -gt 0
+            if (-not $ready) { Start-Sleep -Milliseconds 20 }
+        }
+        $sent = '(送る前に終わった)'
+        $mode = ''
+        if ($ready -and -not $proc.HasExited) {
+            $result = Invoke-Helper $keyScript @('-TargetPid', $proc.Id)
+            $sent = $result['RESULT']
+            $mode = $result['MODE']
+        }
+        if (-not $proc.WaitForExit(120000)) { $proc.Kill(); $sent += '（止まらなかった）' }
+        # ENABLE_PROCESSED_INPUT（1）が外れていれば、キーボードの Ctrl+C も、合図ではなくキーの入力になる
+        $keyMode = if ($mode -match '^\d+$') { ([long]$mode -band 1) -eq 0 } else { "(読めない: $mode)" }
+        [pscustomobject]@{ Code = $proc.ExitCode; Sent = $sent; KeyMode = $keyMode; Dir = (Get-RunDir $out) }
+    }
+    function Get-ManyStates($Rows, [string]$Dir) {
+        $broken = 0; $noBackup = 0
+        foreach ($row in $Rows) {
+            $hex = ConvertTo-Hex (Get-Bytes $row.'ファイル')
+            $isNew = $hex -eq (ConvertTo-Hex $converted)
+            if (-not $isNew -and $hex -ne (ConvertTo-Hex $manyText)) { $broken++ }
+            if (($row.'結果' -eq '変換した') -ne $isNew) { $broken++ }
+            if ($isNew -and (ConvertTo-Hex (Get-Bytes (Join-Path $Dir ('backup\' + (Split-Path -Leaf $row.'ファイル'))))) -ne (ConvertTo-Hex $manyText)) { $noBackup++ }
+        }
+        '{0}/{1}' -f $broken, $noBackup
+    }
+    $run = Invoke-ConsoleStop 'ctrlc-convert' 'convert'
+    $x = Read-Result $run.Dir
+    $kinds = Join-Sorted ($x.Files | ForEach-Object { $_.'結果' } | Select-Object -Unique)
+    Assert-Equal '変換の途中: Ctrl+C をキーの入力として受け取り（合図にしない）、そのキーで止まる（終了コード 1）' ('{0}/{1}/{2}/{3}' -f $run.Sent, $run.KeyMode, $run.Code, $kinds) 'ok/True/1/変換した,変換しなかった'
+    Assert-Equal '変換の途中: 書き込みの途中では止めない（失敗はない）・壊れたファイルも控えのないファイルもない' ('{0}/{1}' -f @($x.Files | Where-Object { $_.'結果' -eq '失敗' }).Count, (Get-ManyStates $x.Files $run.Dir)) '0/0/0'
+    Assert-Equal '変換の途中: 残りの備考と、中断の行' ('{0}/{1}' -f (@($x.Files | Where-Object { $_.'結果' -eq '変換しなかった' } | ForEach-Object { $_.'備考' } | Select-Object -Unique) -join ','), (@($x.Lines | Where-Object { $_ -eq '中断しました。それまでに変換したファイルと、控えたファイルは残っています' }).Count)) '中断したため、変換していません/1'
+    $run = Invoke-ConsoleStop 'ctrlc-scan' 'scan'
+    $unchanged = @(1..1500 | Where-Object { (ConvertTo-Hex (Get-Bytes (Join-Path $many ('f{0:0000}.txt' -f $_)))) -ne (ConvertTo-Hex $manyText) }).Count
+    Assert-Equal '変換の前（調べている途中）: Ctrl+C をキーの入力として受け取り、止まって、結果を残さず、ファイルを変えない' ('{0}/{1}/{2}/{3}/{4}' -f $run.Sent, $run.KeyMode, $run.Code, [bool]$run.Dir, $unchanged) 'ok/True/1/False/0'
+
     Write-Section '地域設定'
     # 日付と数値の書式が、OS の地域設定によって変わらないこと
     $probe   = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; (Get-Date '2026-10-29 08:05:00').ToString('yyyy/MM/dd HH:mm:ss') + '|' + (1.5).ToString('N1')"
