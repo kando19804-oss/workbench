@@ -32,9 +32,11 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Continue'
 
-$tool     = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\tools\Compare-Folder\Compare-Folder.ps1'))
+$repoTool = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\tools\Compare-Folder\Compare-Folder.ps1'))
 $hostTag  = if ($Exe -like 'pwsh*') { '7' } else { '51' }
 $workRoot = Join-Path ([IO.Path]::GetTempPath()) ('workbench-tests\Compare-Folder_{0:yyyyMMdd_HHmmss}_{1}' -f (Get-Date), $hostTag)
+# 結果の既定の保存先はスクリプトのフォルダなので、リポジトリに結果を作らないよう、一時フォルダにコピーしたスクリプトを動かす
+$tool     = Join-Path $workRoot 'tool\Compare-Folder.ps1'
 $ref      = Join-Path $workRoot 'ref'
 $dif      = Join-Path $workRoot 'dif'
 $baseTime = New-Object DateTime 2026, 10, 1, 10, 0, 0
@@ -55,8 +57,9 @@ function Write-Skip([string]$Name, [string]$Reason) { '  SKIP  {0}（{1}）' -f 
 
 function Write-Section([string]$Title) { ''; ('■ ' + $Title) }
 
-# 260 文字を超えるパスも作れるように、\\?\ を付けて作る。中身を指定しないときは、指定したサイズの 0 で埋める
-function New-TestFile([string]$FilePath, [long]$Size = 10, [string]$Text = $null, $Time = $baseTime) {
+# 260 文字を超えるパスも作れるように、\\?\ を付けて作る。中身を指定しないときは、指定したサイズの 0 で埋める。
+# $Text に [string] を付けると、$null が空の文字列になり、いつも中身を書く側に入ってしまうため、型を付けない
+function New-TestFile([string]$FilePath, [long]$Size = 10, $Text = $null, $Time = $baseTime) {
     $parent = $FilePath.Substring(0, $FilePath.LastIndexOf('\'))
     [void][IO.Directory]::CreateDirectory('\\?\' + $parent)
     if ($null -ne $Text) {
@@ -124,7 +127,8 @@ function Read-Result([string]$Dir) {
 # 画面の「結果:」の行（件数まで）
 function Get-ResultLine([string]$Log) { [regex]::Match($Log, '結果: .*?同じ \S+ 件').Value }
 
-# differences.csv の、相対パスの行
+# differences.csv の、相対パスの行。関数から返した空の配列は $null になり、.Count が StrictMode でエラーになるため、
+# 件数を数えるときは @(Get-Row ...) で受ける
 function Get-Row($Rows, [string]$Rel) { @($Rows | Where-Object { $_.'相対パス' -eq $Rel }) }
 
 function Get-Field($Rows, [string]$Rel, [string]$Column) { (Get-Row $Rows $Rel | ForEach-Object { $_.$Column }) -join '|' }
@@ -137,6 +141,12 @@ function Test-SortedRel($Rows) {
     $sorted = [string[]]$rels.Clone()
     [Array]::Sort($keys, $sorted, [StringComparer]::OrdinalIgnoreCase)
     ($rels -join '|') -eq ($sorted -join '|')
+}
+
+function Join-Sorted($Items) {
+    $array = [string[]]@($Items | Where-Object { $null -ne $_ })
+    [Array]::Sort($array, [StringComparer]::Ordinal)
+    $array -join ','
 }
 
 function Get-FileNames([string]$Dir) {
@@ -163,6 +173,26 @@ function New-ConfigFile([string]$FilePath, [string[]]$Lines) {
     $FilePath
 }
 
+# 画面の表の 1 行（全角は 2 文字分の幅として、列をそろえる）。$Cells は @(値, 幅, 右寄せ) の並び。最後の列はそのまま足す
+function Format-Line([object[]]$Cells, [string]$Last) {
+    $parts = foreach ($cell in $Cells) {
+        $text  = [string]$cell[0]
+        $width = 0
+        foreach ($ch in $text.ToCharArray()) { $width += $(if ([int]$ch -lt 0x100) { 1 } else { 2 }) }
+        $pad = ' ' * [math]::Max(0, [int]$cell[1] - $width)
+        if ($cell[2]) { $pad + $text } else { $text + $pad }
+    }
+    ' ' + ($parts -join '  ') + '  ' + $Last
+}
+
+# 自分自身にアクセス拒否を設定する。終了時に戻すため、設定したパスを覚えておく
+function Add-Deny([string]$Path, [string]$Rights) {
+    $null = & icacls.exe $Path /deny "*${userSid}:$Rights" 2>&1
+    if ($LASTEXITCODE -ne 0) { return $false }
+    $extraDenied.Add($Path)
+    $true
+}
+
 # スナップショットを、ツールと同じ形（すべての値を引用符で囲む、BOM 付き UTF-8）で書き直す
 function Save-Snapshot($Rows, [string]$FilePath) {
     $lines = @($Rows | ConvertTo-Csv -NoTypeInformation)
@@ -179,10 +209,14 @@ $bdif      = Join-Path $workRoot 'bdif'
 $deniedDir = Join-Path $bdif 'sec'
 $script:denyApplied = $false
 $junctions = New-Object 'System.Collections.Generic.List[string]'
+$extraDenied = New-Object 'System.Collections.Generic.List[string]'   # Add-Deny で拒否を設定したパス（終了時に戻す）
 $longDir   = ('L' * 120) + '\' + ('M' * 120)
+$isAdmin   = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 try {
     Write-Section ('準備: ダミー環境を作成（{0}）' -f $workRoot)
+    [void][IO.Directory]::CreateDirectory((Split-Path $tool))
+    Copy-Item -LiteralPath $repoTool -Destination $tool
     foreach ($side in $ref, $dif) {
         New-TestFile "$side\same.txt" 100
         New-TestFile "$side\2026-10-31" 10
@@ -218,7 +252,7 @@ try {
     Write-Section '既定（サイズと更新日時）'
     $run = Invoke-Tool 'default' @('-Reference', $ref, '-Difference', $dif)
     Assert-Equal '終了コード' $run.Code 2
-    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 4 件  変更 3 件  種類が違う 1 件  同じ 13 件'
+    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 4 件  変更 3 件  種類が違う 1 件  同じ 14 件'
     Assert-Equal 'リンクの件数' ([regex]::Match($run.Log, 'たどらなかったリンク \S+ 件').Value) 'たどらなかったリンク 2 件'
     $x = Read-Result $run.Dir
     Assert-Equal '保存したファイル' (Get-FileNames $run.Dir) 'differences.csv,skipped.csv,summary.txt'
@@ -227,8 +261,8 @@ try {
     Assert-Equal '削除（日本語のフォルダと中身）' ('{0}/{1}' -f (Get-Field $x.Diffs '日本語 フォルダ' '種類'), (Get-Field $x.Diffs '日本語 フォルダ\メモ.txt' '結果')) 'フォルダ/削除'
     Assert-Equal '変更（サイズ）' ('{0}/{1}/{2}' -f (Get-Field $x.Diffs 'change.txt' '違い'), (Get-Field $x.Diffs 'change.txt' '基準のサイズ(バイト)'), (Get-Field $x.Diffs 'change.txt' '比較のサイズ(バイト)')) 'サイズ/100/200'
     Assert-Equal '変更（更新日時）' (Get-Field $x.Diffs 'dt.txt' '違い') '更新日時'
-    Assert-Equal '2 秒以内の日時の違いは同じ' (Get-Row $x.Diffs 'fat.txt').Count 0
-    Assert-Equal '内容だけの違いは、既定では見つけない' (Get-Row $x.Diffs 'hashonly.txt').Count 0
+    Assert-Equal '2 秒以内の日時の違いは同じ' @(Get-Row $x.Diffs 'fat.txt').Count 0
+    Assert-Equal '内容だけの違いは、既定では見つけない' @(Get-Row $x.Diffs 'hashonly.txt').Count 0
     Assert-Equal '種類が違う' ('{0}/{1}' -f (Get-Field $x.Diffs 'kind' '結果'), (Get-Field $x.Diffs 'kind' '種類')) '種類が違う/フォルダ→ファイル'
     Assert-Equal '種類が違うフォルダの中身は削除' (Get-Field $x.Diffs 'kind\inner.txt' '結果') '削除'
     Assert-Equal '片方にだけあるリンク' ('{0}/{1}/{2}' -f (Get-Field $x.Diffs 'jonly' '結果'), (Get-Field $x.Diffs 'jonly' '種類'), (Get-Field $x.Diffs 'jonly' '備考')) '削除/リンク/ジャンクション'
@@ -238,14 +272,22 @@ try {
     Assert-Equal 'summary.txt に違いと保存先' ('{0}/{1}' -f $x.Summary.Contains('sub\deep\new.txt'), $x.Summary.Contains("保存先: $($run.Dir)")) 'True/True'
     $allText = ($x.Diffs + $x.Skipped | ForEach-Object { ($_.PSObject.Properties | ForEach-Object { $_.Value }) -join '|' }) -join '|'
     Assert-Equal '\\?\ が残っていない' $allText.Contains('\\?\') 'False'
+    # 表の列は、全角を 2 文字分の幅としてそろえる（結果は「種類が違う」、種類は「フォルダ→ファイル」、違いは「更新日時」の幅）
+    $summaryLines = @($x.Summary -split '\r?\n')
+    $at = [array]::IndexOf($summaryLines, '■ 違い（相対パスの順）')
+    $expectedHead = Format-Line @(@('結果', 10, $false), @('種類', 18, $false), @('基準のサイズ', 12, $true), @('比較のサイズ', 12, $true), @('違い', 8, $false)) '相対パス'
+    $expectedRow  = Format-Line @(@('変更', 10, $false), @('ファイル', 18, $false), @('100 B', 12, $true), @('200 B', 12, $true), @('サイズ', 8, $false)) 'change.txt'
+    Assert-Equal '表の見出し' $(if ($at -ge 0) { $summaryLines[$at + 1] } else { '(なし)' }) $expectedHead
+    Assert-Equal '表の行（全角の列もそろう）' (@($summaryLines | Where-Object { $_.EndsWith('  change.txt') }) -join '') $expectedRow
+    Assert-Equal '画面にも同じ表' ($run.Log.Contains($expectedHead) -and $run.Log.Contains($expectedRow)) 'True'
 
     Write-Section '-Hash -IncludeSame'
     $run = Invoke-Tool 'hash' @('-Reference', $ref, '-Difference', $dif, '-Hash', '-IncludeSame')
     Assert-Equal '終了コード' $run.Code 2
     Assert-Equal '比べ方' $run.Log.Contains('比べ方: サイズと更新日時とハッシュ（SHA-256）') 'True'
-    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 4 件  変更 3 件  種類が違う 1 件  日時のみ 1 件  同じ 12 件'
+    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 4 件  変更 3 件  種類が違う 1 件  日時のみ 1 件  同じ 13 件'
     $x = Read-Result $run.Dir
-    Assert-Equal 'differences.csv の行数（同じも含む）' $x.Diffs.Count 22
+    Assert-Equal 'differences.csv の行数（同じも含む）' $x.Diffs.Count 23
     Assert-Equal '内容だけの違い' ('{0}/{1}' -f (Get-Field $x.Diffs 'hashonly.txt' '結果'), (Get-Field $x.Diffs 'hashonly.txt' '違い')) '変更/内容'
     Assert-Equal '日時のみ' ('{0}/{1}' -f (Get-Field $x.Diffs 'dt.txt' '結果'), (Get-Field $x.Diffs 'dt.txt' '違い')) '日時のみ/更新日時'
     Assert-Equal 'サイズが違うファイルはハッシュを計算しない' (Get-Field $x.Diffs 'change.txt' '基準のハッシュ') ''
@@ -259,14 +301,15 @@ try {
     }
     Assert-Equal 'すべてのハッシュが Get-FileHash と同じ' $mismatch 0
     Assert-Equal '260 文字を超えるパスも比べる' (Get-Field $x.Diffs "$longDir\deep.bin" '結果') '同じ'
+    Assert-Equal 'サイズは 3 桁区切り' (Get-Field $x.Diffs "$longDir\deep.bin" '基準のサイズ(バイト)') '1,234'
     Assert-Equal '名前に [ ] を含むフォルダ' (Get-Field $x.Diffs '[a]\f.bin' '結果') '同じ'
-    Assert-Equal '日付に見える名前は ="..."' (Get-Row $x.Diffs '="2026-10-31"').Count 1
+    Assert-Equal '日付に見える名前は ="..."' @(Get-Row $x.Diffs '="2026-10-31"').Count 1
     Assert-Equal '相対パスの順（同じも含む）' (Test-SortedRel $x.Diffs) 'True'
 
     Write-Section '-Exclude（名前、先頭の \ で直下だけ）'
     $run = Invoke-Tool 'exclude' @('-Reference', $ref, '-Difference', $dif, '-Exclude', '*.log,\kind')
     Assert-Equal '終了コード' $run.Code 2
-    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  同じ 13 件'
+    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  同じ 14 件'
     Assert-Equal '除外の件数（基準と比較の合計）' ([regex]::Match($run.Log, '除外 \S+ 件').Value) '除外 4 件'
     $x = Read-Result $run.Dir
     $names = [string[]]@(@($x.Skipped | Where-Object { $_.'理由' -eq '除外指定' }) | ForEach-Object { '{0}:{1}' -f $_.'側', $_.'パス'.Substring($workRoot.Length + 1) })
@@ -283,6 +326,7 @@ try {
         Assert-Equal 'skipped.csv' (@($x.Skipped) | ForEach-Object { '{0}/{1}/{2}' -f $_.'理由', $_.'側', $_.'パス' }) "権限なし/比較/$deniedDir"
         # レビューで見つかった問題: 読めないフォルダがあると、相対パスの配列が object[] になり、並べ替わらないおそれがあった
         Assert-Equal '相対パスの順（読めないフォルダがあるとき）' (Test-SortedRel $x.Diffs) 'True'
+        Assert-Equal '管理者でないときだけ、管理者として実行する案内' $run.Log.Contains('※ 管理者として実行すると、読める範囲が広がります') (-not $isAdmin)
     } else {
         Write-Skip '読めないフォルダ' 'アクセス拒否を設定できなかったため'
     }
@@ -361,11 +405,14 @@ try {
     Assert-Equal '作業の後: 結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 0 件  変更 1 件  同じ 3 件'
     Assert-Equal '作業の後: 基準の行' $run.Log.Contains("基準: スナップショット $snapCsv") 'True'
     $x = Read-Result $run.Dir
-    Assert-Equal '作業の後: 除外したファイルは出ない' (Get-Row $x.Diffs 'junk.tmp').Count 0
+    Assert-Equal '作業の後: 除外したファイルは出ない' @(Get-Row $x.Diffs 'junk.tmp').Count 0
     # レビューで見つかった問題: 比べるときに足した除外で基準の側から外れたものが、記録に残らなかった
     $run = Invoke-Tool 'snap_excl' @('-Reference', $snapCsv, '-Difference', $work, '-Exclude', 'a.txt')
     $x = Read-Result $run.Dir
-    Assert-Equal 'スナップショットの側の除外も記録する' ((@($x.Skipped | Where-Object { $_.'理由' -eq '除外指定' }) | ForEach-Object { $_.'側' }) -join ',') '基準,比較'
+    # スナップショットの除外（*.tmp）は比べるときにも使うので、比較の側の old.tmp と junk.tmp も除外に入る
+    $names = [string[]]@(@($x.Skipped | Where-Object { $_.'理由' -eq '除外指定' }) | ForEach-Object { '{0}:{1}' -f $_.'側', (Split-Path $_.'パス' -Leaf) })
+    [Array]::Sort($names, [StringComparer]::Ordinal)
+    Assert-Equal 'スナップショットの側の除外も記録する' ($names -join ',') '基準:a.txt,比較:a.txt,比較:junk.tmp,比較:old.tmp'
 
     $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $work -Snapshot -OutputFolder (Join-Path $workRoot 'out_snap_nohash') 2>&1 | Out-String)
     $noHashCsv = Join-Path (Get-RunDir (Join-Path $workRoot 'out_snap_nohash')) 'snapshot.csv'
@@ -407,8 +454,9 @@ try {
         @('-Snapshot と -NoSave', @('-Reference', $ref, '-Snapshot', '-NoSave'), '-Snapshot のときは、-NoSave は指定できません'),
         @('-Snapshot でスナップショットのファイル', @('-Reference', $snapCsv, '-Snapshot'), '-Reference にフォルダを指定してください')
     )
+    # -NoSave を足すと、-Snapshot と一緒に使えないという別の理由で止まるため、保存先を指定する（止まれば保存先は作られない）
     foreach ($case in $cases) {
-        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool @($case[1]) -NoSave 2>&1 | Out-String)
+        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool @($case[1]) -OutputFolder (Join-Path $workRoot 'out_stop') 2>&1 | Out-String)
         $code = $LASTEXITCODE
         Assert-Equal $case[0] ('{0}/{1}' -f $code, $log.Contains($case[2])) '1/True'
     }
@@ -436,7 +484,7 @@ try {
     # 名前を省略した 2 つのパス、カンマ区切りの -Exclude、最後の引数が "パス\"
     $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSave -Exclude "*.log,\kind" "{2}" "{3}\"' -f $Exe, $tool, $ref, $dif)
     Assert-Equal '終了コード' $run.Code 2
-    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  同じ 13 件'
+    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  同じ 14 件'
     $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Reference "{2}\" -Difference "{3}" -NoSave' -f $Exe, $tool, $ref, $dif)
     Assert-Equal '"パス\" の後ろに引数: 終了コード' $run.Code 1
     Assert-Equal '"パス\" の後ろに引数: ヒント' ([regex]::IsMatch($run.Log, '最後に \\ を付けないでください')) 'True'
@@ -446,7 +494,7 @@ try {
     $cfg = New-ConfigFile "$cfgDir\c.ini" @('# テスト', 'Reference = ..\..\ref', 'Difference = "..\..\dif"', 'Hash = true', 'Exclude = *.log', 'Exclude = \kind', 'OutputFolder = out')
     $run = Invoke-From $workRoot @('-ConfigFile', $cfg)
     Assert-Equal '終了コード' $run.Code 2
-    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  日時のみ 1 件  同じ 12 件'
+    Assert-Equal '結果の行' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  日時のみ 1 件  同じ 13 件'
     Assert-Equal '設定ファイルの行' $run.Log.Contains("設定ファイル: $cfg") 'True'
     Assert-Equal '相対パスは設定ファイルのフォルダが基準' ('{0}/{1}' -f $run.Log.Contains("基準: $ref"), ($null -ne (Get-RunDir "$cfgDir\out"))) 'True/True'
     # 同じ設定ファイルで、スナップショットも保存できる（Difference は使わない）
@@ -461,6 +509,193 @@ try {
     $typo = New-ConfigFile "$cfgDir\typo.ini" @('Reference = ..\..\ref', 'Diference = ..\..\dif')
     $run = Invoke-From $workRoot @('-ConfigFile', $typo)
     Assert-Equal '知らない項目' ('{0}/{1}' -f $run.Code, $run.Log.Contains('知らない項目です: Diference')) '1/True'
+
+    Write-Section '設定ファイル: 書き方と書き間違い'
+    $jpRef = Join-Path $workRoot '日本語 基準'; $jpDif = Join-Path $workRoot '日本語 比較'
+    New-TestFile "$jpRef\メモ.txt" -Text 'a'; New-TestFile "$jpDif\メモ.txt" -Text 'a'; New-TestFile "$jpDif\追加.txt" -Text 'b'
+    $encodings = [ordered]@{
+        'UTF-8（BOM あり）'             = New-Object Text.UTF8Encoding $true
+        'UTF-8（BOM なし）'             = New-Object Text.UTF8Encoding $false
+        'Shift_JIS'                     = [Text.Encoding]::GetEncoding(932)
+        'UTF-16 LE（メモ帳の Unicode）' = [Text.Encoding]::Unicode
+        'UTF-16 BE'                     = [Text.Encoding]::BigEndianUnicode
+    }
+    $i = 0
+    foreach ($label in $encodings.Keys) {
+        $file = "$cfgDir\enc$i.ini"
+        [IO.File]::WriteAllText($file, (@('Reference = ..\..\日本語 基準', 'Difference = ..\..\日本語 比較', 'NoSave = true') -join "`r`n"), $encodings[$label])
+        $run = Invoke-From $workRoot @('-ConfigFile', $file)
+        Assert-Equal ('文字コード {0}: 日本語のパス' -f $label) ('{0}/{1}' -f $run.Code, (Get-ResultLine $run.Log)) '2/結果: 違いあり   追加 1 件  削除 0 件  変更 0 件  同じ 1 件'
+        $i++
+    }
+    $env:WORKBENCH_TEST_ROOT = $workRoot
+    $envIni = New-ConfigFile "$cfgDir\env.ini" @('Reference = %WORKBENCH_TEST_ROOT%\日本語 基準', 'Difference = %WORKBENCH_TEST_ROOT%\日本語 比較', 'OutputFolder = %WORKBENCH_TEST_ROOT%\out_cfgenv')
+    $run = Invoke-From $workRoot @('-ConfigFile', $envIni)
+    Assert-Equal '環境変数' ('{0}/{1}' -f $run.Code, (Get-FileNames (Get-RunDir "$workRoot\out_cfgenv"))) '2/differences.csv,skipped.csv,summary.txt'
+    # "a","b" のように 1 つずつ囲む書き方と、コマンドラインの -Exclude で置き換わること
+    $quoted = New-ConfigFile "$cfgDir\quoted.ini" @('Reference = ..\..\ref', 'Difference = ..\..\dif', 'Exclude = "*.log","\kind"', 'NoSave = true')
+    $run = Invoke-From $workRoot @('-ConfigFile', $quoted)
+    Assert-Equal 'Exclude を 1 つずつ引用符で囲む' (Get-ResultLine $run.Log) '結果: 違いあり   追加 1 件  削除 3 件  変更 2 件  同じ 14 件'
+    $run = Invoke-From $workRoot @('-ConfigFile', $quoted, '-Exclude', '\kind')
+    Assert-Equal 'コマンドラインの -Exclude で置き換える（合わせない）' ('{0}/{1}' -f (Get-ResultLine $run.Log), $run.Log.Contains('除外: \kind')) '結果: 違いあり   追加 1 件  削除 3 件  変更 3 件  同じ 14 件/True'
+    $mistakes = @(
+        @('知らない項目', @('Reference = ..\..\ref', 'Diference = ..\..\dif'), @('設定ファイルの 2 行目: 知らない項目です: Diference', '使える項目: Reference, Difference, Hash, Exclude, IncludeSame, OutputFolder, NoSave')),
+        @('同じ項目を 2 回', @('Reference = ..\..\ref', 'Difference = ..\..\dif', 'reference = ..\..\dif'), @('設定ファイルの 3 行目: Reference が 2 回書かれています（1 行目と 3 行目）')),
+        @('Hash が true / false 以外', @('Reference = ..\..\ref', 'Hash = yes'), @('設定ファイルの 2 行目: Hash は true か false で指定してください: yes')),
+        @('= がない行', @('Reference ..\..\ref'), @('「項目 = 値」の形になっていません: Reference ..\..\ref')),
+        @('セクションの見出し', @('[Compare-Folder]', 'Reference = ..\..\ref'), @('設定ファイルの 1 行目: 「項目 = 値」の形になっていません: [Compare-Folder]')),
+        @('Reference の引用符が片方だけ', @('Reference = "C:\data'), @('Reference の値に引用符（"）が残っています: "C:\data')),
+        @('Exclude の引用符が片方だけ', @('Reference = ..\..\ref', 'Exclude = "*.log'), @('Exclude の値に引用符（"）が残っています: "*.log')),
+        @('定義されていない環境変数', @('Reference = %WORKBENCH_NO_SUCH_VAR%\x'), @('定義されていない環境変数です: %WORKBENCH_NO_SUCH_VAR%'))
+    )
+    for ($i = 0; $i -lt $mistakes.Count; $i++) {
+        $file    = New-ConfigFile "$cfgDir\err$i.ini" $mistakes[$i][1]
+        $run     = Invoke-From $workRoot @('-ConfigFile', $file)
+        $missing = @(@($mistakes[$i][2]) + "ファイル: $file" | Where-Object { -not $run.Log.Contains($_) })
+        Assert-Equal ('書き間違い: {0}' -f $mistakes[$i][0]) ('{0}/{1}/{2}' -f $run.Code, ($missing -join ' | '), $run.Log.Contains('フォルダ差分 (')) '1//False'
+    }
+    $run = Invoke-From $workRoot @('-ConfigFile', "$cfgDir\nothing.ini")
+    Assert-Equal '設定ファイルが見つからない' ('{0}/{1}' -f $run.Code, $run.Log.Contains("設定ファイルが見つかりません: $cfgDir\nothing.ini")) '1/True'
+    $null = New-ConfigFile "$cfgDir\memo.ini.txt" @('Reference = ..\..\ref')
+    $run = Invoke-From $workRoot @('-ConfigFile', "$cfgDir\memo.ini")
+    Assert-Equal '設定ファイルの拡張子が .txt' ('{0}/{1}' -f $run.Code, $run.Log.Contains("拡張子が .txt になっていませんか: $cfgDir\memo.ini.txt")) '1/True'
+    $noRef = New-ConfigFile "$cfgDir\noref.ini" @('Difference = ..\..\dif', 'Reference = .\nosuch')
+    $run = Invoke-From $workRoot @('-ConfigFile', $noRef)
+    Assert-Equal '設定ファイルの Reference が見つからない: 行番号' ('{0}/{1}' -f $run.Code, $run.Log.Contains("基準のフォルダを開けません: $cfgDir\nosuch（設定ファイルの 2 行目）")) '1/True'
+
+    Write-Section '保存先'
+    $jpOut = Join-Path $workRoot 'out_保存 先'
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $jpRef -Difference $jpDif -OutputFolder $jpOut 2>&1 | Out-String)
+    Assert-Equal '日本語とスペースを含む保存先' ('{0}/{1}' -f $LASTEXITCODE, (Get-FileNames (Get-RunDir $jpOut))) '2/differences.csv,skipped.csv,summary.txt'
+    # 通常の書き方では末尾のピリオドは無視される。\\?\ 付きで作ると、ピリオドの付いたフォルダができてしまう
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $jpRef -Difference $jpDif -OutputFolder "$workRoot\out_trail." 2>&1 | Out-String)
+    Assert-Equal '末尾にピリオドが付いた保存先' ('{0}/{1}/{2}' -f $LASTEXITCODE, (Get-FileNames (Get-RunDir "$workRoot\out_trail")), [IO.Directory]::Exists('\\?\' + "$workRoot\out_trail.")) '2/differences.csv,skipped.csv,summary.txt/False'
+    $longOut = "$workRoot\" + ('P' * 150) + '\' + ('Q' * 150)
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $jpRef -Difference $jpDif -OutputFolder "$longOut\diff" 2>&1 | Out-String)
+    $longRun = @(Get-ChildItem -LiteralPath ('\\?\' + "$longOut\diff") -Directory -ErrorAction SilentlyContinue)
+    Assert-Equal '260 文字を超える保存先' ('{0}/{1}/{2}' -f $LASTEXITCODE, $(if ($longRun.Count -gt 0) { Get-FileNames $longRun[0].FullName } else { '(なし)' }), $log.Contains('保存先に書き込めない')) '2/differences.csv,skipped.csv,summary.txt/False'
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $jpRef -Snapshot -OutputFolder "$longOut\snap" 2>&1 | Out-String)
+    $longSnap = @(Get-ChildItem -LiteralPath ('\\?\' + "$longOut\snap") -Directory -ErrorAction SilentlyContinue)
+    Assert-Equal '260 文字を超える保存先にスナップショット' ('{0}/{1}' -f $LASTEXITCODE, $(if ($longSnap.Count -gt 0) { Get-FileNames $longSnap[0].FullName } else { '(なし)' })) '0/skipped.csv,snapshot.csv,summary.txt'
+    if ($longSnap.Count -gt 0) {
+        # Join-Path は \\?\ で始まるパスを扱えないため、文字列でつなぐ
+        $longCsv = ($longSnap[0].FullName + '\snapshot.csv').Replace('\\?\', '')
+        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $longCsv -Difference $jpRef -NoSave 2>&1 | Out-String)
+        Assert-Equal '260 文字を超える場所のスナップショットと比べる' ('{0}/{1}' -f $LASTEXITCODE, (Get-ResultLine $log)) '0/結果: 違いなし   追加 0 件  削除 0 件  変更 0 件  同じ 1 件'
+    }
+    # 保存先のフォルダは作れるが、その中にファイルを作れないようにして、保存に失敗させる
+    $guardOut = Join-Path $workRoot 'out_guard'
+    [void][IO.Directory]::CreateDirectory($guardOut)
+    if (Add-Deny $guardOut '(OI)(CI)(WD)') {
+        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $ref -Difference $dif -OutputFolder $guardOut 2>&1 | Out-String)
+        Assert-Equal '保存に失敗: 警告して、違いは画面に出す' ('{0}/{1}/{2}/{3}' -f $LASTEXITCODE, $log.Contains('結果を保存できませんでした'), $log.Contains('sub\deep\new.txt'), $log.Contains('skipped.csv を確認')) '2/True/True/False'
+        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $jpRef -Snapshot -OutputFolder $guardOut 2>&1 | Out-String)
+        Assert-Equal '保存に失敗: スナップショットは止まる' ('{0}/{1}' -f $LASTEXITCODE, $log.Contains('スナップショットを保存できませんでした')) '1/True'
+        Assert-Equal '保存に失敗: 書きかけの保存先を残さない' @(Get-ChildItem -LiteralPath $guardOut -Force).Count 0
+    } else {
+        Write-Skip '保存に失敗したとき' 'アクセス拒否を設定できなかったため'
+    }
+
+    Write-Section '画面に出す違いは 200 件まで'
+    $manyA = Join-Path $workRoot 'manyA'; $manyB = Join-Path $workRoot 'manyB'
+    New-TestFolder $manyA
+    foreach ($n in 1..250) { New-TestFile ('{0}\f{1:000}.txt' -f $manyB, $n) 1 }
+    $run = Invoke-Tool 'many' @('-Reference', $manyA, '-Difference', $manyB)
+    $x = Read-Result $run.Dir
+    Assert-Equal '画面の違いは 200 件・残りは案内' ('{0}/{1}' -f [regex]::Matches($run.Log, '追加  ファイル').Count, $run.Log.Contains('（ほか 50 件は differences.csv を参照してください）')) '200/True'
+    Assert-Equal 'summary.txt と differences.csv にはすべて' ('{0}/{1}' -f [regex]::Matches($x.Summary, '追加  ファイル').Count, $x.Diffs.Count) '250/250'
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $manyA -Difference $manyB -NoSave 2>&1 | Out-String)
+    Assert-Equal '-NoSave ならすべて画面に出す' ('{0}/{1}' -f [regex]::Matches($log, '追加  ファイル').Count, $log.Contains('differences.csv を参照')) '250/False'
+
+    Write-Section 'Excel で数値・日付・数式に変わる名前'
+    $xlA = Join-Path $workRoot 'xlA'; $xlB = Join-Path $workRoot 'xlB'
+    New-TestFolder $xlA
+    $risky = '001', '-old.txt', '.1', '1e5', '１２３', '50%', '@home', 'normal.txt'
+    foreach ($name in $risky) { New-TestFile "$xlB\$name" 1 }
+    $run = Invoke-Tool 'excel' @('-Reference', $xlA, '-Difference', $xlB)
+    $cells = Join-Sorted @((Read-Result $run.Dir).Diffs | ForEach-Object { $_.'相対パス' })
+    Assert-Equal 'differences.csv の相対パス' $cells (Join-Sorted @('="001"', '="-old.txt"', '=".1"', '="1e5"', '="１２３"', '="50%"', '="@home"', 'normal.txt'))
+    Assert-Equal '画面にはそのままの名前' ($run.Log.Contains('  -old.txt') -and -not $run.Log.Contains('="')) 'True'
+
+    Write-Section '除外の書き方（相対パス・直下だけ・どの階層でも）'
+    $exA = Join-Path $workRoot 'exA'; $exB = Join-Path $workRoot 'exB'
+    New-TestFolder $exA
+    foreach ($name in 'logs\a.txt', 'sub\logs\b.txt', 'sub\cache\c.txt', 'cache\d.txt', '[x]\e.txt', 'keep.txt') { New-TestFile "$exB\$name" 1 }
+    $all = @('cache', 'cache\d.txt', 'keep.txt', 'logs', 'logs\a.txt', 'sub', 'sub\cache', 'sub\cache\c.txt', 'sub\logs', 'sub\logs\b.txt', '[x]', '[x]\e.txt')
+    $excludeCases = @(
+        @('logs\*（直下の logs の中身）', 'logs\*', @('logs\a.txt')),
+        @('*\cache（2 階層目より下の cache）', '*\cache', @('sub\cache', 'sub\cache\c.txt')),
+        @('\logs（直下の logs だけ）', '\logs', @('logs', 'logs\a.txt')),
+        @('logs（どの階層の logs も）', 'logs', @('logs', 'logs\a.txt', 'sub\logs', 'sub\logs\b.txt')),
+        @('[x]（[ ] はそのままの文字）', '[x]', @('[x]', '[x]\e.txt')),
+        @('K*.TXT（大文字と小文字は区別しない）', 'K*.TXT', @('keep.txt'))
+    )
+    foreach ($case in $excludeCases) {
+        $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $exA -Difference $exB -Exclude $case[1] -IncludeSame -OutputFolder (Join-Path $workRoot 'out_excases') 2>&1 | Out-String)
+        $runDir = @(Get-ChildItem -LiteralPath (Join-Path $workRoot 'out_excases') -Directory | Sort-Object LastWriteTime)[-1].FullName
+        $rels = @((Read-Result $runDir).Diffs | ForEach-Object { $_.'相対パス' }) -join ','
+        Assert-Equal ('-Exclude {0}' -f $case[0]) $rels ((@($all | Where-Object { $case[2] -notcontains $_ })) -join ',')
+    }
+
+    Write-Section '大文字と小文字だけの違い（違いにしない）'
+    $ciA = Join-Path $workRoot 'ciA'; $ciB = Join-Path $workRoot 'ciB'
+    New-TestFile "$ciA\Readme.txt" -Text 'same'; New-TestFile "$ciB\README.TXT" -Text 'same'
+    New-TestFile "$ciA\Docs\a.txt" -Text 'x'; New-TestFile "$ciB\DOCS\a.txt" -Text 'x'
+    $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Reference $ciA -Difference $ciB -Hash -NoSave 2>&1 | Out-String)
+    Assert-Equal '名前の大文字と小文字だけを変えたファイルとフォルダ' ('{0}/{1}' -f $LASTEXITCODE, (Get-ResultLine $log)) '0/結果: 違いなし   追加 0 件  削除 0 件  変更 0 件  同じ 3 件'
+
+    Write-Section '-Hash でほかのプログラムが開いているファイル'
+    $lkA = Join-Path $workRoot 'lockA'; $lkB = Join-Path $workRoot 'lockB'
+    New-TestFile "$lkA\f.txt" -Text 'aaaa'; New-TestFile "$lkB\f.txt" -Text 'bbbb'
+    New-TestFile "$lkA\g.txt" -Text 'same'; New-TestFile "$lkB\g.txt" -Text 'same'
+    $lock = New-Object IO.FileStream ("$lkB\f.txt", [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    try {
+        $run = Invoke-Tool 'locked' @('-Reference', $lkA, '-Difference', $lkB, '-Hash')
+    } finally {
+        $lock.Dispose()
+    }
+    $x = Read-Result $run.Dir
+    Assert-Equal '開けないファイルは比べずに残す' ('{0}/{1}' -f $run.Code, (Get-ResultLine $run.Log)) '1/結果: 違いなし（ただし、比べられなかった場所が 1 件あります。skipped.csv を確認してください）   追加 0 件  削除 0 件  変更 0 件  同じ 1 件'
+    Assert-Equal 'skipped.csv（読めない）' (@($x.Skipped) | ForEach-Object { '{0}/{1}/{2}' -f $_.'理由', $_.'側', $_.'パス' }) "読めない/比較/$lkB\f.txt"
+
+    Write-Section '名前に [ ] を含むフォルダから起動（相対パスで指定）'
+    # 5.1 は、名前に [ ] を含むフォルダで起動すると、名前をワイルドカードとして扱い、別の場所から始まる
+    $start = Join-Path $workRoot 'start'
+    $startCases = @(
+        @('一致するフォルダがない（$PSHOME から始まる）', 'br[1] x', @()),
+        @('隣に 1 つ一致するフォルダがある', 'sib\[a]', @('sib\a')),
+        @('[ が閉じていない（ドライブのルートから始まる）', 'ub\a[b', @('ub\ab')),
+        @('隣に 2 つ一致する（ドライブのルートから始まる）', 'mm\[ab]', @('mm\a', 'mm\b'))
+    )
+    foreach ($case in $startCases) {
+        New-TestFile "$start\$($case[1])\a\x.txt" 1; New-TestFile "$start\$($case[1])\b\x.txt" 1; New-TestFile "$start\$($case[1])\b\y.txt" 1
+        $null = New-ConfigFile "$start\$($case[1])\c.ini" @('Reference = a', 'Difference = b', 'NoSave = true')
+        # 間違ったフォルダを比べたら件数で分かるように、隣のフォルダには追加が 2 件になるように置く
+        foreach ($decoy in $case[2]) { New-TestFile "$start\$decoy\a\x.txt" 1; New-TestFile "$start\$decoy\b\y.txt" 1; New-TestFile "$start\$decoy\b\z.txt" 1 }
+    }
+    foreach ($case in $startCases) {
+        $dir = "$start\$($case[1])"
+        $run = Invoke-From $dir @('-Reference', 'a', '-Difference', 'b', '-OutputFolder', 'out')
+        Assert-Equal ('[ ] を含むフォルダから -Reference・-Difference・-OutputFolder: {0}' -f $case[0]) ('{0}/{1}/{2}' -f $run.Code, (Get-ResultLine $run.Log), (Get-FileNames (Get-RunDir "$dir\out"))) '2/結果: 違いあり   追加 1 件  削除 0 件  変更 0 件  同じ 1 件/differences.csv,skipped.csv,summary.txt'
+        $run = Invoke-From $dir @('-ConfigFile', 'c.ini')
+        Assert-Equal ('[ ] を含むフォルダから -ConfigFile: {0}' -f $case[0]) ('{0}/{1}' -f $run.Code, (Get-ResultLine $run.Log)) '2/結果: 違いあり   追加 1 件  削除 0 件  変更 0 件  同じ 1 件'
+    }
+
+    Write-Section '地域設定'
+    # 日付と数値の書式が、OS の地域設定によって変わらないこと
+    $probe   = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; (Get-Date '2026-10-29 08:05:00').ToString('yyyy/MM/dd HH:mm:ss') + '|' + (1.5).ToString('N1')"
+    $control = "$(& $Exe -NoProfile -Command $probe)"
+    if ($control -and $control -ne '2026/10/29 08:05:00|1.5') {
+        $cultureOut = Join-Path $workRoot 'out_culture'
+        $command = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; & '{0}' -Reference '{1}' -Difference '{2}' -OutputFolder '{3}' | Out-Null" -f $tool.Replace("'", "''"), $ref.Replace("'", "''"), $dif.Replace("'", "''"), $cultureOut.Replace("'", "''")
+        $null = & $Exe -NoProfile -ExecutionPolicy Bypass -Command $command 2>&1
+        $x = Read-Result (Get-RunDir $cultureOut)
+        Assert-Equal 'fi-FI でも日時は yyyy-MM-dd HH:mm:ss' ([regex]::IsMatch($x.Summary, '\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}   ')) 'True'
+        Assert-Equal 'fi-FI でも合計と所要時間の小数点は .' ([regex]::IsMatch($x.Summary, '合計 \d+\.\d KB') -and [regex]::IsMatch($x.Summary, '所要 \d+\.\d秒')) 'True'
+        Assert-Equal 'fi-FI でも differences.csv の日時とサイズ' ('{0}/{1}' -f (Get-Field $x.Diffs 'dt.txt' '比較の最終更新日時'), (Get-Field $x.Diffs 'change.txt' '比較のサイズ(バイト)')) '2026/10/01 11:00:00/200'
+    } else {
+        Write-Skip '地域設定' 'fi-FI に切り替えられなかったため'
+    }
 
     Write-Section 'Ctrl+C で中断（ハッシュを計算している途中で停止）'
     $bigA = Join-Path $env:SystemRoot 'System32'
@@ -528,6 +763,8 @@ try {
 } finally {
     # アクセス拒否を戻してから消す
     if ($script:denyApplied) { $null = & icacls.exe $deniedDir /remove:d "*$userSid" 2>&1 }
+    foreach ($path in $extraDenied) { $null = & icacls.exe $path /remove:d "*$userSid" 2>&1 }
+    Remove-Item Env:\WORKBENCH_TEST_ROOT -ErrorAction SilentlyContinue
     if ($KeepTemp) {
         Write-Section ('ダミー環境を残しました: {0}' -f $workRoot)
     } elseif (Test-Path -LiteralPath $workRoot) {
