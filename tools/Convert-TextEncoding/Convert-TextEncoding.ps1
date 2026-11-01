@@ -638,13 +638,14 @@ $lines  = New-Object 'System.Collections.Generic.List[string]'
 function Save-Result {
     if (-not $runDir) { return }
     try {
-        [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
+        # 保存先は \\?\ 付きで作っているため、長いパスでも書けるよう、ここも \\?\ を付ける
+        [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$lines, $Utf8Bom)
         $rows = New-Object 'System.Collections.Generic.List[object]'
         foreach ($file in $sortedFiles) {
             $rows.Add([object[]]@($file.Path, $file.Name, $file.Line, $file.Size.ToString('N0', $Invariant), $file.Time.ToString($TimeFormat, $Invariant), $file.Result, $file.Note))
         }
-        Save-Csv (Join-Path $runDir 'files.csv') $FileColumns $rows
-        Save-Csv (Join-Path $runDir 'skipped.csv') $SkipColumns $skipped
+        Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'files.csv')) $FileColumns $rows
+        Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'skipped.csv')) $SkipColumns $skipped
     } catch {
         $script:saveError = Get-ErrorText (Get-InnerException $_.Exception)
     }
