@@ -316,6 +316,24 @@ function Get-LinkName($Entry) {
     return $null
 }
 
+# 新しい順の表の見出しと行（行は、文字とレベルの組）
+function Get-EventTable($List) {
+    $width = @{ Level = 6; Log = 4; Source = 6 }
+    foreach ($ev in $List) {
+        $width.Level  = [math]::Max($width.Level, (Get-DisplayWidth $ev.Level))
+        $width.Log    = [math]::Max($width.Log, (Get-DisplayWidth $ev.Log))
+        $width.Source = [math]::Max($width.Source, (Get-DisplayWidth $ev.Source))
+    }
+    $header = ' ' + (Format-Column '日時' 19 $false) + '  ' + (Format-Column 'レベル' $width.Level $false) + '  ' + (Format-Column 'ログ' $width.Log $false) + '  ' +
+        (Format-Column 'ソース' $width.Source $false) + '  ' + (Format-Column 'ID' 5 $false) + '  メッセージ（1 行目）'
+    $rows = @(foreach ($ev in $List) {
+        $text = ' ' + $ev.Time.ToString('yyyy-MM-dd HH:mm:ss', $Invariant) + '  ' + (Format-Column $ev.Level $width.Level $false) + '  ' + (Format-Column $ev.Log $width.Log $false) + '  ' +
+            (Format-Column $ev.Source $width.Source $false) + '  ' + (Format-Column ([string]$ev.Id) 5 $false) + '  ' + (Limit-Text $ev.FirstLine $ScreenMessage)
+        , @($text, $ev.LevelValue)
+    })
+    return @{ Header = $header; Lines = $rows }
+}
+
 # メッセージの 1 行目（空の行は飛ばす）
 function Get-FirstLine([string]$Text) {
     foreach ($line in ($Text -split '\r?\n')) {
@@ -390,8 +408,9 @@ function ConvertTo-IdList([string]$Text, [string]$Name) {
     return , $list
 }
 $idList      = ConvertTo-IdList $Id '-Id'
-# FilterHashtable の Id は検索の式の or に展開され、20 個ほどを超えるとイベントログの API がエラーにする。そのときは取り出した後に絞る
-$MaxQueryIds = 20
+# FilterHashtable の Id は検索の式の or に展開され、レベルなどと合わせて 20 個ほどを超えるとイベントログの API がエラーにする。
+# レベル（最大 6 つ）と合わせても収まるよう、ID が多いときは取り出した後に絞る
+$MaxQueryIds = 15
 $idSet = New-Object 'System.Collections.Generic.HashSet[int]'
 foreach ($value in $idList) { [void]$idSet.Add($value) }
 $idInQuery = $idList.Count -gt 0 -and $idList.Count -le $MaxQueryIds
@@ -639,21 +658,9 @@ try {
                 (Format-Column $group.Source $groupWidth.Source $false) + '  ' + (Format-Column ([string]$group.Id) 5 $false) + '  ' + $group.Last.ToString('yyyy-MM-dd HH:mm', $Invariant) + '  ' + (Limit-Text $group.FirstLine $ScreenMessage)
             , @($text, $group.LevelValue)
         })
-        # 新しい順の表。全件は events.csv に書くので、画面の行は画面に出す分だけ作る（イベントが多いと時間がかかるため）
-        $screenEvents = if ($runDir) { @($sorted | Select-Object -First $ScreenEvents) } else { $sorted }
-        $eventWidth = @{ Level = 6; Log = 4; Source = 6 }
-        foreach ($ev in $screenEvents) {
-            $eventWidth.Level  = [math]::Max($eventWidth.Level, (Get-DisplayWidth $ev.Level))
-            $eventWidth.Log    = [math]::Max($eventWidth.Log, (Get-DisplayWidth $ev.Log))
-            $eventWidth.Source = [math]::Max($eventWidth.Source, (Get-DisplayWidth $ev.Source))
-        }
-        $eventHeader = ' ' + (Format-Column '日時' 19 $false) + '  ' + (Format-Column 'レベル' $eventWidth.Level $false) + '  ' + (Format-Column 'ログ' $eventWidth.Log $false) + '  ' +
-            (Format-Column 'ソース' $eventWidth.Source $false) + '  ' + (Format-Column 'ID' 5 $false) + '  メッセージ（1 行目）'
-        $eventLines = @(foreach ($ev in $screenEvents) {
-            $text = ' ' + $ev.Time.ToString('yyyy-MM-dd HH:mm:ss', $Invariant) + '  ' + (Format-Column $ev.Level $eventWidth.Level $false) + '  ' + (Format-Column $ev.Log $eventWidth.Log $false) + '  ' +
-                (Format-Column $ev.Source $eventWidth.Source $false) + '  ' + (Format-Column ([string]$ev.Id) 5 $false) + '  ' + (Limit-Text $ev.FirstLine $ScreenMessage)
-            , @($text, $ev.LevelValue)
-        })
+        # 新しい順の表。全件は events.csv に書くので、画面の行は画面に出す分だけ作る（イベントが多いと時間がかかるため）。
+        # 保存に失敗したときは、画面の後でもう一度すべての行を作る
+        $eventTable = Get-EventTable $(if ($runDir) { @($sorted | Select-Object -First $ScreenEvents) } else { $sorted })
 
         $countParts = @()
         foreach ($value in 1, 2, 3, 4, 5) {
@@ -757,7 +764,9 @@ if ($sorted.Count -gt 0) {
     Write-Table $groupTitle $groupHeader $groupLines $ScreenGroups 'summary.csv'
     Write-Host ''
     $eventTitle = if ($saved) { '■ 新しい順（{0} 件まで）' -f $ScreenEvents } else { '■ 新しい順' }
-    Write-Table $eventTitle $eventHeader $eventLines $ScreenEvents 'events.csv' $sorted.Count
+    # 保存に失敗したときは、ほかに見る場所がないため、すべての行を作り直して出す
+    if (-not $saved -and $eventTable.Lines.Count -lt $sorted.Count) { $eventTable = Get-EventTable $sorted }
+    Write-Table $eventTitle $eventTable.Header $eventTable.Lines $ScreenEvents 'events.csv' $sorted.Count
 }
 foreach ($line in $tail) { Write-Host $line }
 
