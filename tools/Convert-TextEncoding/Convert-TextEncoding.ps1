@@ -295,26 +295,13 @@ function Test-ByteSequence([byte[]]$Bytes, [int]$Count, [byte[]]$Pattern) {
 }
 
 # EUC-JP として正しいか（0x80 以上のバイトが、2 バイト文字・半角カナ・補助漢字の形になっているか）。
-# $Partial のときは、末尾で文字が途中で切れていてもよい
-function Test-EucJp([byte[]]$Bytes, [int]$Count, [bool]$Partial) {
-    $i = 0
-    while ($i -lt $Count) {
-        $b = $Bytes[$i]
-        if ($b -lt 0x80) { $i++; continue }
-        $need = 0
-        if ($b -ge 0xA1 -and $b -le 0xFE) { $need = 1 }
-        elseif ($b -eq 0x8E) { $need = 1 }
-        elseif ($b -eq 0x8F) { $need = 2 }
-        else { return $false }
-        if ($i + $need -ge $Count) { return $Partial }
-        for ($j = 1; $j -le $need; $j++) {
-            $t = $Bytes[$i + $j]
-            if ($b -eq 0x8E) { if ($t -lt 0xA1 -or $t -gt 0xDF) { return $false } }
-            elseif ($t -lt 0xA1 -or $t -gt 0xFE) { return $false }
-        }
-        $i += $need + 1
-    }
-    return $true
+# 1 バイトずつ調べると 5.1 では遅いため、バイトをそのまま文字にしたものから、正しい並びを正規表現で取り除き、残りがあるかで判定する。
+# 先頭のバイトで長さが決まるので、左から取り除けば、正しい並びはすべて消える。$Partial のときは、末尾で文字が途中で切れていてもよい
+$eucToken = New-Object Text.RegularExpressions.Regex ('[\x00-\x7F]+|[\xA1-\xFE][\xA1-\xFE]|\x8E[\xA1-\xDF]|\x8F[\xA1-\xFE][\xA1-\xFE]')
+function Test-EucJp([string]$Raw, [bool]$Partial) {
+    $rest = $eucToken.Replace($Raw, '')
+    if ($rest.Length -eq 0) { return $true }
+    return $Partial -and $rest.Length -le 2 -and $Raw.EndsWith($rest)
 }
 
 # 末尾の何バイトかを外して、厳密に文字に直す（大きなファイルを先頭だけ読んだとき、末尾で文字が切れていることがあるため）
@@ -357,18 +344,17 @@ function Get-TextInfo([byte[]]$Bytes, [int]$Count, [bool]$Partial) {
               (Test-ByteSequence $Bytes $Count ([byte[]](0x1B, 0x28, 0x49))) -or (Test-ByteSequence $Bytes $Count ([byte[]](0x1B, 0x24, 0x28, 0x44)))) {
         $info.Name = $NameJis
     } else {
-        $highIndex = -1
-        for ($i = 0; $i -lt $Count; $i++) { if ($Bytes[$i] -ge 0x80) { $highIndex = $i; break } }
-        if ($highIndex -lt 0) {
+        # ASCII だけのファイルは UTF-8 としても正しいので、UTF-8 として読めたら、0x80 以上の文字があるかで分ける
+        $text = ConvertFrom-Bytes $strictUtf8 $Bytes 0 $Count $maxCut
+        if ($null -ne $text -and $text -notmatch '[^\x00-\x7F]') {
             $info.Name = $NameAscii
-            $info.Text = $latin1.GetString($Bytes, 0, $Count)
+            $info.Text = $text
         } else {
-            $text = ConvertFrom-Bytes $strictUtf8 $Bytes 0 $Count $maxCut
             if ($null -ne $text) {
                 $info.Name = $NameUtf8; $info.Text = $text
             } else {
                 $sjisText = ConvertFrom-Bytes $strictSjis $Bytes 0 $Count ([math]::Min($maxCut, 1))
-                $isEuc    = Test-EucJp $Bytes $Count $Partial
+                $isEuc    = Test-EucJp ($latin1.GetString($Bytes, 0, $Count)) $Partial
                 if ($null -ne $sjisText -and $isEuc) {
                     # EUC-JP の日本語を Shift_JIS として読むと、半角カナばかりになる
                     $kana = [regex]::Matches($sjisText, '[\uFF61-\uFF9F]').Count
@@ -408,10 +394,90 @@ function Get-TargetEncoding([string]$Key, $Info) {
     return @{ Name = $NameUtf8; Encoding = $strictUtf8; Preamble = [byte[]]@() }
 }
 
+# バイト列が同じか。1 バイトずつ比べると 5.1 では遅いため、バイトをそのまま文字にして比べる
 function Test-SameBytes([byte[]]$A, [byte[]]$B) {
     if ($A.Length -ne $B.Length) { return $false }
-    for ($i = 0; $i -lt $A.Length; $i++) { if ($A[$i] -ne $B[$i]) { return $false } }
-    return $true
+    return $latin1.GetString($A) -ceq $latin1.GetString($B)
+}
+
+# 改行をそろえる
+function ConvertTo-LineEnding([string]$Text, [string]$Newline) {
+    $Text = $Text.Replace("`r`n", "`n").Replace("`r", "`n")
+    if ($Newline -ne "`n") { $Text = $Text.Replace("`n", $Newline) }
+    return $Text
+}
+
+# 開いたファイルの中身をすべて読む（配列のまま返すため、先頭にカンマを付ける）
+function Read-StreamBytes([IO.Stream]$Stream) {
+    $buffer = New-Object 'byte[]' ([int]$Stream.Length)
+    $count  = 0
+    while ($count -lt $buffer.Length) {
+        $n = $Stream.Read($buffer, $count, $buffer.Length - $count)
+        if ($n -le 0) { break }
+        $count += $n
+    }
+    if ($count -lt $buffer.Length) { $short = New-Object 'byte[]' $count; [Array]::Copy($buffer, $short, $count); $buffer = $short }
+    return , $buffer
+}
+
+# 変換の予定を立てたときの中身と、書き込む直前の中身が同じかを確かめるためのハッシュ
+$sha256 = New-Object Security.Cryptography.SHA256CryptoServiceProvider
+function Get-BytesHash([byte[]]$Bytes) { return [BitConverter]::ToString($sha256.ComputeHash($Bytes)) }
+
+# 中身から、変換後のバイト列を作る。Status は「変換する」「すでに同じ」「対象外」「変換できない」のどれか
+function Get-Conversion([byte[]]$Bytes) {
+    $info   = Get-TextInfo $Bytes $Bytes.Length $false
+    $result = @{ Status = ''; Info = $info; NewBytes = $null; NewText = $null; Target = $null; Change = ''; Note = ''; EncodingChanged = $false }
+    if (-not ($Convertible -contains $info.Name)) {
+        $result.Status = '対象外'
+        $result.Note = '{0} は変換しません' -f $info.Name
+        return $result
+    }
+    $targetEnc = Get-TargetEncoding $To $info
+    $result.Target = $targetEnc
+    $newline = if ($LineEnding -eq 'CRLF') { "`r`n" } else { "`n" }
+    # Shift_JIS のまま（ASCII のみで BOM を付けないときも）は、文字に直さず、バイトのまま改行だけを置き換える。
+    # CP932 には同じ文字になる重複した字（NEC と IBM の拡張文字など）があり、文字に直してから戻すとバイトが変わるため。
+    # Shift_JIS の 2 バイト目に CR と LF の値は現れないので、バイトのまま置き換えてよい
+    $byteMode = ($info.Name -eq $NameSjis -and $targetEnc.Name -eq $NameSjis) -or ($info.Name -eq $NameAscii -and $targetEnc.Preamble.Length -eq 0)
+    if ($byteMode) {
+        $raw = $latin1.GetString($Bytes)
+        if ($LineEnding) { $raw = ConvertTo-LineEnding $raw $newline }
+        $newBytes = $latin1.GetBytes($raw)
+    } else {
+        $newText = $info.Text
+        if ($LineEnding) { $newText = ConvertTo-LineEnding $newText $newline }
+        try {
+            $body = $targetEnc.Encoding.GetBytes($newText)
+        } catch {
+            # EncoderFallbackException は MethodInvocationException に包まれて届く
+            $ex = Get-InnerException $_.Exception
+            if ($ex -isnot [Text.EncoderFallbackException]) { throw }
+            $char = if ($ex.CharUnknownHigh -ne [char]0) { [string]$ex.CharUnknownHigh + [string]$ex.CharUnknownLow } else { [string]$ex.CharUnknown }
+            $lineNo = 1 + [regex]::Matches($newText.Substring(0, [math]::Min($ex.Index, $newText.Length)), "`n").Count
+            $result.Status = '変換できない'
+            $result.Note = '{0} にない文字: {1}（{2} 行目）' -f $targetEnc.Name, $char, $lineNo
+            return $result
+        }
+        $newBytes = New-Object 'byte[]' ($targetEnc.Preamble.Length + $body.Length)
+        [Array]::Copy($targetEnc.Preamble, 0, $newBytes, 0, $targetEnc.Preamble.Length)
+        [Array]::Copy($body, 0, $newBytes, $targetEnc.Preamble.Length, $body.Length)
+        $result.NewText = $newText
+    }
+    $result.NewBytes = $newBytes
+    if (Test-SameBytes $Bytes $newBytes) {
+        $result.Status = 'すでに同じ'
+        return $result
+    }
+    # 変換の内容。ASCII のみのファイルは、BOM を付けない限り、UTF-8 でも Shift_JIS でも同じバイトのままなので、文字コードの変更とは書かない
+    $parts = @()
+    $newLineKind = Get-LineKind $(if ($targetEnc.Name -eq $NameUtf16) { $result.NewText } else { $latin1.GetString($newBytes) })
+    $result.EncodingChanged = $targetEnc.Name -ne $info.Name -and -not ($info.Name -eq $NameAscii -and $targetEnc.Preamble.Length -eq 0)
+    if ($result.EncodingChanged) { $parts += '{0} → {1}' -f $info.Name, $targetEnc.Name }
+    if ($newLineKind -ne $info.Line) { $parts += '改行 {0} → {1}' -f $info.Line, $newLineKind }
+    $result.Change = $parts -join '・'
+    $result.Status = '変換する'
+    return $result
 }
 
 # リパースポイントのうち、リンクと判定できたものの種類を返す（OneDrive のファイルやフォルダもリパースポイントなので、それ以外は $null）
@@ -487,6 +553,8 @@ if (-not $NoSave) {
     $baseDir = if ($outText) { $outText } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
+        # 末尾のピリオドや .. を整えておく（\\?\ 付きで書く backup と、通常の書き方で書く summary が、別の場所に分かれないように）
+        $baseDir = [IO.Path]::GetFullPath($baseDir)
         $runName = Format-Invariant '{0}{1}_{2:yyyyMMdd_HHmmss}' $OutputPrefix $machineName $startTime
         $runDir  = Join-Path $baseDir $runName
         # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
@@ -510,7 +578,8 @@ $rpFlag    = [IO.FileAttributes]::ReparsePoint
 $hsFlag    = [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
 $files     = New-Object 'System.Collections.Generic.List[object]'
 $skipped   = New-Object 'System.Collections.Generic.List[object]'
-$skipKinds = [ordered]@{ '権限なし' = 0; 'その他のエラー' = 0 }
+$skipKinds = [ordered]@{ '権限なし' = 0; 'その他のエラー' = 0; 'クラウドのみ' = 0 }
+$OnlineMask = 0x00441000   # クラウドのみのファイルの属性（OFFLINE・RECALL_ON_OPEN・RECALL_ON_DATA_ACCESS）
 $linkCount     = 0
 $excludedCount = 0
 
@@ -529,10 +598,16 @@ function Get-ExcludeMatch([string]$FullPath) {
     return $null
 }
 
-# ファイルを読んで判定し、一覧に加える。読めないときは skipped に残す
+# ファイルを読んで判定し、一覧に加える。読めないときは skipped に残す。
+# 中身は持ち続けない（判定だけのときは使わず、変換するときは、書き込む直前にもう一度読むため）
 $readBuffer = New-Object 'byte[]' $SniffBytes
 function Add-FileInfo($Entry) {
     $display = ConvertTo-DisplayPath $Entry.FullName
+    # OneDrive などのクラウドのみのファイルは、読むとダウンロードが始まるため、調べない
+    if (([int]$Entry.Attributes -band $OnlineMask) -ne 0) {
+        Add-Skip 'クラウドのみ' $display 'クラウドのみのファイル（読むとダウンロードが始まるため、調べていません）'
+        return
+    }
     $length  = $Entry.Length
     $partial = $length -gt $LargeBytes
     $bytes   = $null
@@ -556,11 +631,10 @@ function Add-FileInfo($Entry) {
     }
     $info = Get-TextInfo $bytes $count $partial
     $note = if ($partial) { '先頭の 1 MB で判定' } else { '' }
-    # 変換の判定と、変換後の読み直しで使うため、全部を読んだファイルは元のバイト列を持っておく
     $files.Add([pscustomobject]@{
         Path = $display; Full = $Entry.FullName; Size = $length; Time = $Entry.LastWriteTime; ReadOnly = $Entry.IsReadOnly
-        Name = $info.Name; Line = $info.Line; Text = $info.Text; Partial = $partial; Info = $info
-        Bytes = $(if ($partial) { $null } else { $bytes }); Result = ''; Note = $note; NewBytes = $null; NewText = $null; Target = $null; Change = ''; Ext = $Entry.Extension.ToLowerInvariant()
+        Name = $info.Name; Line = $info.Line; Partial = $partial; Result = ''; Note = $note
+        Planned = $false; Hash = ''; Change = ''; TargetName = ''; Ext = $Entry.Extension.ToLowerInvariant()
     })
 }
 
@@ -589,6 +663,7 @@ function Save-Result {
 
 $sortedFiles = @()
 $answeredNo  = $false
+$currentFile = $null
 $nextProgress = 0L
 try {
     #region 調べる
@@ -697,7 +772,9 @@ try {
     if ($kinds.Count -eq 1) {
         $notes += Format-Invariant 'スキップ {0:N0} 件（{1}）' $kinds[0][1] $kinds[0][0]
     } elseif ($kinds.Count -gt 1) {
-        $notes += Format-Invariant 'スキップ {0:N0} 件（権限なし {1:N0}・その他のエラー {2:N0}）' ($skipKinds['権限なし'] + $skipKinds['その他のエラー']) $skipKinds['権限なし'] $skipKinds['その他のエラー']
+        $skipTotal = 0
+        foreach ($kind in $kinds) { $skipTotal += $kind[1] }
+        $notes += Format-Invariant 'スキップ {0:N0} 件（{1}）' $skipTotal (($kinds | ForEach-Object { Format-Invariant '{0} {1:N0}' $_[0] $_[1] }) -join '・')
     }
     if ($linkCount -gt 0) { $notes += Format-Invariant 'たどらなかったリンク {0:N0} 件' $linkCount }
     if ($excludedCount -gt 0) { $notes += Format-Invariant '除外 {0:N0} 件' $excludedCount }
@@ -718,67 +795,60 @@ try {
     #region 変換
 
     if ($converting) {
-        # 変換の予定を立てる
+        # 変換の予定を立てる。中身はファイルごとに読み直し、予定を立てたら手放す（すべてをメモリに持たないため）
         $plan = New-Object 'System.Collections.Generic.List[object]'
         $sameCount = 0; $outCount = 0; $cannotCount = 0
+        $ps1Count = 0; $batCount = 0
         $changeKinds = [ordered]@{}
         foreach ($file in $sortedFiles) {
-            if ($file.Partial -or -not ($Convertible -contains $file.Name) -or $null -eq $file.Text) {
+            if ($sw.ElapsedMilliseconds -ge $nextProgress) {
+                Write-Progress -Activity '文字コード判定・変換' -Status '変換の予定を立てています' -CurrentOperation $file.Path
+                $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
+            }
+            if ($file.Partial -or -not ($Convertible -contains $file.Name)) {
                 $file.Result = '対象外'
                 if (-not $file.Note) { $file.Note = '{0} は変換しません' -f $file.Name }
                 $outCount++
                 continue
             }
-            $targetEnc = Get-TargetEncoding $To $file.Info
-            $newText = $file.Text
-            if ($LineEnding) {
-                $newline = if ($LineEnding -eq 'CRLF') { "`r`n" } else { "`n" }
-                $newText = $newText.Replace("`r`n", "`n").Replace("`r", "`n")
-                if ($newline -ne "`n") { $newText = $newText.Replace("`n", $newline) }
-            }
             try {
-                $body = $targetEnc.Encoding.GetBytes($newText)
+                $stream = New-Object IO.FileStream($file.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete'))
+                try { $bytes = Read-StreamBytes $stream } finally { $stream.Dispose() }
             } catch {
-                # EncoderFallbackException は MethodInvocationException に包まれて届く
-                $ex = Get-InnerException $_.Exception
-                if ($ex -is [Text.EncoderFallbackException]) {
-                    $char = if ($ex.CharUnknownHigh -ne [char]0) { [string]$ex.CharUnknownHigh + [string]$ex.CharUnknownLow } else { [string]$ex.CharUnknown }
-                    $lineNo = 1 + [regex]::Matches($newText.Substring(0, [math]::Min($ex.Index, $newText.Length)), "`n").Count
-                    $file.Result = '変換できない'
-                    $file.Note = '{0} にない文字: {1}（{2} 行目）' -f $targetEnc.Name, $char, $lineNo
-                    $cannotCount++
-                    continue
-                }
-                throw
-            }
-            $newBytes = New-Object 'byte[]' ($targetEnc.Preamble.Length + $body.Length)
-            [Array]::Copy($targetEnc.Preamble, 0, $newBytes, 0, $targetEnc.Preamble.Length)
-            [Array]::Copy($body, 0, $newBytes, $targetEnc.Preamble.Length, $body.Length)
-            if (Test-SameBytes $file.Bytes $newBytes) {
-                $file.Result = 'すでに同じ'
-                $sameCount++
-                continue
-            }
-            if ($file.ReadOnly) {
                 $file.Result = '変換できない'
-                $file.Note = '読み取り専用のファイル'
+                $file.Note = '読めません: ' + (Get-ErrorText (Get-InnerException $_.Exception))
                 $cannotCount++
                 continue
             }
-            # 変換の内容（文字コードが同じ名前でも、ASCII のみ → UTF-8 BOM のように BOM が付くときは文字コードの変更として書く）
-            $parts = @()
-            $newLine = Get-LineKind $(if ($targetEnc.Name -eq $NameUtf16) { $newText } else { $latin1.GetString($newBytes) })
-            # ASCII のみのファイルは、BOM を付けない限り、UTF-8 でも Shift_JIS でも同じバイトのままなので、文字コードの変更とは書かない
-            $encodingChanged = $targetEnc.Name -ne $file.Name -and -not ($file.Name -eq $NameAscii -and $targetEnc.Preamble.Length -eq 0)
-            if ($encodingChanged) { $parts += '{0} → {1}' -f $file.Name, $targetEnc.Name }
-            if ($newLine -ne $file.Line) { $parts += '改行 {0} → {1}' -f $file.Line, $newLine }
-            $file.Change = $parts -join '・'
-            $file.NewBytes = $newBytes
-            $file.Target = $targetEnc
-            $file.NewText = $newText
-            $plan.Add($file)
-            foreach ($part in $parts) { if ($changeKinds.Contains($part)) { $changeKinds[$part]++ } else { $changeKinds[$part] = 1 } }
+            $conv = Get-Conversion $bytes
+            switch ($conv.Status) {
+                '対象外' { $file.Result = '対象外'; $file.Note = $conv.Note; $outCount++ }
+                '変換できない' { $file.Result = '変換できない'; $file.Note = $conv.Note; $cannotCount++ }
+                'すでに同じ' { $file.Result = 'すでに同じ'; $sameCount++ }
+                default {
+                    if ($file.ReadOnly) {
+                        $file.Result = '変換できない'
+                        $file.Note = '読み取り専用のファイル'
+                        $cannotCount++
+                    } else {
+                        $file.Planned = $true
+                        $file.Hash = Get-BytesHash $bytes
+                        $file.Change = $conv.Change
+                        $file.TargetName = $conv.Target.Name
+                        $plan.Add($file)
+                        foreach ($part in ($conv.Change -split '・')) { if ($changeKinds.Contains($part)) { $changeKinds[$part]++ } else { $changeKinds[$part] = 1 } }
+                        # よくある落とし穴を知らせる（日本語などを含み、文字コードを変えるものだけ）
+                        if ($conv.EncodingChanged -and $conv.Info.Name -ne $NameAscii) {
+                            if ($conv.Target.Name -eq $NameUtf8 -and @('.ps1', '.psm1', '.psd1') -contains $file.Ext) { $ps1Count++ }
+                            if (($conv.Target.Name -eq $NameUtf8 -or $conv.Target.Name -eq $NameUtf8Bom) -and @('.bat', '.cmd') -contains $file.Ext) { $batCount++ }
+                        }
+                    }
+                }
+            }
+            $bytes = $null
+            $conv  = $null
         }
+        Write-Progress -Activity '文字コード判定・変換' -Completed
 
         $targetLabel = @()
         if ($To) { $targetLabel += (Get-TargetEncoding $To $null).Name }
@@ -796,9 +866,6 @@ try {
         if ($cannotCount -gt 0) { $restParts += Format-Invariant '変換できない {0:N0} 件' $cannotCount }
         $restCount = $sameCount + $outCount + $cannotCount
         if ($restCount -gt 0) { $planLines.Add((Format-Invariant '変換しないファイル {0:N0} 件（{1}）' $restCount ($restParts -join '・'))) }
-        # よくある落とし穴を知らせる
-        $ps1Count = @($plan | Where-Object { $_.Target.Name -eq $NameUtf8 -and @('.ps1', '.psm1', '.psd1') -contains $_.Ext }).Count
-        $batCount = @($plan | Where-Object { ($_.Target.Name -eq $NameUtf8 -or $_.Target.Name -eq $NameUtf8Bom) -and @('.bat', '.cmd') -contains $_.Ext }).Count
         if ($ps1Count -gt 0) { $planLines.Add((Format-Invariant '※ .ps1 を BOM なしの UTF-8 にすると、Windows PowerShell 5.1 で日本語が化けます（{0:N0} 件）' $ps1Count)) }
         if ($batCount -gt 0) { $planLines.Add((Format-Invariant '※ .bat・.cmd を UTF-8 にすると、コマンドプロンプトで日本語が化けます（{0:N0} 件）' $batCount)) }
         foreach ($line in $planLines) {
@@ -807,8 +874,10 @@ try {
         }
 
         if ($plan.Count -eq 0) {
-            $lines.Add('変換するファイルはありません（すべてそろっています）')
-            Write-Host '変換するファイルはありません（すべてそろっています）'
+            # 変換できないファイルがあるときは、「そろっている」とは言わない
+            $message = if ($cannotCount -gt 0) { '変換するファイルはありません' } else { '変換するファイルはありません（すべてそろっています）' }
+            $lines.Add($message)
+            Write-Host $message
         } else {
             $message = '元のファイルは、保存先の backup フォルダに控えます'
             $lines.Add($message)
@@ -840,54 +909,84 @@ try {
                         Write-Progress -Activity '文字コード判定・変換' -Status (Format-Invariant '変換しています: {0:N0} / {1:N0} 件' ($doneCount + $failCount) $plan.Count) -CurrentOperation $file.Path
                         $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
                     }
-                    # 元のファイルを控える。控えられなければ変換しない
-                    $relative = $file.Path.Substring([math]::Min($basePrefixLen, $file.Path.Length))
-                    if ($targetIsFile) { $relative = Split-Path -Leaf $file.Path }
-                    $backupPath = Join-Path (Join-Path $runDir 'backup') $relative
+                    # ほかのプログラムが書き込めないように開いたまま、読む・控える・書く・読み直すまでを行う
                     try {
-                        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath (Split-Path -LiteralPath $backupPath)))
-                        [IO.File]::WriteAllBytes((ConvertTo-LongPath $backupPath), $file.Bytes)
+                        $stream = New-Object IO.FileStream($file.Full, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
                     } catch {
                         $file.Result = '失敗'
-                        $file.Note = '元のファイルを控えられないため、変換していません: ' + (Get-ErrorText (Get-InnerException $_.Exception))
+                        $file.Note = '開けないため、変換していません: ' + (Get-ErrorText (Get-InnerException $_.Exception))
                         $failCount++
                         continue
                     }
-                    # 隠しファイルにも書けるよう、作り直さずに開いて書き換える（アクセス権と属性はそのまま）
-                    $written = $false
                     try {
-                        $stream = New-Object IO.FileStream($file.Full, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
-                        try {
-                            $written = $true
-                            $stream.Write($file.NewBytes, 0, $file.NewBytes.Length)
-                            $stream.SetLength($file.NewBytes.Length)
-                        } finally {
-                            $stream.Dispose()
+                        $bytes = Read-StreamBytes $stream
+                        # 予定を立てた後（確認を待っている間など）に変わったファイルは、追記した分などを消さないよう、書かない
+                        if ((Get-BytesHash $bytes) -ne $file.Hash) {
+                            $file.Result = '失敗'
+                            $file.Note = '調べた後に変更されたため、変換していません'
+                            $failCount++
+                            continue
                         }
-                        # 読み直して、書いた内容と、文字に直した内容が変わっていないかを確かめる
-                        $check = [IO.File]::ReadAllBytes($file.Full)
-                        $preambleLength = $file.Target.Preamble.Length
-                        $checkText = $file.Target.Encoding.GetString($check, $preambleLength, $check.Length - $preambleLength)
-                        if (-not (Test-SameBytes $check $file.NewBytes) -or $checkText -cne $file.NewText) { throw '読み直した内容が、変換した内容と一致しません' }
-                        $file.Result = '変換した'
-                        $file.Note = $file.Change
-                        $doneCount++
-                    } catch {
-                        $reason = if ($_.Exception -is [Management.Automation.RuntimeException] -and -not $_.Exception.InnerException) { $_.Exception.Message } else { Get-ErrorText (Get-InnerException $_.Exception) }
-                        # 書き始めていたら、元の内容に戻す
-                        $restored = ''
-                        if ($written) {
+                        $conv = Get-Conversion $bytes
+                        # 元のファイルを控える。控えられなければ変換しない
+                        $relative = $file.Path.Substring([math]::Min($basePrefixLen, $file.Path.Length))
+                        if ($targetIsFile) { $relative = Split-Path -Leaf $file.Path }
+                        $backupPath = Join-Path (Join-Path $runDir 'backup') $relative
+                        try {
+                            [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath (Split-Path -LiteralPath $backupPath)))
+                            [IO.File]::WriteAllBytes((ConvertTo-LongPath $backupPath), $bytes)
+                        } catch {
+                            $file.Result = '失敗'
+                            $file.Note = '元のファイルを控えられないため、変換していません: ' + (Get-ErrorText (Get-InnerException $_.Exception))
+                            $failCount++
+                            continue
+                        }
+                        # 書き込みの途中で止まったときに、そのファイルを「失敗」と記録できるようにしておく
+                        $currentFile = $file
+                        try {
+                            $stream.Position = 0
+                            $stream.Write($conv.NewBytes, 0, $conv.NewBytes.Length)
+                            $stream.SetLength($conv.NewBytes.Length)
+                            $stream.Flush()
+                            # 読み直して、書いた内容と、文字に直した内容が変わっていないかを確かめる
+                            $stream.Position = 0
+                            $check = Read-StreamBytes $stream
+                            $same = Test-SameBytes $check $conv.NewBytes
+                            if ($same -and $null -ne $conv.NewText) {
+                                $preambleLength = $conv.Target.Preamble.Length
+                                $same = $conv.Target.Encoding.GetString($check, $preambleLength, $check.Length - $preambleLength) -ceq $conv.NewText
+                            }
+                            if (-not $same) { throw '読み直した内容が、変換した内容と一致しません' }
+                            $file.Result = '変換した'
+                            $file.Note = $file.Change
+                            $doneCount++
+                        } catch {
+                            $reason = if ($_.Exception -is [Management.Automation.RuntimeException] -and -not $_.Exception.InnerException) { $_.Exception.Message } else { Get-ErrorText (Get-InnerException $_.Exception) }
+                            # 元の内容に戻す
+                            $restored = '（元に戻しました）'
                             try {
-                                $stream = New-Object IO.FileStream($file.Full, [IO.FileMode]::Open, [IO.FileAccess]::Write, [IO.FileShare]::None)
-                                try { $stream.Write($file.Bytes, 0, $file.Bytes.Length); $stream.SetLength($file.Bytes.Length) } finally { $stream.Dispose() }
-                                $restored = '（元に戻しました）'
+                                $stream.Position = 0
+                                $stream.Write($bytes, 0, $bytes.Length)
+                                $stream.SetLength($bytes.Length)
+                                $stream.Flush()
                             } catch {
                                 $restored = '（元に戻せませんでした。backup のファイルから戻してください）'
                             }
+                            $file.Result = '失敗'
+                            $file.Note = $reason + $restored
+                            $failCount++
                         }
-                        $file.Result = '失敗'
-                        $file.Note = $reason + $restored
-                        $failCount++
+                        $currentFile = $null
+                    } finally {
+                        $stream.Dispose()
+                    }
+                    # 変換した後のサイズと最終更新日時を、一覧に書く
+                    if ($file.Result -eq '変換した') {
+                        try {
+                            $newInfo = New-Object IO.FileInfo $file.Full
+                            $file.Size = $newInfo.Length
+                            $file.Time = $newInfo.LastWriteTime
+                        } catch { }
                     }
                 }
                 Write-Progress -Activity '文字コード判定・変換' -Completed
@@ -918,7 +1017,12 @@ try {
     } elseif (-not $finished) {
         if ($convertStarted) {
             # 変換の途中で止まったときは、変換したファイルと控えが残っているため、結果も残す
-            foreach ($file in $sortedFiles) { if ($file.Result -eq '' -and $file.NewBytes) { $file.Result = '変換しなかった'; $file.Note = '中断したため、変換していません' } }
+            # 書き込みの途中だったファイルは、壊れているおそれがあるため「失敗」にする
+            if ($currentFile) {
+                $currentFile.Result = '失敗'
+                $currentFile.Note = '書き込みの途中で止まりました。backup のファイルから戻してください'
+            }
+            foreach ($file in $sortedFiles) { if ($file.Result -eq '' -and $file.Planned) { $file.Result = '変換しなかった'; $file.Note = '中断したため、変換していません' } }
             $stopText = if ($unexpected) { 'エラーで止まりました' } else { '中断しました' }
             $lines.Add(('{0}。それまでに変換したファイルと、控えたファイルは残っています' -f $stopText))
             Save-Result
