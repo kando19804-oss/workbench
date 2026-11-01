@@ -72,7 +72,7 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 外部コマンドの出力を `Select-Object -First` で途中まで読むと、7 ではそのコマンド自体が止まる
 - `-like` は `[ ]` を文字の範囲として解釈する。5.1 の `WildcardPattern.Escape` はバッククォートをエスケープしない。`*` だけを使わせたいときは、`` ` `` `[` `]` `?` を自分でエスケープして `WildcardPattern` を作る（正規表現の `.*` は、`*` が多いと極端に遅くなる）
 - `String.Normalize` は、壊れた文字（対になっていないサロゲート）を含む文字列で例外を出す。NTFS はそういうファイル名を許すので、ファイル名を扱う処理は例外に備える
-- `-ceq` `-eq` は序数ではなくカルチャの規則で比べ、NUL・C1 制御文字（U+0080～U+009F）・ソフトハイフンを無視する（`"A"+NUL -ceq NUL+"A"` が真になる。7 でも同じ）。バイト列を Latin-1 で文字にして比べるときなど、中身が同じかを確かめるときは `[string]::Equals($a, $b, [StringComparison]::Ordinal)` を使う。`String.EndsWith` `StartsWith` `IndexOf`（文字列を渡す版）も、序数で比べたいときは `[StringComparison]::Ordinal` を渡す
+- `-ceq` `-eq` は序数ではなくカルチャの規則で比べ、NUL とソフトハイフンを無視する（`"A"+NUL -ceq NUL+"A"` が真になる。5.1 と 7 の両方）。7 は C1 制御文字（U+0080～U+009F、U+0085 を除く）も無視するが、5.1 は無視しない。バイト列を Latin-1 で文字にして比べるときなど、中身が同じかを確かめるときは `[string]::Equals($a, $b, [StringComparison]::Ordinal)` を使う。`String.EndsWith` `StartsWith` `IndexOf`（文字列を渡す版）も、序数で比べたいときは `[StringComparison]::Ordinal` を渡す（7 では `("A"+NUL).EndsWith("A")` が真になる）
 - Excel は CSV の `.1` `.001` のような値を数値に変える。数値として読める文字列は `="..."` の形で出す
 - 日付や数値を `-f` で整形すると、OS の地域設定で区切り文字が変わる。出力には `InvariantCulture` を使う
 - .NET の例外メッセージは、途中や末尾に改行が入ることがある。表示する前に 1 行にまとめる
