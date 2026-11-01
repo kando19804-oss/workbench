@@ -273,6 +273,7 @@ function Test-LocalAddress([long]$Value) {
 $startTime = Get-Date
 $adapters  = Get-LocalAdapter
 $networks  = New-Object 'System.Collections.Generic.List[object]'
+$tooLarge  = New-Object 'System.Collections.Generic.List[string]'   # 自動で決めるときに、大きすぎて飛ばしたネットワークの知らせ
 
 if ($Range.Count -gt 0) {
     # -File で起動すると配列を渡せないため、カンマ区切りの 1 つの文字列も受け付ける
@@ -315,19 +316,23 @@ if ($Range.Count -gt 0) {
         Stop-WithError (Format-Invariant '-Range の範囲が大きすぎます（{0:N0} 件）。合わせて {1:N0} 件までにして、分けて実行してください' $total $MaxManual)
     }
 } else {
-    # 既定のゲートウェイのあるアダプターのネットワークを探す
+    # 既定のゲートウェイのあるアダプターのネットワークを探す。大きすぎるネットワーク（社内 VPN の /16 など）は飛ばし、ほかは探す
     foreach ($adapter in $adapters) {
         if ($adapter.Gateways.Count -eq 0) { continue }
         $net = New-CidrRange $adapter.Address $adapter.Prefix
         $count = $net.Last - $net.First + 1
         if ($count -gt $MaxAuto) {
-            Stop-WithError ((Format-Invariant 'この PC のネットワーク {0}（{1}）は大きすぎるため、探しません（{2:N0} 件。{3:N0} 件までです）。' $net.Label $adapter.Name $count $MaxAuto) + "`r`n" +
-                '-Range で、探す範囲を狭めて指定してください（例: -Range "' + (ConvertTo-IpText ($adapter.Address - ($adapter.Address % 256))) + '/24"）')
+            $tooLarge.Add(((Format-Invariant '※ {0}（{1}）は大きすぎるため、探していません（{2:N0} 件。{3:N0} 件までです）。' $net.Label $adapter.Name $count $MaxAuto) +
+                '探すときは -Range で範囲を狭めて指定してください（例: -Range "' + (ConvertTo-IpText ($adapter.Address - ($adapter.Address % 256))) + '/24"）'))
+            continue
         }
         if (@($networks | Where-Object { $_.Label -eq $net.Label }).Count -gt 0) { continue }
         $net.Adapter = $adapter
         $net.Coverage = 'inside'
         $networks.Add($net)
+    }
+    if ($networks.Count -eq 0 -and $tooLarge.Count -gt 0) {
+        Stop-WithError (($tooLarge -join "`r`n").Replace('※ ', '').Replace('探していません', '探しません'))
     }
     if ($networks.Count -eq 0) {
         Stop-WithError ('探すネットワークを決められません（既定のゲートウェイが設定されたネットワーク アダプターがありません）。' + "`r`n" + '-Range で範囲を指定してください（例: -Range "192.168.1.0/24"）')
@@ -569,6 +574,7 @@ try {
     $selfText = @($adapters | Where-Object { $_.Gateways.Count -gt 0 } | ForEach-Object { $_.Ip }) -join ', '
     if (-not $selfText) { $selfText = @($adapters | ForEach-Object { $_.Ip }) -join ', ' }
     $lines.Add((Format-Invariant '{0:yyyy-MM-dd HH:mm:ss}   {1}（{2}）' $startTime $machineName $selfText))
+    foreach ($note in $tooLarge) { $lines.Add($note) }
     foreach ($net in $outside) {
         if ($net.Coverage -eq 'partial') {
             $lines.Add(('※ {0} の一部は、この PC のネットワークの外です。その部分は MAC アドレスが分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
