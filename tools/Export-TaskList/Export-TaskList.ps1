@@ -439,15 +439,13 @@ $tasks     = New-Object 'System.Collections.Generic.List[object]'
 $skipped   = New-Object 'System.Collections.Generic.List[object]'
 $skipKinds = [ordered]@{ '権限なし' = 0; 'その他のエラー' = 0 }
 
-function Add-Skip([string]$ItemPath, [Exception]$Exception, [string]$Prefix) {
+# スキップの件数は、読めなかったフォルダとタスクだけを数える（XML を保存できなかったタスクは、一覧には載るので別の行で知らせる）
+function Add-Skip([string]$ItemPath, [Exception]$Exception, [string]$Prefix, [bool]$NoCount) {
     $ex = Get-InnerException $Exception
-    if (Test-AccessDenied $ex) {
-        $skipped.Add([object[]]@('権限なし', $ItemPath, ($Prefix + 'アクセスが拒否されました')))
-        $skipKinds['権限なし']++
-    } else {
-        $skipped.Add([object[]]@('その他のエラー', $ItemPath, ($Prefix + (Get-ErrorText $ex))))
-        $skipKinds['その他のエラー']++
-    }
+    $reason = if (Test-AccessDenied $ex) { '権限なし' } else { 'その他のエラー' }
+    $detail = if ($reason -eq '権限なし') { 'アクセスが拒否されました' } else { Get-ErrorText $ex }
+    $skipped.Add([object[]]@($reason, $ItemPath, ($Prefix + $detail)))
+    if (-not $NoCount) { $skipKinds[$reason]++ }
 }
 
 # 読んでいる途中や保存の途中で Ctrl+C されたときや、保存に失敗したときは、書きかけの結果を残さない
@@ -552,7 +550,7 @@ try {
     $lines.Add((Format-Invariant '対象: {0}（管理者: {1}）   {2:yyyy-MM-dd HH:mm:ss}' $machineName $(if ($isAdmin) { 'はい' } else { 'いいえ' }) $startTime))
     if ($includeMicrosoft -and $taskRoot -eq '\') {
         $lines.Add(('範囲: {0} の下（Windows 標準のタスクを含む）' -f $taskRoot))
-    } elseif ($includeMicrosoft) {
+    } elseif ($includeMicrosoft -or $taskRoot -ne '\') {
         $lines.Add(('範囲: {0} の下' -f $taskRoot))
     } else {
         $lines.Add(('範囲: {0} の下（\Microsoft\ の下を除く）' -f $taskRoot))
@@ -626,7 +624,7 @@ try {
                         [IO.File]::WriteAllText((ConvertTo-LongPath $xmlPath), $task.Xml, [Text.Encoding]::Unicode)
                         $task.XmlFile = $relative
                     } catch {
-                        Add-Skip $task.Path $_.Exception 'XML を保存できません: '
+                        Add-Skip $task.Path $_.Exception 'XML を保存できません: ' $true
                         $xmlFailed++
                     }
                 }
