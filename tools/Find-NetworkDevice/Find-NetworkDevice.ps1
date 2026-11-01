@@ -13,7 +13,7 @@
         powershell -ExecutionPolicy Bypass -File .\Find-NetworkDevice.ps1
 
 .PARAMETER Range
-    探す IP アドレスの範囲。"192.168.1.0/24"（CIDR）か "192.168.1.10-192.168.1.50"（始まりと終わり）で書きます。
+    探す IP アドレスの範囲。"192.168.1.0/24"（CIDR）、"192.168.1.10-192.168.1.50"（始まりと終わり）、"192.168.1.1"（1 つだけ）で書きます。
     カンマで区切って複数書けます。合わせて 4,096 件までです。省略すると、この PC のネットワークを探します。
 
 .PARAMETER Timeout
@@ -47,7 +47,7 @@
 #Requires -Version 5.1
 [CmdletBinding(PositionalBinding = $false)]
 param(
-    [string]$Range,
+    [string[]]$Range = @(),
 
     [ValidateRange(100, 10000)]
     [int]$Timeout = 500,
@@ -70,6 +70,14 @@ $Invariant      = [Globalization.CultureInfo]::InvariantCulture
 $Utf8Bom        = New-Object Text.UTF8Encoding $true
 $OnWindows      = [IO.Path]::DirectorySeparatorChar -eq '\'   # 開発用に Mac の pwsh でも動かせるようにするため
 $machineName    = if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Environment]::MachineName }
+
+# .NET Framework の名前解決はスレッドプールの上で 1 件ずつ止まって待つため、引けない名前が多いと
+# スレッドが足りなくなり、後ろの引ける名前まで待ち時間を超えてしまう。同時に問い合わせる数だけ、スレッドを先に用意しておく
+try {
+    $minWorker = 0; $minIo = 0
+    [Threading.ThreadPool]::GetMinThreads([ref]$minWorker, [ref]$minIo)
+    if ($minWorker -lt $Parallel * 2) { [void][Threading.ThreadPool]::SetMinThreads($Parallel * 2, $minIo) }
+} catch { }
 
 #region 補助関数
 
@@ -249,6 +257,15 @@ function Get-LocalAdapter {
     return , $list
 }
 
+# この PC のネットワーク（アダプターの IP アドレスとサブネット マスクで決まる範囲）に入る IP アドレスか
+function Test-LocalAddress([long]$Value) {
+    foreach ($adapter in $adapters) {
+        $local = New-CidrRange $adapter.Address $adapter.Prefix
+        if ($Value -ge $local.Network -and $Value -le $local.Network + $local.Size - 1) { return $true }
+    }
+    return $false
+}
+
 #endregion
 
 #region 引数の確認
@@ -257,33 +274,37 @@ $startTime = Get-Date
 $adapters  = Get-LocalAdapter
 $networks  = New-Object 'System.Collections.Generic.List[object]'
 
-if ($Range) {
-    $rangeText = Remove-Quote $Range
-    foreach ($part in ($rangeText -split ',')) {
+if ($Range.Count -gt 0) {
+    # -File で起動すると配列を渡せないため、カンマ区切りの 1 つの文字列も受け付ける
+    $rangeParts = @(foreach ($item in $Range) { (Remove-Quote $item) -split ',' })
+    foreach ($part in $rangeParts) {
         $item = $part.Trim().Trim("'")
         if (-not $item) { continue }
         if ($item -match '^([\d.]+)/(\d{1,2})$') {
             $address = ConvertTo-IpNumber $Matches[1]
             $prefix  = [int]$Matches[2]
-            if ($null -eq $address -or $prefix -lt 1 -or $prefix -gt 32) { Stop-WithError ('-Range の書き方が正しくありません: {0}（"192.168.1.0/24" か "192.168.1.10-192.168.1.50" の形で書きます）' -f $item) }
+            if ($null -eq $address -or $prefix -lt 1 -or $prefix -gt 32) { Stop-WithError ('-Range の書き方が正しくありません: {0}（"192.168.1.0/24"、"192.168.1.10-192.168.1.50"、"192.168.1.1" のどれかの形で書きます）' -f $item) }
             $net = New-CidrRange $address $prefix
         } elseif ($item -match '^([\d.]+)\s*-\s*([\d.]+)$') {
             $first = ConvertTo-IpNumber $Matches[1]
             $last  = ConvertTo-IpNumber $Matches[2]
-            if ($null -eq $first -or $null -eq $last -or $first -gt $last) { Stop-WithError ('-Range の書き方が正しくありません: {0}（"192.168.1.0/24" か "192.168.1.10-192.168.1.50" の形で書きます）' -f $item) }
+            if ($null -eq $first -or $null -eq $last -or $first -gt $last) { Stop-WithError ('-Range の書き方が正しくありません: {0}（"192.168.1.0/24"、"192.168.1.10-192.168.1.50"、"192.168.1.1" のどれかの形で書きます）' -f $item) }
             $net = @{ Label = '{0}-{1}' -f (ConvertTo-IpText $first), (ConvertTo-IpText $last); First = $first; Last = $last }
         } elseif ($item -match '^[\d.]+$' -and $null -ne (ConvertTo-IpNumber $item)) {
             # 1 つだけの IP アドレス
             $single = ConvertTo-IpNumber $item
             $net = @{ Label = $item; First = $single; Last = $single }
         } else {
-            Stop-WithError ('-Range の書き方が正しくありません: {0}（"192.168.1.0/24" か "192.168.1.10-192.168.1.50" の形で書きます）' -f $item)
+            Stop-WithError ('-Range の書き方が正しくありません: {0}（"192.168.1.0/24"、"192.168.1.10-192.168.1.50"、"192.168.1.1" のどれかの形で書きます）' -f $item)
         }
-        # この PC のネットワークの中なら、ARP で MAC アドレスが分かる
+        # この PC のネットワークに、全部が入るか、一部が入るか（入る部分は ARP で MAC アドレスが分かる）
         $net.Adapter = $null
+        $net.Coverage = 'outside'
         foreach ($adapter in $adapters) {
             $local = New-CidrRange $adapter.Address $adapter.Prefix
-            if ($net.First -ge $local.Network -and $net.Last -le $local.Network + $local.Size - 1) { $net.Adapter = $adapter; break }
+            $localLast = $local.Network + $local.Size - 1
+            if ($net.First -ge $local.Network -and $net.Last -le $localLast) { $net.Adapter = $adapter; $net.Coverage = 'inside'; break }
+            if ($net.First -le $localLast -and $net.Last -ge $local.Network) { $net.Adapter = $adapter; $net.Coverage = 'partial' }
         }
         $networks.Add($net)
     }
@@ -305,6 +326,7 @@ if ($Range) {
         }
         if (@($networks | Where-Object { $_.Label -eq $net.Label }).Count -gt 0) { continue }
         $net.Adapter = $adapter
+        $net.Coverage = 'inside'
         $networks.Add($net)
     }
     if ($networks.Count -eq 0) {
@@ -427,9 +449,10 @@ try {
         if ($null -ne $value) { $arpTable[$value] = $mac }
     }
     foreach ($net in $networks) {
-        if (-not $net.Adapter) { continue }   # この PC のネットワークの外は、ARP の表に載らない
         foreach ($value in @($arpTable.Keys)) {
             if ($value -lt $net.First -or $value -gt $net.Last) { continue }
+            # この PC のネットワークの外のアドレスは、ARP の表に載っていても使わない（ルーターの MAC アドレスになっているため）
+            if (-not (Test-LocalAddress $value)) { continue }
             if ($devices.ContainsKey($value)) {
                 if (-not $devices[$value].Mac) { $devices[$value].Mac = $arpTable[$value] }
             } else {
@@ -450,24 +473,26 @@ try {
     #region 名前
 
     Write-Progress -Activity 'ネットワークの機器一覧' -Status (Format-Invariant '名前を調べています: {0:N0} 台' $devices.Count)
-    # DNS の逆引きを、まとめて問い合わせる
-    $dnsJobs = New-Object 'System.Collections.Generic.List[object]'
-    $dnsTasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
-    foreach ($device in $devices.Values) {
-        if ($device.Kind -eq 'この PC') { continue }
-        try {
-            $task = [Net.Dns]::GetHostEntryAsync([Net.IPAddress]::Parse((ConvertTo-IpText $device.Ip)))
-            $dnsJobs.Add(@{ Device = $device; Task = $task })
-            $dnsTasks.Add($task)
-        } catch { }
-    }
-    if ($dnsTasks.Count -gt 0) { try { [void][Threading.Tasks.Task]::WaitAll($dnsTasks.ToArray(), $NameWaitMs) } catch { } }
-    foreach ($job in $dnsJobs) {
-        $task = $job.Task
-        if ($task.Status -ne 'RanToCompletion') { continue }
-        $hostName = [string]$task.Result.HostName
-        # 名前が分からないときは、IP アドレスがそのまま返ることがある
-        if ($hostName -and $hostName -ne (ConvertTo-IpText $job.Device.Ip)) { $job.Device.Name = $hostName; $job.Device.NameBy = 'DNS' }
+    # DNS の逆引きを、ping と同じ数ずつまとめて問い合わせる（一度に始めると、待ち時間を数え始めた後に始まる問い合わせが出るため）
+    $dnsTargets = @($devices.Values | Where-Object { $_.Kind -ne 'この PC' })
+    for ($offset = 0; $offset -lt $dnsTargets.Count; $offset += $Parallel) {
+        $dnsJobs = New-Object 'System.Collections.Generic.List[object]'
+        $dnsTasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
+        for ($i = $offset; $i -lt [math]::Min($offset + $Parallel, $dnsTargets.Count); $i++) {
+            try {
+                $task = [Net.Dns]::GetHostEntryAsync([Net.IPAddress]::Parse((ConvertTo-IpText $dnsTargets[$i].Ip)))
+                $dnsJobs.Add(@{ Device = $dnsTargets[$i]; Task = $task })
+                $dnsTasks.Add($task)
+            } catch { }
+        }
+        if ($dnsTasks.Count -gt 0) { try { [void][Threading.Tasks.Task]::WaitAll($dnsTasks.ToArray(), $NameWaitMs) } catch { } }
+        foreach ($job in $dnsJobs) {
+            $task = $job.Task
+            if ($task.Status -ne 'RanToCompletion') { continue }
+            $hostName = [string]$task.Result.HostName
+            # 名前が分からないときは、IP アドレスがそのまま返ることがある
+            if ($hostName -and $hostName -ne (ConvertTo-IpText $job.Device.Ip)) { $job.Device.Name = $hostName; $job.Device.NameBy = 'DNS' }
+        }
     }
 
     # DNS で分からなかった機器は、NetBIOS の名前（ノード状態）を UDP 137 番に問い合わせる。1 つのソケットからまとめて送り、まとめて受け取る
@@ -486,6 +511,8 @@ try {
         $udp = $null
         try {
             $udp = New-Object Net.Sockets.UdpClient 0
+            # NetBIOS に答えない機器から ICMP のポート到達不能が返ると、Windows は次の Receive を例外にする。それを止める
+            try { [void]$udp.Client.IOControl(-1744830452, [byte[]](0, 0, 0, 0), $null) } catch { }
             $index = 0
             foreach ($ipText in $byIp.Keys) {
                 $index++
@@ -537,13 +564,17 @@ try {
         $count = $net.Last - $net.First + 1
         $where = if ($net.Adapter) { '   ' + $net.Adapter.Name } else { '' }
         $lines.Add((Format-Invariant '対象: {0}（{1} ～ {2}・{3:N0} 件）{4}' $net.Label (ConvertTo-IpText $net.First) (ConvertTo-IpText $net.Last) $count $where))
-        if (-not $net.Adapter) { $outside += $net.Label }
+        if ($net.Coverage -ne 'inside') { $outside += $net }
     }
     $selfText = @($adapters | Where-Object { $_.Gateways.Count -gt 0 } | ForEach-Object { $_.Ip }) -join ', '
     if (-not $selfText) { $selfText = @($adapters | ForEach-Object { $_.Ip }) -join ', ' }
     $lines.Add((Format-Invariant '{0:yyyy-MM-dd HH:mm:ss}   {1}（{2}）' $startTime $machineName $selfText))
-    foreach ($label in $outside) {
-        $lines.Add(('※ {0} は、この PC のネットワークの外です。MAC アドレスは分かりません（ping に応答した機器だけを載せます）' -f $label))
+    foreach ($net in $outside) {
+        if ($net.Coverage -eq 'partial') {
+            $lines.Add(('※ {0} の一部は、この PC のネットワークの外です。その部分は MAC アドレスが分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
+        } else {
+            $lines.Add(('※ {0} は、この PC のネットワークの外です。MAC アドレスは分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
+        }
     }
     $lines.Add('')
 
