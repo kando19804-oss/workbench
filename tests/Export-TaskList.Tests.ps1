@@ -10,8 +10,8 @@
     XML ファイルの列が - で始まる場合を確かめるため、ルート（\）にも、名前に目印（-wbt_ET_<日時>）を付けた
     タスクを 1 つだけ登録します。
 
-    管理者だけが登録できるもの（起動時のトリガー、SYSTEM など）と、読み取りを拒否したタスクは、
-    管理者のときだけ試します（管理者でないと、アクセス拒否の設定が途中までしか効かず、消せなくなるため）。
+    管理者だけが登録できるもの（起動時のトリガー、SYSTEM など）は、管理者のときだけ試します。
+    読めないタスク（権限なし）は、タスクスケジューラが一覧から除くため、再現できず試しません。
 
     結果の既定の保存先はスクリプトのフォルダなので、リポジトリに結果を作らないよう、一時フォルダにコピーした
     スクリプトを動かします。テスト用のタスクとフォルダ、一時フォルダの結果は、終了時に削除します。
@@ -282,13 +282,14 @@ function Remove-TestFolder([string]$FolderPath) {
 }
 
 # COM から消せなかったもの（読み取りを拒否したタスクや、登録の途中で拒否されて残ったタスクのファイル）は、
-# タスクのファイル（%windir%\System32\Tasks の下）のアクセス拒否を外してから消す
-function Clear-TestLeftovers {
-    $disk = Join-Path $env:windir ('System32\Tasks\' + $testRel)
+# タスクのファイル（%windir%\System32\Tasks の下）のアクセス拒否を外してから消す。Sub を指定したときは、そのフォルダの下だけ
+function Clear-TestLeftovers([string]$Sub) {
+    $folderPath = if ($Sub) { "$testDir\$Sub" } else { $testDir }
+    $disk = Join-Path $env:windir ('System32\Tasks' + $folderPath)
     if (-not [IO.Directory]::Exists($disk)) { return }
     $null = & icacls.exe $disk /remove:d "*$userSid" /t /c /q 2>&1
     foreach ($file in @(Get-ChildItem -LiteralPath $disk -Recurse -File -Force -ErrorAction SilentlyContinue)) {
-        $taskPath = $testDir + $file.FullName.Substring($disk.Length)
+        $taskPath = $folderPath + $file.FullName.Substring($disk.Length)
         $cut = $taskPath.LastIndexOf('\')
         try {
             $service.GetFolder($taskPath.Substring(0, $cut)).DeleteTask($taskPath.Substring($cut + 1), 0)
@@ -299,7 +300,7 @@ function Clear-TestLeftovers {
             if ($ex.HResult -eq -2147024894) { try { $file.Delete() } catch { } }
         }
     }
-    Remove-TestFolder $testDir
+    Remove-TestFolder $folderPath
 }
 
 function Remove-RootTestTasks {
@@ -772,32 +773,9 @@ try {
             Write-Skip 'XML を保存できないタスク' 'テスト用のタスクを登録できなかったため'
         }
 
-        Write-Section '権限なし'
-        if ($isAdmin) {
-            # 読み取りを拒否したタスク。プロパティを読むときの権限エラーも「権限なし」に分ける
-            $denyOk = $true
-            try {
-                Register-TestTask 'deny\open' { param($d) $t = $d.Triggers.Create(1); $t.StartBoundary = $start }
-                Register-TestTask 'deny\secret' { param($d) $t = $d.Triggers.Create(1); $t.StartBoundary = $start } ('D:(D;;FR;;;{0})(A;;FA;;;BA)(A;;FA;;;SY)' -f $userSid)
-            } catch { $denyOk = $false; '  （登録できなかった: {0}）' -f ($_.Exception.Message -replace '\s+', ' ') }
-            if ($denyOk) {
-                $run = Invoke-Tool 'denied' @('-Path', "$testDir\deny")
-                $x = Read-Result $run.Dir
-                $row = @($x.Skipped | Where-Object { $_.'パス' -eq "$testDir\deny\secret" })
-                if ($row.Count -gt 0) {
-                    Assert-Equal '読めないタスクは権限なし' ('{0}/{1}' -f (($row | ForEach-Object { '{0}:{1}' -f $_.'理由', $_.'詳細' }) -join ','), $run.Log.Contains('スキップ 1 件（権限なし）')) '権限なし:アクセスが拒否されました/True'
-                    Assert-Equal '読めないタスクがあっても、ほかのタスクは出す（終了コード 0）' ('{0}/{1}/{2}' -f $run.Code, @(Get-TaskRow $x.Tasks 'deny\open').Count, @(Get-TaskRow $x.Tasks 'deny\secret').Count) '0/1/0'
-                } else {
-                    Write-Skip '読めないタスク' ('一覧からも消えたため（エラーにならなかった）。tasks.csv の行: {0}' -f $x.Tasks.Count)
-                }
-            } else {
-                Write-Skip '読めないタスク' 'アクセス拒否のタスクを登録できなかったため'
-            }
-            Clear-TestLeftovers
-            Assert-Equal '読めないタスクを片付けた' ([IO.Directory]::Exists((Join-Path $env:windir ('System32\Tasks\' + $testRel + '\deny')))) 'False'
-        } else {
-            Write-Skip '読めないタスク' '管理者でないと、アクセス拒否の設定が途中までしか効かず、消せなくなるため'
-        }
+        # 読めないタスク（権限なし）は再現できないため、試さない。タスクスケジューラは、読めないタスクを一覧から除く。
+        # 読み取りを拒否して登録しようとすると、管理者でも登録の時点で拒否される（タスクのファイルだけが残る）。
+        # 管理者でないときは、登録したタスクやフォルダのアクセス拒否の変更も、拒否されるのに途中まで効いて、消せなくなる
 
         Write-Section 'Ctrl+C で中断（読んでいる途中で停止）'
         $stopScript = New-HelperScript 'stop-during-read.ps1' @(
@@ -829,6 +807,7 @@ try {
             $cultureOut = Join-Path $workRoot 'out\culture'
             $command = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; & '{0}' -Path '{1}' -NoXml -OutputFolder '{2}' | Out-Null" -f $tool.Replace("'", "''"), $testDir, $cultureOut.Replace("'", "''")
             $null = & $Exe -NoProfile -ExecutionPolicy Bypass -Command $command 2>&1
+            Assert-Equal 'fi-FI で実行して保存できた' ([bool](Get-RunDir $cultureOut)) 'True'
             $x = Read-Result (Get-RunDir $cultureOut)
             $summaryText = $x.Lines -join "`n"
             Assert-Equal 'fi-FI でも対象の行の日時は yyyy-MM-dd HH:mm:ss' ([regex]::IsMatch($summaryText, '対象: .*   \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}')) 'True'
@@ -841,7 +820,7 @@ try {
         }
 
         Write-Section 'レビューで見つかった問題の再発防止'
-        # 1. プロパティを読むときの権限エラーも「権限なし」に分ける（上の「権限なし」で確かめている。管理者のときだけ）
+        # 1. プロパティを読むときの権限エラーも「権限なし」に分ける（読めないタスクを再現できないため、確かめられない）
         # 2. XML の名前が重なったら _2 を付け、1 件保存できなくても続ける（上の「XML」と「XML を保存できないタスク」で確かめている）
         # 3. XML ファイルの列も Excel 対策する（上の「範囲」の、ルートのタスクで確かめている）
         # 4. -Path を開けないときと見つからないときの表示を分ける（見つからないときは「止まるとき」で確かめている。
@@ -861,7 +840,7 @@ try {
 
     Write-Section '管理者でないときの注意'
     $run = Invoke-Plain @('-Path', $(if ($testFolder) { $testDir } else { '\' }), '-NoSave')
-    Assert-Equal '管理者でないときの注意' $run.Log.Contains('※ 管理者として実行していないため、ほかのユーザーや SYSTEM のタスクが出ないことがあります') (-not $isAdmin)
+    Assert-Equal '管理者でないときの注意（管理者のときは出さない）' ('{0}/{1}' -f $run.Code, $run.Log.Contains('※ 管理者として実行していないため、ほかのユーザーや SYSTEM のタスクが出ないことがあります')) ('0/{0}' -f (-not $isAdmin))
 } finally {
     foreach ($path in $denied) { $null = & icacls.exe $path /remove:d "*$userSid" 2>&1 }
     if ($KeepTemp) {
@@ -869,7 +848,7 @@ try {
     } else {
         if ($testFolder) {
             Remove-TestFolder $testDir
-            Clear-TestLeftovers
+            Clear-TestLeftovers ''
             # ほかのテストが使っていなければ、\workbench-tests も消す
             try {
                 $top = $service.GetFolder($testTop)
