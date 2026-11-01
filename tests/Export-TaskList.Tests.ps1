@@ -408,7 +408,8 @@ try {
             $c = $d.Actions.Create(5); $c.ClassId = '{11111111-2222-3333-4444-555555555555}'
             $e = $d.Actions.Create(0); $e.Path = 'C:\Program Files\Example\tool.exe'; $e.Arguments = '-a "b c"'; $e.WorkingDirectory = 'D:\work'
             $e2 = $d.Actions.Create(0); $e2.Path = 'cmd.exe'; $e2.Arguments = '/c exit 0'
-            $d.RegistrationInfo.Description = '１２３'
+            # 全角のピリオドは数字の判定の正規表現に当たらないため、半角にそろえてから判定しないと見落とす
+            $d.RegistrationInfo.Description = '１．５'
         }
         Add-TestTask '-dash' {
             param($d)
@@ -524,7 +525,7 @@ try {
 
         Write-Section 'Excel 対策（="..."）'
         Assert-Equal '日付に見える説明' (Get-TaskField $x.Tasks 'daily' '説明') '="2026-10-31"'
-        Assert-Equal '全角の数字の説明' (Get-TaskField $x.Tasks 'actions' '説明') '="１２３"'
+        Assert-Equal '全角の数字の説明' (Get-TaskField $x.Tasks 'actions' '説明') '="１．５"'
         Assert-Equal '+ で始まる作成者' (Get-TaskField $x.Tasks '-dash' '作成者') '="+81 3"'
         Assert-Equal '255 文字を超える = で始まる説明は、先頭に空白' (Get-TaskField $x.Tasks '-dash' '説明') (' =' + ('x' * 299))
         Assert-Equal '- で始まる名前' @($x.Tasks | Where-Object { $_.'タスク名' -ceq '="-dash"' }).Count 1
