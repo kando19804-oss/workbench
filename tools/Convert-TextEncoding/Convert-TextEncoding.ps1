@@ -591,6 +591,7 @@ function Get-ExcludeMatch([string]$FullPath) {
 # 中身は持ち続けない（判定だけのときは使わず、変換するときは、書き込む直前にもう一度読むため）
 $readBuffer = New-Object 'byte[]' $SniffBytes
 function Add-FileInfo($Entry) {
+    Stop-IfCtrlC
     $display = ConvertTo-DisplayPath $Entry.FullName
     # OneDrive などのクラウドのみのファイルは、読むとダウンロードが始まるため、調べない
     if (([int]$Entry.Attributes -band $OnlineMask) -ne 0) {
@@ -627,6 +628,38 @@ function Add-FileInfo($Entry) {
     })
 }
 
+# 5.1 は、Ctrl+C（パイプラインの停止）を取りこぼして動き続けることがあり、変換の途中ではほとんど止まらない。
+# 変換するときは、コンソールで動かしている間、Ctrl+C をキーの入力として受け取り、ファイルの区切りごとに確かめて止める
+# （書き込みの途中では止めない）。止めたあとの片付けと結果の保存は、finally で行う
+$ctrlCSaved = $null   # 変える前の TreatControlCAsInput（変えていないときは $null）
+function Enable-CtrlCInput {
+    if (-not $converting -or $null -ne $script:ctrlCSaved) { return }
+    try {
+        if ([Console]::IsInputRedirected) { return }
+        $saved = [Console]::TreatControlCAsInput
+        [Console]::TreatControlCAsInput = $true
+        $script:ctrlCSaved = $saved
+    } catch { }   # コンソールがないとき（タスクスケジューラなど）は、通常の Ctrl+C のまま
+}
+
+function Disable-CtrlCInput {
+    if ($null -eq $script:ctrlCSaved) { return }
+    try { [Console]::TreatControlCAsInput = $script:ctrlCSaved } catch { }
+    $script:ctrlCSaved = $null
+}
+
+function Stop-IfCtrlC {
+    if ($null -eq $script:ctrlCSaved) { return }
+    $pressed = $false
+    try {
+        while ([Console]::KeyAvailable) {
+            $key = [Console]::ReadKey($true)
+            if ($key.Key -eq [ConsoleKey]::C -and ($key.Modifiers -band [ConsoleModifiers]::Control)) { $pressed = $true }
+        }
+    } catch { }
+    if ($pressed) { exit 1 }
+}
+
 # 調べている途中や変換の途中で Ctrl+C されたときに、どこまで進んだかを残せるようにする
 $finished   = $false
 $unexpected = $false
@@ -658,6 +691,7 @@ $nextProgress = 0L
 try {
     #region 調べる
 
+    Enable-CtrlCInput
     if ($targetIsFile) {
         Add-FileInfo (New-Object IO.FileInfo (ConvertTo-LongPath $target))
     } else {
@@ -666,6 +700,7 @@ try {
         $stack.Push((New-Object IO.DirectoryInfo (ConvertTo-LongPath $target)))
         $isRoot = $true
         while ($stack.Count -gt 0) {
+            Stop-IfCtrlC
             $dir = $stack.Pop()
             if ($sw.ElapsedMilliseconds -ge $nextProgress) {
                 Write-Progress -Activity '文字コード判定・変換' -Status (Format-Invariant 'ファイル {0:N0} 件' $files.Count) -CurrentOperation (ConvertTo-DisplayPath $dir.FullName)
@@ -791,6 +826,7 @@ try {
         $ps1Count = 0; $batCount = 0
         $changeKinds = [ordered]@{}
         foreach ($file in $sortedFiles) {
+            Stop-IfCtrlC
             if ($sw.ElapsedMilliseconds -ge $nextProgress) {
                 Write-Progress -Activity '文字コード判定・変換' -Status '変換の予定を立てています' -CurrentOperation $file.Path
                 $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
@@ -884,6 +920,9 @@ try {
                 # 画面のない実行（タスクスケジューラの「ログオンしているかどうかにかかわらず実行する」など）で、確認待ちのまま止まり続けないようにする
                 $cannotAsk = '確認できないため、変換しません。確認せずに変換するときは -Force を付けてください'
                 if (-not [Environment]::UserInteractive) { Stop-WithError $cannotAsk }
+                # 確認を待つ間は、通常の Ctrl+C に戻す（キーの入力として受け取ると、Read-Host に Ctrl+C の文字が入るため）
+                Stop-IfCtrlC
+                Disable-CtrlCInput
                 $answer = ''
                 while ($answer -notmatch '^[YyNnＹｙＮｎ]') {
                     # -NonInteractive で起動されていると、Read-Host は英語のエラーで止まる
@@ -898,10 +937,13 @@ try {
                 $lines.Add('変換しませんでした')
                 Write-Host '変換しませんでした'
             } else {
+                Enable-CtrlCInput
                 $convertStarted = $true
                 $convertWatch = [Diagnostics.Stopwatch]::StartNew()
                 $doneCount = 0; $failCount = 0
                 foreach ($file in $plan) {
+                    # 押されていたら、ここ（前のファイルを書き終えた後）で止める
+                    Stop-IfCtrlC
                     if ($sw.ElapsedMilliseconds -ge $nextProgress) {
                         Write-Progress -Activity '文字コード判定・変換' -Status (Format-Invariant '変換しています: {0:N0} / {1:N0} 件' ($doneCount + $failCount) $plan.Count) -CurrentOperation $file.Path
                         $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
@@ -1016,6 +1058,7 @@ try {
     $unexpected = $true
     throw
 } finally {
+    Disable-CtrlCInput
     Write-Progress -Activity '文字コード判定・変換' -Completed
     if (-not $finished -and $stopping) {
         # 止めた理由は、Stop-WithError が表示している
