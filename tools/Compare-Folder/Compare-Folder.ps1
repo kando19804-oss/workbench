@@ -858,12 +858,17 @@ if (-not $NoSave) {
     $runPrefix = if ($Snapshot) { 'FolderSnapshot_' } else { 'FolderDiff_' }
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
+        # \\?\ 付きのパスでは末尾のピリオドや空白が残るため、先に通常の書き方で整える（260 文字を超えると例外になるので、そのときはそのまま）
+        try { $baseDir = [IO.Path]::GetFullPath($baseDir) } catch { }
         $runName = Format-Invariant '{0}{1}_{2:yyyyMMdd_HHmmss}' $runPrefix $machineName $startTime
         $runDir  = Join-Path $baseDir $runName
         # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
         $suffix = 1
-        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-        [void][IO.Directory]::CreateDirectory($runDir)
+        while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) {
+            $suffix++
+            $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix)
+        }
+        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
     } catch {
         $reason = Get-ErrorText (Get-InnerException $_.Exception)
         $runDir = $null
@@ -1215,13 +1220,13 @@ try {
     if (-not $fatal -and $runDir) {
         Write-Progress -Activity 'フォルダ差分' -Status '結果を保存しています'
         try {
-            [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
+            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$lines, $Utf8Bom)
             if ($Snapshot) {
-                Save-Csv (Join-Path $runDir 'snapshot.csv') $SnapshotColumns $rows
+                Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'snapshot.csv')) $SnapshotColumns $rows
             } else {
-                Save-Csv (Join-Path $runDir 'differences.csv') $DiffColumns $rows
+                Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'differences.csv')) $DiffColumns $rows
             }
-            Save-Csv (Join-Path $runDir 'skipped.csv') $SkipColumns $skipped
+            Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'skipped.csv')) $SkipColumns $skipped
         } catch {
             $saveError = Get-ErrorText (Get-InnerException $_.Exception)
         }
@@ -1239,7 +1244,7 @@ try {
     Write-Progress -Activity 'フォルダ差分' -Completed
     if (-not $finished -or $fatal -or $saveError) {
         # 消すのは、このツールが作った保存先のフォルダだけ
-        if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
+        if ($runDir) { try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { } }
         if ($unexpected) { Write-Host 'エラーで止まりました。結果は保存していません。' -ForegroundColor Yellow }
         elseif (-not $finished) { Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow }
     }
