@@ -120,9 +120,10 @@ function Format-Duration([TimeSpan]$Span) {
     return '{0}時間{1}分{2}秒' -f [math]::Floor($Span.TotalHours), $Span.Minutes, $Span.Seconds
 }
 
-# .NET のメソッドで起きた例外は MethodInvocationException に包まれて届くため、元の例外を取り出す
+# .NET や COM のメソッドで起きた例外は MethodInvocationException に、プロパティ（タスクの Definition など）を読むときに
+# 起きた例外は GetValueInvocationException に包まれて届くため、元の例外を取り出す（どちらも ExtendedTypeSystemException の仲間）
 function Get-InnerException([Exception]$Exception) {
-    while ($Exception -is [Management.Automation.MethodInvocationException] -and $Exception.InnerException) {
+    while ($Exception -is [Management.Automation.ExtendedTypeSystemException] -and $Exception.InnerException) {
         $Exception = $Exception.InnerException
     }
     return $Exception
@@ -401,7 +402,9 @@ try {
 try {
     $rootFolder = $service.GetFolder($taskRoot)
 } catch {
-    Stop-WithError ('タスクのフォルダが見つかりません: {0}（{1}）' -f $taskRoot, (Get-ErrorText (Get-InnerException $_.Exception)))
+    $ex = Get-InnerException $_.Exception
+    if (Test-AccessDenied $ex) { Stop-WithError ('タスクのフォルダを開けません（権限なし）: {0}。管理者として実行してください' -f $taskRoot) }
+    Stop-WithError ('タスクのフォルダが見つかりません: {0}（{1}）' -f $taskRoot, (Get-ErrorText $ex))
 }
 
 $startTime = Get-Date
@@ -436,13 +439,13 @@ $tasks     = New-Object 'System.Collections.Generic.List[object]'
 $skipped   = New-Object 'System.Collections.Generic.List[object]'
 $skipKinds = [ordered]@{ '権限なし' = 0; 'その他のエラー' = 0 }
 
-function Add-Skip([string]$ItemPath, [Exception]$Exception) {
+function Add-Skip([string]$ItemPath, [Exception]$Exception, [string]$Prefix) {
     $ex = Get-InnerException $Exception
     if (Test-AccessDenied $ex) {
-        $skipped.Add([object[]]@('権限なし', $ItemPath, 'アクセスが拒否されました'))
+        $skipped.Add([object[]]@('権限なし', $ItemPath, ($Prefix + 'アクセスが拒否されました')))
         $skipKinds['権限なし']++
     } else {
-        $skipped.Add([object[]]@('その他のエラー', $ItemPath, (Get-ErrorText $ex)))
+        $skipped.Add([object[]]@('その他のエラー', $ItemPath, ($Prefix + (Get-ErrorText $ex))))
         $skipKinds['その他のエラー']++
     }
 }
@@ -547,7 +550,7 @@ try {
 
     $lines.Add((Format-Invariant 'タスクスケジューラ出力 (Export-TaskList {0})' $ScriptVersion))
     $lines.Add((Format-Invariant '対象: {0}（管理者: {1}）   {2:yyyy-MM-dd HH:mm:ss}' $machineName $(if ($isAdmin) { 'はい' } else { 'いいえ' }) $startTime))
-    if ($includeMicrosoft -and -not (& $isMicrosoftPath $taskRoot)) {
+    if ($includeMicrosoft -and $taskRoot -eq '\') {
         $lines.Add(('範囲: {0} の下（Windows 標準のタスクを含む）' -f $taskRoot))
     } elseif ($includeMicrosoft) {
         $lines.Add(('範囲: {0} の下' -f $taskRoot))
@@ -606,15 +609,31 @@ try {
         Write-Progress -Activity 'タスクスケジューラ出力' -Status '結果を保存しています'
         try {
             if (-not $NoXml) {
-                # タスクスケジューラと同じフォルダの構成で、タスクスケジューラが書き出すときと同じ UTF-16（BOM 付き）で保存する
+                # タスクスケジューラと同じフォルダの構成で、タスクスケジューラが書き出すときと同じ UTF-16（BOM 付き）で保存する。
+                # 使えない文字を _ にすると別のタスクと同じ名前になることがあるため、そのときは _2 などを付ける
+                $xmlFailed = 0
+                $usedNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
                 foreach ($task in $sorted) {
                     $parts = @($task.Folder.Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries) | ForEach-Object { ConvertTo-SafeName $_ })
-                    $relative = (@($parts) + (ConvertTo-SafeName $task.Name)) -join '\'
-                    $relative += '.xml'
+                    $stem  = (@($parts) + (ConvertTo-SafeName $task.Name)) -join '\'
+                    $relative = $stem + '.xml'
+                    $suffix = 1
+                    while (-not $usedNames.Add($relative)) { $suffix++; $relative = '{0}_{1}.xml' -f $stem, $suffix }
                     $xmlPath = Join-Path (Join-Path $runDir 'xml') $relative
-                    [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath (Split-Path -LiteralPath $xmlPath)))
-                    [IO.File]::WriteAllText((ConvertTo-LongPath $xmlPath), $task.Xml, [Text.Encoding]::Unicode)
-                    $task.XmlFile = $relative
+                    # 1 件書けなくても、ほかのタスクの XML と一覧は保存する
+                    try {
+                        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath (Split-Path -LiteralPath $xmlPath)))
+                        [IO.File]::WriteAllText((ConvertTo-LongPath $xmlPath), $task.Xml, [Text.Encoding]::Unicode)
+                        $task.XmlFile = $relative
+                    } catch {
+                        Add-Skip $task.Path $_.Exception 'XML を保存できません: '
+                        $xmlFailed++
+                    }
+                }
+                if ($xmlFailed -gt 0) {
+                    $note = Format-Invariant '※ XML を保存できなかったタスクが {0:N0} 件あります（skipped.csv を確認してください）' $xmlFailed
+                    $tail.Add($note)
+                    $lines.Add($note)
                 }
             }
             $rows = New-Object 'System.Collections.Generic.List[object]'
@@ -624,7 +643,7 @@ try {
                     $(if ($task.Highest) { 'はい' } else { 'いいえ' }), $task.Triggers, (Protect-ExcelText $task.Actions), (Protect-ExcelText $task.WorkDir),
                     $(if ($task.LastRun) { $task.LastRun.ToString($TimeFormat, $Invariant) } else { '' }), $task.Result, ('0x{0:X8}' -f $task.Code),
                     $(if ($task.NextRun) { $task.NextRun.ToString($TimeFormat, $Invariant) } else { '' }),
-                    (Protect-ExcelText $task.Author), $task.Created, (Protect-ExcelText $task.Comment), $(if ($task.Hidden) { 'はい' } else { '' }), $task.XmlFile))
+                    (Protect-ExcelText $task.Author), $task.Created, (Protect-ExcelText $task.Comment), $(if ($task.Hidden) { 'はい' } else { '' }), (Protect-ExcelText $task.XmlFile)))
             }
             $lines.Add(('保存先: {0}' -f $runDir))
             [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
