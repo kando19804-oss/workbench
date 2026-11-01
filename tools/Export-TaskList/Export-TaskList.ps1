@@ -420,12 +420,17 @@ if (-not $NoSave) {
     $baseDir = if ($outText) { $outText } elseif ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
     try {
         $baseDir = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($baseDir)
+        # \\?\ 付きのパスでは末尾のピリオドや空白が残るため、先に通常の書き方で整える（260 文字を超えると例外になるので、そのときはそのまま）
+        try { $baseDir = [IO.Path]::GetFullPath($baseDir) } catch { }
         $runName = Format-Invariant 'TaskList_{0}_{1:yyyyMMdd_HHmmss}' $machineName $startTime
         $runDir  = Join-Path $baseDir $runName
         # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
         $suffix = 1
-        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-        [void][IO.Directory]::CreateDirectory($runDir)
+        while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) {
+            $suffix++
+            $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix)
+        }
+        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
     } catch {
         $saveWarning = '保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))
         $runDir = $null
@@ -452,6 +457,7 @@ function Add-Skip([string]$ItemPath, [Exception]$Exception, [string]$Prefix, [bo
 $finished   = $false
 $unexpected = $false
 $saveError  = $null
+$xmlNote    = $null
 $sw         = [Diagnostics.Stopwatch]::StartNew()
 $lines      = New-Object 'System.Collections.Generic.List[string]'
 try {
@@ -629,9 +635,8 @@ try {
                     }
                 }
                 if ($xmlFailed -gt 0) {
-                    $note = Format-Invariant '※ XML を保存できなかったタスクが {0:N0} 件あります（skipped.csv を確認してください）' $xmlFailed
-                    $tail.Add($note)
-                    $lines.Add($note)
+                    $xmlNote = Format-Invariant '※ XML を保存できなかったタスクが {0:N0} 件あります（skipped.csv を確認してください）' $xmlFailed
+                    $lines.Add($xmlNote)
                 }
             }
             $rows = New-Object 'System.Collections.Generic.List[object]'
@@ -640,13 +645,14 @@ try {
                     $task.Folder, (Protect-ExcelText $task.Name), $StateNames[$task.State], (Protect-ExcelText $task.User), $task.Logon,
                     $(if ($task.Highest) { 'はい' } else { 'いいえ' }), $task.Triggers, (Protect-ExcelText $task.Actions), (Protect-ExcelText $task.WorkDir),
                     $(if ($task.LastRun) { $task.LastRun.ToString($TimeFormat, $Invariant) } else { '' }), $task.Result, ('0x{0:X8}' -f $task.Code),
-                    $(if ($task.NextRun) { $task.NextRun.ToString($TimeFormat, $Invariant) } else { '' }),
+                    $(if ($task.NextRun -and $task.Enabled) { $task.NextRun.ToString($TimeFormat, $Invariant) } else { '' }),
                     (Protect-ExcelText $task.Author), $task.Created, (Protect-ExcelText $task.Comment), $(if ($task.Hidden) { 'はい' } else { '' }), (Protect-ExcelText $task.XmlFile)))
             }
             $lines.Add(('保存先: {0}' -f $runDir))
-            [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
-            Save-Csv (Join-Path $runDir 'tasks.csv') $TaskColumns $rows
-            Save-Csv (Join-Path $runDir 'skipped.csv') $SkipColumns $skipped
+            # 保存先は \\?\ 付きで作っているため、長いパスでも書けるよう、ここも \\?\ を付ける
+            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$lines, $Utf8Bom)
+            Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'tasks.csv')) $TaskColumns $rows
+            Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'skipped.csv')) $SkipColumns $skipped
         } catch {
             $saveError = Get-ErrorText (Get-InnerException $_.Exception)
         }
@@ -691,6 +697,8 @@ if ($table.Count -eq 0) {
     }
 }
 foreach ($line in $tail) { Write-Host $line }
+# XML を保存できなかった注意は、skipped.csv も保存できたときだけ出す（保存に失敗したときは、見てもらうファイルがない）
+if ($xmlNote -and -not $saveError) { Write-Host $xmlNote }
 
 if ($saveError) {
     Write-Warning ('結果を保存できませんでした: {0}' -f $saveError)
