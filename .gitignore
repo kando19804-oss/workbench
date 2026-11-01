@@ -16,6 +16,10 @@ Connectivity_*/
 PortProcess_*/
 SearchLog_*/
 
+# Compare-Folder の実行結果とスナップショット（既定ではスクリプトと同じフォルダに保存される）
+FolderDiff_*/
+FolderSnapshot_*/
+
 # Export-TaskList の実行結果（既定ではスクリプトと同じフォルダに保存される）
 TaskList_*/
 
