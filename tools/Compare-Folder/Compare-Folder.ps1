@@ -373,7 +373,7 @@ function Assert-Folder([string]$FullPath, [string]$Label, [string]$ConfigName) {
 # 結果の表示用に、引数を必要なときだけ引用符で囲む。"D:\data\" のように最後が \" になると
 # 引用符が閉じなくなるため、最後の \ は 2 つにする
 function Format-Argument([string]$Text) {
-    if ($Text -notmatch '[\s&()^,;=!%]') { return $Text }
+    if ($Text -notmatch "[\s&()^,;=!%'`$]") { return $Text }
     if ($Text.EndsWith('\')) { $Text += '\' }
     return '"' + $Text + '"'
 }
@@ -543,6 +543,15 @@ if ($difPath) { Assert-Folder $difPath '比較' 'Difference' }
 if ($difPath -and -not $refIsSnapshot -and $refPath.TrimEnd('\') -eq $difPath.TrimEnd('\')) {
     Stop-WithError ('基準と比較が同じフォルダです: {0}' -f $refPath)
 }
+# 片方がもう片方の中にあると、中にあるほうの中身が、外のほうにだけあるものとしてすべて出てしまう
+if ($difPath -and -not $refIsSnapshot) {
+    $sep = [string][IO.Path]::DirectorySeparatorChar
+    $refPrefix = $refPath.TrimEnd([char]$sep) + $sep
+    $difPrefix = $difPath.TrimEnd([char]$sep) + $sep
+    if ($difPrefix.StartsWith($refPrefix, [StringComparison]::OrdinalIgnoreCase) -or $refPrefix.StartsWith($difPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+        Stop-WithError ('基準と比較の片方が、もう片方の中にあります。中にあるフォルダの中身が、すべて違いとして出てしまいます。' + "`r`n" + ('基準: {0}' -f $refPath) + "`r`n" + ('比較: {0}' -f $difPath))
+    }
+}
 
 #endregion
 
@@ -564,11 +573,11 @@ if ($refIsSnapshot) {
 
     $columnsOk = $records.Count -gt 0 -and
         (@($records[0].PSObject.Properties | ForEach-Object { $_.Name }) -join ',') -eq ($SnapshotColumns -join ',')
-    if (-not $columnsOk -or $records[0].'種類' -ne '情報' -or $records[0].'相対パス' -ne 'ツール' -or -not $records[0].'状態'.StartsWith($SnapshotTool)) {
+    if (-not $columnsOk -or $records[0].'種類' -ne '情報' -or $records[0].'相対パス' -ne 'ツール' -or -not ([string]$records[0].'状態').StartsWith($SnapshotTool)) {
         Stop-WithError ('スナップショットのファイルとして読めません: {0}（Compare-Folder の -Snapshot で保存した snapshot.csv を指定してください）' -f $refPath)
     }
 
-    $snapInfo = @{ Folder = ''; Saved = ''; HasHash = $false; Exclude = @() }
+    $snapInfo = @{ Folder = ''; Saved = ''; HasHash = $false; Exclude = @(); Zone = [TimeZoneInfo]::Local }
     $snapRows = New-Object 'System.Collections.Generic.List[object]'
     $rowNumber = 1   # 見出しが 1 行目
     foreach ($record in $records) {
@@ -580,24 +589,31 @@ if ($refIsSnapshot) {
                 '保存日時' { $snapInfo.Saved = $record.'状態' }
                 'ハッシュ' { $snapInfo.HasHash = $record.'状態' -eq 'SHA-256' }
                 '除外'     { $snapInfo.Exclude += $record.'状態' }
+                # 日時は保存した PC の現地時刻で書いてあるため、その PC の時間帯で UTC に直す（比べる PC と時間帯が違っても、ずれないように）
+                '時間帯'   { try { $snapInfo.Zone = [TimeZoneInfo]::FindSystemTimeZoneById([string]$record.'状態') } catch { } }
             }
             continue
         }
-        $rel = $record.'相対パス'
+        # 列の足りない行（手で直したときなど）は値が $null になるため、文字列にそろえてから調べる
+        $rel = [string]$record.'相対パス'
         if ($rel.StartsWith('="') -and $rel.EndsWith('"')) { $rel = $rel.Substring(2, $rel.Length - 3) }
         $size   = 0L
         $timeUtc = $null
         $valid  = ($kind -eq 'ファイル' -or $kind -eq 'フォルダ' -or $kind -eq 'リンク') -and $rel -ne ''
         if ($valid -and $kind -eq 'ファイル') {
             $parsedTime = [datetime]::MinValue
-            $valid = [long]::TryParse($record.'サイズ(バイト)'.Replace(',', ''), [Globalization.NumberStyles]::None, $Invariant, [ref]$size) -and
-                [datetime]::TryParseExact($record.'最終更新日時', $TimeFormat, $Invariant, [Globalization.DateTimeStyles]::AssumeLocal, [ref]$parsedTime)
-            if ($valid) { $timeUtc = $parsedTime.ToUniversalTime() }
+            $valid = [long]::TryParse(([string]$record.'サイズ(バイト)').Replace(',', ''), [Globalization.NumberStyles]::None, $Invariant, [ref]$size) -and
+                [datetime]::TryParseExact([string]$record.'最終更新日時', $TimeFormat, $Invariant, [Globalization.DateTimeStyles]::None, [ref]$parsedTime)
+            if ($valid) {
+                # 夏時間に切り替わるときの、存在しない時刻は例外になるため、そのときは 1 時間後とみなす
+                try { $timeUtc = [TimeZoneInfo]::ConvertTimeToUtc($parsedTime, $snapInfo.Zone) }
+                catch { $timeUtc = [TimeZoneInfo]::ConvertTimeToUtc($parsedTime.AddHours(1), $snapInfo.Zone) }
+            }
         }
         if (-not $valid) {
             Stop-WithError ('スナップショットのファイルとして読めません: {0}（{1} 行目が正しくありません。Excel で上書き保存すると、形が変わることがあります）' -f $refPath, $rowNumber)
         }
-        $snapRows.Add([pscustomobject]@{ Kind = $kind; Rel = $rel; Size = $size; Time = $timeUtc; Hash = $record.'ハッシュ'; State = $record.'状態' })
+        $snapRows.Add([pscustomobject]@{ Kind = $kind; Rel = $rel; Size = $size; Time = $timeUtc; Hash = [string]$record.'ハッシュ'; State = [string]$record.'状態' })
     }
 
     if ($Hash -and -not $snapInfo.HasHash) {
@@ -655,13 +671,14 @@ function Get-ExcludeMatch([string]$Rel, [string]$Name) {
 }
 
 # スナップショットの行は、親のフォルダが除外に当てはまるときも除く（フォルダをたどるときは、親で止まるため要らない）
+# 当てはまったら、書き方（Text）と、その行そのものが当てはまったか（Direct）を返す
 function Get-ExcludeMatchWithParent([string]$Rel) {
     $parts = $Rel.Split('\')
     $path  = ''
-    foreach ($part in $parts) {
-        $path = if ($path) { $path + '\' + $part } else { $part }
-        $matched = Get-ExcludeMatch $path $part
-        if ($matched) { return $matched }
+    for ($i = 0; $i -lt $parts.Count; $i++) {
+        $path = if ($path) { $path + '\' + $parts[$i] } else { $parts[$i] }
+        $matched = Get-ExcludeMatch $path $parts[$i]
+        if ($matched) { return @{ Text = $matched; Direct = ($i -eq $parts.Count - 1) } }
     }
     return $null
 }
@@ -679,8 +696,8 @@ function Get-LinkName($Entry) {
     return $null
 }
 
+# 表示の間隔が来たかどうかは、呼ぶ側で確かめる（毎回、表示の文字列を組み立てないため）
 function Show-Progress([string]$Status, [string]$Operation) {
-    if ($sw.ElapsedMilliseconds -lt $progress.Next) { return }
     $percent = -1
     if ($progress.Total -gt 0) { $percent = [int][math]::Min(100, 100 * $progress.Done / $progress.Total) }
     Write-Progress -Activity 'フォルダ差分' -Status $Status -CurrentOperation $Operation -PercentComplete $percent
@@ -702,7 +719,7 @@ function Read-FolderState([string]$RootPath, [string]$Side) {
         $node    = $stack.Pop()
         $dir     = $node[0]
         $dirRel  = $node[1]
-        Show-Progress (Format-Invariant '{0}を調べています: フォルダ {1:N0} 件 / ファイル {2:N0} 件' $Side $totals.Dirs $totals.Files) (ConvertTo-DisplayPath $dir.FullName)
+        if ($sw.ElapsedMilliseconds -ge $progress.Next) { Show-Progress (Format-Invariant '{0}を調べています: フォルダ {1:N0} 件 / ファイル {2:N0} 件' $Side $totals.Dirs $totals.Files) (ConvertTo-DisplayPath $dir.FullName) }
 
         try {
             $entries = $dir.GetFileSystemInfos()
@@ -737,7 +754,14 @@ function Read-FolderState([string]$RootPath, [string]$Side) {
                     continue
                 }
             }
-            $linkName = Get-LinkName $entry
+            # リンクの判定は、リパースポイントのときだけ行う（件数が多いと、関数を呼ぶだけで時間がかかるため）
+            $linkName = $null
+            if (($entry.Attributes -band $rpFlag) -eq $rpFlag) { $linkName = Get-LinkName $entry }
+            # 大文字と小文字を区別するフォルダ（WSL など）では、大文字と小文字だけが違う名前が並ぶ。表には 1 つしか入らないので、後のほうを記録に残して飛ばす
+            if ($items.ContainsKey($rel)) {
+                Add-Skip 'その他のエラー' $Side (ConvertTo-DisplayPath $entry.FullName) '大文字と小文字だけが違う名前がほかにあるため、比べられません'
+                continue
+            }
             if ($linkName) {
                 $items[$rel] = [pscustomobject]@{ Kind = 'リンク'; Rel = $rel; Size = 0L; Time = $null; Full = $entry.FullName; Hash = ''; State = ''; Note = $linkName; Online = $false }
             } elseif ($isDir) {
@@ -759,18 +783,22 @@ function Read-FolderState([string]$RootPath, [string]$Side) {
 # SHA-256 のハッシュを、Get-FileHash と同じ大文字の 16 進数で返す。開けないときは $null を返し、skipped に残す。
 # ほかのプログラムが書き込み中のファイルも読めるように開く。FIPS モードの PC でも使えるよう、CryptoServiceProvider を使う
 $hashBuffer = New-Object 'byte[]' $HashBufferSize
+$sha256     = New-Object Security.Cryptography.SHA256CryptoServiceProvider   # ファイルごとに作ると遅いため、Initialize で使い回す
 function Get-HashText($Item, [string]$Side) {
     $display = ConvertTo-DisplayPath $Item.Full
-    $sha     = New-Object Security.Cryptography.SHA256CryptoServiceProvider
+    $sha     = $sha256
     $stream  = $null
     try {
+        $sha.Initialize()
         $stream = New-Object IO.FileStream($Item.Full, [IO.FileMode]::Open, [IO.FileAccess]::Read, ([IO.FileShare]'ReadWrite, Delete'), 65536)
         while ($true) {
             $read = $stream.Read($hashBuffer, 0, $hashBuffer.Length)
             if ($read -le 0) { break }
             [void]$sha.TransformBlock($hashBuffer, 0, $read, $null, 0)
             $progress.Done += $read
-            Show-Progress (Format-Invariant 'ハッシュを計算しています: {0:N0} / {1:N0} 件（{2} / {3}）' $progress.Files $progress.FileTotal (Format-Size $progress.Done) (Format-Size $progress.Total)) $display
+            if ($sw.ElapsedMilliseconds -ge $progress.Next) {
+                Show-Progress (Format-Invariant 'ハッシュを計算しています: {0:N0} / {1:N0} 件（{2} / {3}）' $progress.Files $progress.FileTotal (Format-Size $progress.Done) (Format-Size $progress.Total)) $display
+            }
         }
         [void]$sha.TransformFinalBlock($hashBuffer, 0, 0)
         return [BitConverter]::ToString($sha.Hash).Replace('-', '')
@@ -780,7 +808,6 @@ function Get-HashText($Item, [string]$Side) {
         return $null
     } finally {
         if ($stream) { $stream.Dispose() }
-        $sha.Dispose()
         $progress.Files++
     }
 }
@@ -846,6 +873,7 @@ if (-not $NoSave) {
 
 # 調べている途中や保存の途中で Ctrl+C されたときや、保存に失敗したときは、書きかけの結果を残さない
 $finished  = $false
+$unexpected = $false
 $fatal     = $null
 $saveError = $null
 $exitCode  = 0
@@ -901,13 +929,21 @@ try {
         if ($hasExclude) { $lines.Add(('除外: {0}' -f (($excludeRules | ForEach-Object { $_.Text }) -join ', '))) }
         $lines.Add('')
         $lines.Add((Format-Invariant 'ファイル {0:N0} 件  フォルダ {1:N0} 件  合計 {2}  所要 {3}' $totals.Files $totals.Dirs (Format-Size $totals.Size) (Format-Duration $elapsed)))
-        $linkItems = @($items | Where-Object { $_.Kind -eq 'リンク' }).Count
+        $linkItems = 0
+        foreach ($item in $items) { if ($item.Kind -eq 'リンク') { $linkItems++ } }
         foreach ($line in (Get-NoteLine $linkItems)) { $lines.Add($line) }
+        $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { '.\Compare-Folder.ps1' }
+        $lines.Add(('保存先: {0}' -f $runDir))
+        $lines.Add('')
+        $lines.Add('作業の後で、次のコマンドで比べられます:')
+        $lines.Add(('powershell -ExecutionPolicy Bypass -File {0} -Reference {1} -Difference {2}' -f
+            (Format-Argument $scriptPath), (Format-Argument (Join-Path $runDir 'snapshot.csv')), (Format-Argument $refPath)))
 
         $rows = New-Object 'System.Collections.Generic.List[object]'
         $rows.Add([object[]]@('情報', 'ツール', '', '', '', ('{0} {1}' -f $SnapshotTool, $ScriptVersion)))
         $rows.Add([object[]]@('情報', 'フォルダ', '', '', '', $refPath))
         $rows.Add([object[]]@('情報', '保存日時', '', '', '', $startTime.ToString($TimeFormat, $Invariant)))
+        $rows.Add([object[]]@('情報', '時間帯', '', '', '', [TimeZoneInfo]::Local.Id))
         $rows.Add([object[]]@('情報', 'ハッシュ', '', '', '', $(if ($useHash) { 'SHA-256' } else { 'なし' })))
         foreach ($rule in $excludeRules) { $rows.Add([object[]]@('情報', '除外', '', '', '', $rule.Text)) }
         foreach ($item in $items) {
@@ -927,7 +963,14 @@ try {
             foreach ($row in $snapRows) {
                 if ($hasExclude) {
                     $matched = Get-ExcludeMatchWithParent $row.Rel
-                    if ($matched) { continue }
+                    if ($matched) {
+                        # 記録に残すのは、除外に直接当てはまった行だけ（フォルダをたどるときに、除外したフォルダの中を数えないのと同じ）
+                        if ($matched.Direct) {
+                            $excludedCount++
+                            Add-Skip '除外指定' '基準' ($snapInfo.Folder.TrimEnd('\') + '\' + $row.Rel) $matched.Text
+                        }
+                        continue
+                    }
                 }
                 $state = if ($row.State -eq '権限なし' -or $row.State -eq 'その他のエラー') { $row.State } else { '' }
                 $refItems[$row.Rel] = [pscustomobject]@{ Kind = $row.Kind; Rel = $row.Rel; Size = $row.Size; Time = $row.Time; Full = ''; Hash = $row.Hash; State = $state; Note = ''; Online = $row.State -eq 'オンライン専用' }
@@ -956,7 +999,8 @@ try {
         $keys = New-Object 'string[]' $keySet.Count
         $keySet.CopyTo($keys)
         if ($blocked.Count -gt 0) {
-            $keys = @(foreach ($key in $keys) {
+            # [Array]::Sort で並べ替わるよう、文字列の配列にしておく
+            $keys = [string[]]@(foreach ($key in $keys) {
                 $isBlocked = $false
                 $cut = $key.LastIndexOf('\')
                 while ($cut -gt 0) {
@@ -985,6 +1029,7 @@ try {
             }
         }
 
+        $noHashCount = 0   # -Hash でも、ハッシュで比べられなかったファイルの件数
         $counts = [ordered]@{ '追加' = 0; '削除' = 0; '変更' = 0; '種類が違う' = 0; '日時のみ' = 0; '同じ' = 0 }
         $results = New-Object 'System.Collections.Generic.List[object]'
         $linkKeys = 0
@@ -1014,8 +1059,10 @@ try {
                 if ($useHash -and -not $sizeDiff) {
                     if ($r.Online -or $d.Online) {
                         $note = 'オンライン専用のため、ハッシュを計算していない'
+                        $noHashCount++
                     } elseif ($refIsSnapshot -and -not $r.Hash) {
                         $note = 'スナップショットにハッシュがないため、サイズと更新日時で比べた'
+                        $noHashCount++
                     } else {
                         if (-not $refIsSnapshot) { $r.Hash = Get-HashText $r '基準' }
                         if ($null -ne $r.Hash) { $d.Hash = Get-HashText $d '比較' }
@@ -1110,19 +1157,26 @@ try {
                 $resultParts += Format-Invariant '{0} {1:N0} 件' $name $counts[$name]
             }
         }
-        if ($diffCount -gt 0) {
-            $status = '違いあり'
-            $exitCode = 2
-        } elseif ($skipCount -gt 0) {
-            $status = Format-Invariant '違いなし（ただし、比べられなかった場所が {0:N0} 件あります{1}）' $skipCount $(if ($runDir) { '。skipped.csv を確認してください' } else { '' })
-            $exitCode = 1
-        } else {
-            $status = '違いなし'
+        if ($diffCount -gt 0) { $exitCode = 2 } elseif ($skipCount -gt 0) { $exitCode = 1 }
+        # 保存できなかったときは skipped.csv を見るよう案内できないため、保存の後で作り直せるようにしておく
+        $resultLine = {
+            param([bool]$HasFile)
+            if ($diffCount -gt 0) {
+                $status = '違いあり'
+            } elseif ($skipCount -gt 0) {
+                $status = Format-Invariant '違いなし（ただし、比べられなかった場所が {0:N0} 件あります{1}）' $skipCount $(if ($HasFile) { '。skipped.csv を確認してください' } else { '' })
+            } else {
+                $status = '違いなし'
+            }
+            '結果: {0}   {1}' -f $status, ($resultParts -join '  ')
         }
         $tail = New-Object 'System.Collections.Generic.List[string]'
         $tail.Add('')
-        $tail.Add(('結果: {0}   {1}' -f $status, ($resultParts -join '  ')))
+        $tail.Add((& $resultLine ([bool]$runDir)))
         foreach ($line in (Get-NoteLine $linkKeys)) { $tail.Add($line) }
+        if ($noHashCount -gt 0) {
+            $tail.Add((Format-Invariant '※ ハッシュで比べられなかったファイルが {0:N0} 件あります（オンライン専用など）。サイズと更新日時で比べました。-IncludeSame を付けると、differences.csv の備考で確かめられます' $noHashCount))
+        }
 
         # summary.txt には、違いをすべて書く
         $lines.Add('■ 違い（相対パスの順）')
@@ -1133,6 +1187,7 @@ try {
             foreach ($entry in $tableLines) { $lines.Add($entry[0]) }
         }
         foreach ($line in $tail) { $lines.Add($line) }
+        if ($runDir) { $lines.Add(('保存先: {0}' -f $runDir)) }
 
         $rows = New-Object 'System.Collections.Generic.List[object]'
         foreach ($row in $results) {
@@ -1168,12 +1223,17 @@ try {
     #endregion
 
     $finished = $true
+} catch {
+    # 想定外のエラーは、Ctrl+C の「中断しました」と区別して知らせる
+    $unexpected = $true
+    throw
 } finally {
     Write-Progress -Activity 'フォルダ差分' -Completed
     if (-not $finished -or $fatal -or $saveError) {
         # 消すのは、このツールが作った保存先のフォルダだけ
         if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
-        if (-not $finished) { Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow }
+        if ($unexpected) { Write-Host 'エラーで止まりました。結果は保存していません。' -ForegroundColor Yellow }
+        elseif (-not $finished) { Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow }
     }
 }
 if ($fatal) { Stop-WithError $fatal }
@@ -1184,12 +1244,6 @@ if ($Snapshot -and $saveError) { Stop-WithError ('スナップショットを保
 $saved = $runDir -and -not $saveError
 if ($Snapshot) {
     foreach ($line in $lines) { Write-Host $line }
-    Write-Host ('保存先: {0}' -f $runDir)
-    Write-Host ''
-    Write-Host '作業の後で、次のコマンドで比べられます:'
-    $scriptPath = if ($PSCommandPath) { $PSCommandPath } else { '.\Compare-Folder.ps1' }
-    Write-Host ('powershell -ExecutionPolicy Bypass -File {0} -Reference {1} -Difference {2}' -f
-        (Format-Argument $scriptPath), (Format-Argument (Join-Path $runDir 'snapshot.csv')), (Format-Argument $refPath))
     exit 0
 }
 
@@ -1211,6 +1265,7 @@ if ($tableLines.Count -eq 0) {
         Write-Host (Format-Invariant '（ほか {0:N0} 件は differences.csv を参照してください）' ($tableLines.Count - $shown))
     }
 }
+if ($saveError) { $tail[1] = & $resultLine $false }
 foreach ($line in $tail) { Write-Host $line }
 
 if ($saveError) {
