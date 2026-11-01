@@ -198,7 +198,7 @@ function Save-Csv([string]$FilePath, [string[]]$Columns, $Rows) {
 $excelRisk = New-Object Text.RegularExpressions.Regex ('^(?:[=+\-@]|[\d\s.,/:+\-]+$)')
 function Protect-ExcelText([string]$Text) {
     if ($Text -eq '' -or -not $excelRisk.IsMatch($Text)) { return $Text }
-    if ($Text.Length -le 255) { return '="' + $Text + '"' }
+    if ($Text.Length -le 255) { return '="' + $Text.Replace('"', '""') + '"' }
     return ' ' + $Text
 }
 
@@ -288,6 +288,34 @@ function ConvertTo-PointInTime([string]$Text, [string]$Name) {
     return @{ Time = $parsed; Relative = '' }
 }
 
+# 例外の連なり（InnerException）のどこかに、指定した種類の例外があるか。
+# Get-WinEvent は、権限がなくてログの情報を取れないとき、UnauthorizedAccessException をふつうの例外で包んで出すため
+function Test-InnerException([Exception]$Exception, [type]$Type) {
+    while ($Exception) {
+        if ($Exception -is $Type) { return $true }
+        $Exception = $Exception.InnerException
+    }
+    return $false
+}
+
+# Get-WinEvent は FilterHashtable の Path をワイルドカードとして解決するため、[ ] * ? と ` を文字どおりに扱うようエスケープする
+function ConvertTo-LiteralPattern([string]$Text) {
+    return $Text.Replace('`', '``').Replace('[', '`[').Replace(']', '`]').Replace('*', '`*').Replace('?', '`?')
+}
+
+# リパースポイントのうち、リンクと判定できたものの種類を返す（OneDrive のフォルダもリパースポイントなので、それ以外は $null）
+function Get-LinkName($Entry) {
+    if (($Entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) { return $null }
+    # Windows が互換用に作ったリンク（All Users、Application Data など）は、5.1 では種類を判定できない。どれも隠し・システム属性付き
+    $hiddenSystem = [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
+    if ($Entry -is [IO.DirectoryInfo] -and ($Entry.Attributes -band $hiddenSystem) -eq $hiddenSystem) { return 'Windows の互換用リンク' }
+    $linkType = $null
+    try { $linkType = $Entry.LinkType } catch { }
+    if ($linkType -eq 'Junction') { return 'ジャンクション' }
+    if ($linkType -eq 'SymbolicLink') { return 'シンボリックリンク' }
+    return $null
+}
+
 # メッセージの 1 行目（空の行は飛ばす）
 function Get-FirstLine([string]$Text) {
     foreach ($line in ($Text -split '\r?\n')) {
@@ -331,7 +359,8 @@ $untilInfo = $null
 if ($Until) { $untilInfo = ConvertTo-PointInTime $Until '-Until' }
 $endTime = if ($untilInfo) { $untilInfo.Time } else { $startTime }
 if ($sinceInfo.Time -ge $endTime) {
-    Stop-WithError ('-Since の日時（{0:yyyy-MM-dd HH:mm}）が、-Until の日時（{1:yyyy-MM-dd HH:mm}）より後になっています' -f $sinceInfo.Time, $endTime)
+    $endLabel = if ($untilInfo) { '-Until の日時' } else { '今' }
+    Stop-WithError (Format-Invariant '-Since の日時（{0:yyyy-MM-dd HH:mm}）が、{1}（{2:yyyy-MM-dd HH:mm}）より後になっています' $sinceInfo.Time $endLabel $endTime)
 }
 
 # レベル
@@ -361,6 +390,11 @@ function ConvertTo-IdList([string]$Text, [string]$Name) {
     return , $list
 }
 $idList      = ConvertTo-IdList $Id '-Id'
+# FilterHashtable の Id は検索の式の or に展開され、20 個ほどを超えるとイベントログの API がエラーにする。そのときは取り出した後に絞る
+$MaxQueryIds = 20
+$idSet = New-Object 'System.Collections.Generic.HashSet[int]'
+foreach ($value in $idList) { [void]$idSet.Add($value) }
+$idInQuery = $idList.Count -gt 0 -and $idList.Count -le $MaxQueryIds
 $excludeList = ConvertTo-IdList $ExcludeId '-ExcludeId'
 $excludeSet  = New-Object 'System.Collections.Generic.HashSet[int]'
 foreach ($value in $excludeList) { [void]$excludeSet.Add($value) }
@@ -376,7 +410,7 @@ if ($OutputFolder) {
 
 # 読む対象（ログ名か、.evtx ファイル）
 $skipped   = New-Object 'System.Collections.Generic.List[object]'
-$skipKinds = [ordered]@{ '権限なし' = 0; 'ログがない' = 0; 'ファイルを読めない' = 0; 'その他のエラー' = 0 }
+$skipKinds = [ordered]@{ '権限なし' = 0; 'ログがない' = 0; 'ファイルを読めない' = 0; 'リンク' = 0; 'その他のエラー' = 0 }
 function Add-Skip([string]$Reason, [string]$Target, [string]$Detail) {
     $skipped.Add([object[]]@($Reason, $Target, $Detail))
     $skipKinds[$Reason]++
@@ -393,7 +427,7 @@ if ($useFiles) {
             $full = [IO.Path]::GetFullPath($full)
         } catch { }
         if ([IO.File]::Exists((ConvertTo-LongPath $full))) {
-            $targets.Add(@{ Label = $full; Filter = @{ Path = $full } })
+            $targets.Add(@{ Label = $full; Filter = @{ Path = (ConvertTo-LiteralPattern $full) } })
         } elseif ([IO.Directory]::Exists((ConvertTo-LongPath $full))) {
             # フォルダの下の .evtx を探す。リンクはたどらず、読めないフォルダは飛ばす
             $stack = New-Object 'System.Collections.Generic.Stack[string]'
@@ -406,14 +440,22 @@ if ($useFiles) {
                     Add-Skip $reason (ConvertTo-DisplayPath $dir) (Get-ErrorText $ex)
                     continue
                 }
+                # ファイルは名前の順に加え、サブフォルダは名前の順にたどれるよう、逆の順に積む
+                $subDirs = New-Object 'System.Collections.Generic.List[string]'
                 foreach ($entry in ($entries | Sort-Object -Property Name)) {
-                    if (($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -and $entry -is [IO.DirectoryInfo]) { continue }
-                    if ($entry -is [IO.DirectoryInfo]) { $stack.Push($entry.FullName) }
+                    # リンクはたどらない（OneDrive のフォルダもリパースポイントなので、リンクと判定できたものだけを飛ばす）
+                    $linkName = Get-LinkName $entry
+                    if ($linkName -and $entry -is [IO.DirectoryInfo]) {
+                        Add-Skip 'リンク' (ConvertTo-DisplayPath $entry.FullName) $linkName
+                        continue
+                    }
+                    if ($entry -is [IO.DirectoryInfo]) { $subDirs.Add($entry.FullName) }
                     elseif ($entry.Extension -ieq '.evtx') {
                         $file = ConvertTo-DisplayPath $entry.FullName
-                        $targets.Add(@{ Label = $file; Filter = @{ Path = $file } })
+                        $targets.Add(@{ Label = $file; Filter = @{ Path = (ConvertTo-LiteralPattern $file) } })
                     }
                 }
+                for ($i = $subDirs.Count - 1; $i -ge 0; $i--) { $stack.Push($subDirs[$i]) }
             }
         } else {
             Add-Skip 'ファイルを読めない' $full '見つかりません'
@@ -471,7 +513,7 @@ try {
         $filter['StartTime'] = $sinceInfo.Time
         $filter['EndTime']   = $endTime
         $filter['Level']     = [int[]]$levelValues.ToArray()
-        if ($idList.Count -gt 0) { $filter['Id'] = [int[]]$idList.ToArray() }
+        if ($idInQuery) { $filter['Id'] = [int[]]$idList.ToArray() }
         Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
         try {
             # 1 件ずつ受け取って、読みながら絞り込む（すべてを先にメモリへ読み込まないため）
@@ -483,6 +525,7 @@ try {
                     $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
                 }
                 if ($excludeSet.Count -gt 0 -and $excludeSet.Contains([int]$record.Id)) { return }
+                if ($idList.Count -gt 0 -and -not $idInQuery -and -not $idSet.Contains([int]$record.Id)) { return }
                 # ソースは、ここで絞る（ProviderName で絞ると、この PC にないソースのときにエラーになり、ほかのサーバーの .evtx を読めないため）
                 if ($sourceList.Count -gt 0) {
                     $providerName = [string]$record.ProviderName
@@ -517,7 +560,7 @@ try {
                 # 該当するイベントがなかっただけ
             } elseif ($errorId -like 'NoMatchingLogsFound*') {
                 Add-Skip 'ログがない' $target.Label 'この PC にはないログです'
-            } elseif ($ex -is [UnauthorizedAccessException]) {
+            } elseif (Test-InnerException $_.Exception ([UnauthorizedAccessException])) {
                 Add-Skip '権限なし' $target.Label 'アクセスが拒否されました'
             } elseif ($useFiles) {
                 Add-Skip 'ファイルを読めない' $target.Label (Get-ErrorText $ex)
@@ -544,7 +587,9 @@ try {
 
         $sorted = @($events | Sort-Object -Property Time -Descending)
         $groups = @{}
+        $levelCounts = @{}
         foreach ($ev in $sorted) {
+            if ($levelCounts.ContainsKey($ev.Level)) { $levelCounts[$ev.Level]++ } else { $levelCounts[$ev.Level] = 1 }
             $key = '{0}|{1}|{2}|{3}' -f $ev.Log, $ev.Level, $ev.Source, $ev.Id
             $group = $groups[$key]
             if ($null -eq $group) {
@@ -580,29 +625,31 @@ try {
         $headIndex = $lines.Count
 
         # 集計の表
-        $groupWidth = @{ Level = 6; Log = 4; Source = 6 }
+        $groupWidth = @{ Count = 4; Level = 6; Log = 4; Source = 6 }
+        if ($groupList.Count -gt 0) { $groupWidth.Count = [math]::Max(4, $groupList[0].Count.ToString('N0', $Invariant).Length) }
         foreach ($group in $groupList) {
             $groupWidth.Level  = [math]::Max($groupWidth.Level, (Get-DisplayWidth $group.Level))
             $groupWidth.Log    = [math]::Max($groupWidth.Log, (Get-DisplayWidth $group.Log))
             $groupWidth.Source = [math]::Max($groupWidth.Source, (Get-DisplayWidth $group.Source))
         }
-        $groupHeader = ' ' + (Format-Column '件数' 6 $true) + '  ' + (Format-Column 'レベル' $groupWidth.Level $false) + '  ' + (Format-Column 'ログ' $groupWidth.Log $false) + '  ' +
+        $groupHeader = ' ' + (Format-Column '件数' $groupWidth.Count $true) + '  ' + (Format-Column 'レベル' $groupWidth.Level $false) + '  ' + (Format-Column 'ログ' $groupWidth.Log $false) + '  ' +
             (Format-Column 'ソース' $groupWidth.Source $false) + '  ' + (Format-Column 'ID' 5 $false) + '  ' + (Format-Column '最後に発生' 16 $false) + '  メッセージ（1 行目）'
         $groupLines = @(foreach ($group in $groupList) {
-            $text = ' ' + (Format-Column ($group.Count.ToString('N0', $Invariant)) 6 $true) + '  ' + (Format-Column $group.Level $groupWidth.Level $false) + '  ' + (Format-Column $group.Log $groupWidth.Log $false) + '  ' +
+            $text = ' ' + (Format-Column ($group.Count.ToString('N0', $Invariant)) $groupWidth.Count $true) + '  ' + (Format-Column $group.Level $groupWidth.Level $false) + '  ' + (Format-Column $group.Log $groupWidth.Log $false) + '  ' +
                 (Format-Column $group.Source $groupWidth.Source $false) + '  ' + (Format-Column ([string]$group.Id) 5 $false) + '  ' + $group.Last.ToString('yyyy-MM-dd HH:mm', $Invariant) + '  ' + (Limit-Text $group.FirstLine $ScreenMessage)
             , @($text, $group.LevelValue)
         })
-        # 新しい順の表
+        # 新しい順の表。全件は events.csv に書くので、画面の行は画面に出す分だけ作る（イベントが多いと時間がかかるため）
+        $screenEvents = if ($runDir) { @($sorted | Select-Object -First $ScreenEvents) } else { $sorted }
         $eventWidth = @{ Level = 6; Log = 4; Source = 6 }
-        foreach ($ev in $sorted) {
+        foreach ($ev in $screenEvents) {
             $eventWidth.Level  = [math]::Max($eventWidth.Level, (Get-DisplayWidth $ev.Level))
             $eventWidth.Log    = [math]::Max($eventWidth.Log, (Get-DisplayWidth $ev.Log))
             $eventWidth.Source = [math]::Max($eventWidth.Source, (Get-DisplayWidth $ev.Source))
         }
         $eventHeader = ' ' + (Format-Column '日時' 19 $false) + '  ' + (Format-Column 'レベル' $eventWidth.Level $false) + '  ' + (Format-Column 'ログ' $eventWidth.Log $false) + '  ' +
             (Format-Column 'ソース' $eventWidth.Source $false) + '  ' + (Format-Column 'ID' 5 $false) + '  メッセージ（1 行目）'
-        $eventLines = @(foreach ($ev in $sorted) {
+        $eventLines = @(foreach ($ev in $screenEvents) {
             $text = ' ' + $ev.Time.ToString('yyyy-MM-dd HH:mm:ss', $Invariant) + '  ' + (Format-Column $ev.Level $eventWidth.Level $false) + '  ' + (Format-Column $ev.Log $eventWidth.Log $false) + '  ' +
                 (Format-Column $ev.Source $eventWidth.Source $false) + '  ' + (Format-Column ([string]$ev.Id) 5 $false) + '  ' + (Limit-Text $ev.FirstLine $ScreenMessage)
             , @($text, $ev.LevelValue)
@@ -611,8 +658,7 @@ try {
         $countParts = @()
         foreach ($value in 1, 2, 3, 4, 5) {
             $name = $LevelNames[$value]
-            $n = @($sorted | Where-Object { $_.Level -eq $name }).Count
-            if ($n -gt 0) { $countParts += Format-Invariant '{0} {1:N0}' $name $n }
+            if ($levelCounts.ContainsKey($name)) { $countParts += Format-Invariant '{0} {1:N0}' $name $levelCounts[$name] }
         }
         $tail = New-Object 'System.Collections.Generic.List[string]'
         $tail.Add('')
@@ -686,7 +732,8 @@ if ($fatal) { Stop-WithError $fatal }
 
 # 保存できたときは、画面には先頭の分だけを出す。保存しなかったときは、ほかに見る場所がないためすべて出す
 $saved = $runDir -and -not $saveError
-function Write-Table([string]$Title, [string]$Header, $Rows, [int]$Limit, [string]$MoreFile) {
+function Write-Table([string]$Title, [string]$Header, $Rows, [int]$Limit, [string]$MoreFile, [int]$Total = -1) {
+    if ($Total -lt 0) { $Total = $Rows.Count }
     Write-Host $Title -ForegroundColor Cyan
     if ($Rows.Count -eq 0) { Write-Host '    （該当なし）'; return }
     Write-Host $Header
@@ -701,7 +748,7 @@ function Write-Table([string]$Title, [string]$Header, $Rows, [int]$Limit, [strin
         }
         $shown++
     }
-    if ($Rows.Count -gt $shown) { Write-Host (Format-Invariant '（ほか {0:N0} 件は {1} を参照してください）' ($Rows.Count - $shown) $MoreFile) }
+    if ($Total -gt $shown) { Write-Host (Format-Invariant '（ほか {0:N0} 件は {1} を参照してください）' ($Total - $shown) $MoreFile) }
 }
 
 for ($i = 0; $i -lt $headIndex; $i++) { Write-Host $lines[$i] }
@@ -710,7 +757,7 @@ if ($sorted.Count -gt 0) {
     Write-Table $groupTitle $groupHeader $groupLines $ScreenGroups 'summary.csv'
     Write-Host ''
     $eventTitle = if ($saved) { '■ 新しい順（{0} 件まで）' -f $ScreenEvents } else { '■ 新しい順' }
-    Write-Table $eventTitle $eventHeader $eventLines $ScreenEvents 'events.csv'
+    Write-Table $eventTitle $eventHeader $eventLines $ScreenEvents 'events.csv' $sorted.Count
 }
 foreach ($line in $tail) { Write-Host $line }
 
