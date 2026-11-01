@@ -23,5 +23,8 @@ FolderSnapshot_*/
 # Export-TaskList の実行結果（既定ではスクリプトと同じフォルダに保存される）
 TaskList_*/
 
+# Convert-TextEncoding の実行結果（既定ではスクリプトと同じフォルダに保存される）
+TextEncoding_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
