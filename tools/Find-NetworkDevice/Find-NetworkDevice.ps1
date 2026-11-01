@@ -273,7 +273,8 @@ function Test-LocalAddress([long]$Value) {
 $startTime = Get-Date
 $adapters  = Get-LocalAdapter
 $networks  = New-Object 'System.Collections.Generic.List[object]'
-$tooLarge  = New-Object 'System.Collections.Generic.List[string]'   # 自動で決めるときに、大きすぎて飛ばしたネットワークの知らせ
+$tooLarge  = New-Object 'System.Collections.Generic.List[string]'
+$tooLargeLabels = New-Object 'System.Collections.Generic.HashSet[string]'   # 自動で決めるときに、大きすぎて飛ばしたネットワークの知らせ
 
 if ($Range.Count -gt 0) {
     # -File で起動すると配列を渡せないため、カンマ区切りの 1 つの文字列も受け付ける
@@ -322,6 +323,9 @@ if ($Range.Count -gt 0) {
         $net = New-CidrRange $adapter.Address $adapter.Prefix
         $count = $net.Last - $net.First + 1
         if ($count -gt $MaxAuto) {
+            # 同じネットワークに複数のアダプター（有線と Wi-Fi など）でつながっていても、知らせは 1 回だけ
+            if ($tooLargeLabels.Contains($net.Label)) { continue }
+            [void]$tooLargeLabels.Add($net.Label)
             $tooLarge.Add(((Format-Invariant '※ {0}（{1}）は大きすぎるため、探していません（{2:N0} 件。{3:N0} 件までです）。' $net.Label $adapter.Name $count $MaxAuto) +
                 '探すときは -Range で範囲を狭めて指定してください（例: -Range "' + (ConvertTo-IpText ($adapter.Address - ($adapter.Address % 256))) + '/24"）'))
             continue
@@ -481,6 +485,7 @@ try {
     # DNS の逆引きを、ping と同じ数ずつまとめて問い合わせる（一度に始めると、待ち時間を数え始めた後に始まる問い合わせが出るため）
     $dnsTargets = @($devices.Values | Where-Object { $_.Kind -ne 'この PC' })
     for ($offset = 0; $offset -lt $dnsTargets.Count; $offset += $Parallel) {
+        Write-Progress -Activity 'ネットワークの機器一覧' -Status (Format-Invariant '名前を調べています: {0:N0} / {1:N0} 台' $offset $dnsTargets.Count) -PercentComplete ([int](100 * $offset / [math]::Max(1, $dnsTargets.Count)))
         $dnsJobs = New-Object 'System.Collections.Generic.List[object]'
         $dnsTasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
         for ($i = $offset; $i -lt [math]::Min($offset + $Parallel, $dnsTargets.Count); $i++) {
