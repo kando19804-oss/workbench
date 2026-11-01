@@ -16,5 +16,8 @@ Connectivity_*/
 PortProcess_*/
 SearchLog_*/
 
+# Search-EventLog の実行結果（既定ではスクリプトと同じフォルダに保存される）
+EventLog_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
