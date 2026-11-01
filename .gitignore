@@ -10,10 +10,11 @@ Backup_*/
 # Get-DiskUsage の実行結果（既定ではスクリプトと同じフォルダに保存される）
 DiskUsage_*/
 
-# Get-FolderTree・Test-Connectivity・Get-PortProcess の実行結果（既定ではスクリプトと同じフォルダに保存される）
+# Get-FolderTree・Test-Connectivity・Get-PortProcess・Search-Log の実行結果（既定ではスクリプトと同じフォルダに保存される）
 FolderTree_*/
 Connectivity_*/
 PortProcess_*/
+SearchLog_*/
 
 # Mac の Finder が作るファイル
 .DS_Store
