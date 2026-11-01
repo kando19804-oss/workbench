@@ -156,7 +156,7 @@ NoSave = false
 powershell -ExecutionPolicy Bypass -File C:\tools\Compare-Folder.ps1 -Reference C:\tools\FolderSnapshot_SERVER01_20261031_220000\snapshot.csv -Difference D:\app
 ```
 
-パスにスペースや `'` などが入っているときは、そのパスを `"` で囲んで表示します。保存先の行と最後のコマンドは、`summary.txt` にも書きます。
+パスにスペースや `'` などが入っているときは、そのパスを `"` で囲んで表示します。`$` を含むパス（`\\server\share$` など）は、PowerShell で変数として読まれないよう `'` で囲みます（コマンドプロンプトに貼るときは、`'` を `"` に変えてください）。保存先の行と最後のコマンドは、`summary.txt` にも書きます。
 
 表示の決まりは次のとおりです。
 

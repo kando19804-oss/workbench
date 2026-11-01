@@ -374,6 +374,8 @@ function Assert-Folder([string]$FullPath, [string]$Label, [string]$ConfigName) {
 # 引用符が閉じなくなるため、最後の \ は 2 つにする
 function Format-Argument([string]$Text) {
     if ($Text -notmatch "[\s&()^,;=!%'`$]") { return $Text }
+    # "..." の中の $名前 は PowerShell では変数として展開されるため、' を含まなければ '...' で囲む（コマンドプロンプトでは ' が残るので、$ があるときだけ）
+    if ($Text.Contains('$') -and -not $Text.Contains("'")) { return "'" + $Text + "'" }
     if ($Text.EndsWith('\')) { $Text += '\' }
     return '"' + $Text + '"'
 }
@@ -585,12 +587,15 @@ if ($refIsSnapshot) {
         $kind = $record.'種類'
         if ($kind -eq '情報') {
             switch ($record.'相対パス') {
-                'フォルダ' { $snapInfo.Folder = $record.'状態' }
-                '保存日時' { $snapInfo.Saved = $record.'状態' }
+                'フォルダ' { $snapInfo.Folder = [string]$record.'状態' }
+                '保存日時' { $snapInfo.Saved = [string]$record.'状態' }
                 'ハッシュ' { $snapInfo.HasHash = $record.'状態' -eq 'SHA-256' }
-                '除外'     { $snapInfo.Exclude += $record.'状態' }
+                '除外'     { if ($record.'状態') { $snapInfo.Exclude += [string]$record.'状態' } }
                 # 日時は保存した PC の現地時刻で書いてあるため、その PC の時間帯で UTC に直す（比べる PC と時間帯が違っても、ずれないように）
-                '時間帯'   { try { $snapInfo.Zone = [TimeZoneInfo]::FindSystemTimeZoneById([string]$record.'状態') } catch { } }
+                '時間帯'   {
+                    try { $snapInfo.Zone = [TimeZoneInfo]::FindSystemTimeZoneById([string]$record.'状態') }
+                    catch { Write-Warning ('スナップショットを保存した PC の時間帯（{0}）が見つからないため、この PC の時間帯で更新日時を読みます。時間帯が違うと、更新日時がずれて「変更」と出ることがあります' -f $record.'状態') }
+                }
             }
             continue
         }
@@ -1175,7 +1180,10 @@ try {
         $tail.Add((& $resultLine ([bool]$runDir)))
         foreach ($line in (Get-NoteLine $linkKeys)) { $tail.Add($line) }
         if ($noHashCount -gt 0) {
-            $tail.Add((Format-Invariant '※ ハッシュで比べられなかったファイルが {0:N0} 件あります（オンライン専用など）。サイズと更新日時で比べました。-IncludeSame を付けると、differences.csv の備考で確かめられます' $noHashCount))
+            $hint = ''
+            if ($runDir -and $IncludeSame) { $hint = '。differences.csv の備考で確かめられます' }
+            elseif ($runDir) { $hint = '。-IncludeSame を付けると、differences.csv の備考で確かめられます' }
+            $tail.Add((Format-Invariant '※ ハッシュで比べられなかったファイルが {0:N0} 件あります（オンライン専用など）。サイズと更新日時で比べました{1}' $noHashCount $hint))
         }
 
         # summary.txt には、違いをすべて書く
