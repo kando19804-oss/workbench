@@ -685,6 +685,18 @@ try {
             Assert-Equal ('Excel 対策: {0}' -f $excelEvents[$i][0]) $rows[$excelEvents.Count - 1 - $i].'メッセージ' $excelEvents[$i][2]
         }
 
+        Write-Section '見えない文字'
+        # 実機確認で見つかった問題: Windows はメッセージの日時に見えない文字（U+200E）を入れるので、-Pattern で日時を探せなかった
+        # （-ceq はこの文字を無視することがあるので、Contains と -Pattern の結果で確かめる）
+        $lrm = [string][char]0x200E
+        $rlm = [string][char]0x200F
+        $markFile = Join-Path $workRoot 'marks\marks.evtx'
+        New-EvtxFile $markFile @(New-TestEvent (Get-TestTime '10:00') 2 1 'WSH' ("開始 ${lrm}2026${lrm}-${lrm}11${rlm}-${lrm}01 終了") 'Application')
+        $run = Invoke-Tool 'marks' (@('-Path', $markFile, '-Pattern', '2026-11-01') + $range)
+        Assert-Equal '見えない文字を除いて探す' (Get-CodeAndIds $run) '0/1'
+        $saved = (@((Read-Result $run.Dir).Events) | ForEach-Object { $_.'メッセージ' }) -join ''
+        Assert-Equal '見えない文字を除いて保存する' ('{0}/{1}/{2}' -f $saved.Contains($lrm), $saved.Contains($rlm), $saved.Contains('開始 2026-11-01 終了')) 'False/False/True'
+
         Write-Section 'メッセージの長さ'
         $lengthFile = Join-Path $workRoot 'length\length.evtx'
         New-EvtxFile $lengthFile @(
