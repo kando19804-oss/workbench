@@ -301,7 +301,7 @@ $targetIsDir  = $false
 try { $targetIsFile = [IO.File]::Exists($targetLong) } catch { }
 try { $targetIsDir = [IO.Directory]::Exists($targetLong) } catch { }
 if (-not $targetIsFile -and -not $targetIsDir) {
-    Stop-WithError ((@(('ファイルもフォルダも見つかりません: {0}' -f $targetFull)) + @(Get-NetworkHint $targetFull)) -join "`r`n")
+    Stop-WithError ((@(('ファイルもフォルダも見つかりません（または、アクセスする権限がありません）: {0}' -f $targetFull)) + @(Get-NetworkHint $targetFull)) -join "`r`n")
 }
 $targetIsNetwork = Test-NetworkPath $targetFull
 
@@ -378,7 +378,8 @@ namespace Workbench.FindFileLock {
 # 同じ PowerShell でもう一度実行したときは、読み込み済みの型を使う（同じ名前の型は読み込み直せない）
 if (-not ('Workbench.FindFileLock.Native' -as [type])) {
     try {
-        Add-Type -TypeDefinition $nativeSource -ErrorAction Stop
+        # 5.1 の Add-Type は、コンパイラーの警告もエラーとして扱う
+        Add-Type -TypeDefinition $nativeSource -IgnoreWarnings -WarningAction SilentlyContinue -ErrorAction Stop
     } catch {
         Stop-WithError ('Windows の API を呼ぶ準備ができません。制約付き言語モードか、コンパイラーの実行が禁止されている環境では使えません（{0}）' -f (Get-ErrorText (Get-InnerException $_.Exception)))
     }
@@ -388,6 +389,7 @@ if (-not ('Workbench.FindFileLock.Native' -as [type])) {
 
 $hits       = New-Object 'System.Collections.Generic.List[object]'   # プロセスが使っているもの
 $clients    = New-Object 'System.Collections.Generic.List[object]'   # 共有フォルダから開いているもの
+$sharedFiles = New-Object 'System.Collections.Generic.List[string]'  # 属性の読み取りでも共有違反になったファイル（pagefile.sys など）
 $skipped    = New-Object 'System.Collections.Generic.List[object]'
 $skipKinds  = [ordered]@{ '権限なし' = 0; 'その他のエラー' = 0 }
 $linkCount  = 0
@@ -432,6 +434,8 @@ function Find-UsingProcess([string]$LongPath, [bool]$IsFile, [bool]$OpenLink) {
     }
     # 調べている間に消えたもの（ERROR_FILE_NOT_FOUND、ERROR_PATH_NOT_FOUND）は、もう使われていないので数えない
     if ($code -eq 2 -or $code -eq 3) { return }
+    # ERROR_SHARING_VIOLATION。プロセスは分からないが使われているので、開けるかの確認に回す
+    if ($code -eq 32 -and $IsFile) { $sharedFiles.Add($display); return }
     if ($code -ne 0) {
         $detail = Get-ErrorText (New-Object ComponentModel.Win32Exception ([int]$code))
         Add-Skip $(if ($code -eq 5) { '権限なし' } else { 'その他のエラー' }) $display $detail
@@ -557,19 +561,30 @@ try {
     # 共有フォルダの接続は、このコンピューターが共有しているものだけが分かる。ネットワーク上のパスとは突き合わせられない
     if (-not $targetIsNetwork -and (Get-Command Get-SmbOpenFile -ErrorAction SilentlyContinue)) {
         Write-Progress -Activity $ToolTitle -Status '共有フォルダの接続を調べています'
-        $targetTrim = $targetFull.TrimEnd('\')
+        $targetTrim  = $targetFull.TrimEnd('\')
+        $clientIndex = @{}   # 同じファイル・クライアント・ユーザーの接続は 1 行にまとめ、権限は強いほうを残す
         try {
             foreach ($open in @(Get-SmbOpenFile -ErrorAction Stop)) {
                 $openPath = ([string]$open.Path).TrimEnd('\')
                 $isUnder  = $openPath.Equals($targetTrim, [StringComparison]::OrdinalIgnoreCase) -or
                     ($targetIsDir -and $openPath.StartsWith($targetTrim + '\', [StringComparison]::OrdinalIgnoreCase))
                 if (-not $isUnder) { continue }
-                $clients.Add([pscustomobject]@{
-                    File   = $openPath
+                $accessText = Get-AccessText $open.Permissions
+                $clientKey  = '{0}|{1}|{2}' -f $openPath, $open.ClientComputerName, $open.ClientUserName
+                if ($clientIndex.ContainsKey($clientKey)) {
+                    $known = $clientIndex[$clientKey]
+                    if ($accessText -eq '読み書き' -or ($accessText -eq '読み取り' -and $known.Access -eq 'その他')) { $known.Access = $accessText }
+                    continue
+                }
+                # ドライブのルートは、\ を外すと D: になるので元に戻す
+                $client = [pscustomobject]@{
+                    File   = $(if ($openPath -match '^[A-Za-z]:$') { $openPath + '\' } else { $openPath })
                     Client = [string]$open.ClientComputerName
                     User   = [string]$open.ClientUserName
-                    Access = Get-AccessText $open.Permissions
-                })
+                    Access = $accessText
+                }
+                $clientIndex[$clientKey] = $client
+                $clients.Add($client)
             }
         } catch {
             if (-not $isAdmin) {
@@ -586,6 +601,7 @@ try {
     Write-Progress -Activity $ToolTitle -Status '開けるかを確かめています'
     if ($targetIsFile) { Add-OpenCheck $targetFull }
     foreach ($hit in $hits) { if ($hit.IsFile) { Add-OpenCheck $hit.File } }
+    foreach ($shared in $sharedFiles) { Add-OpenCheck $shared }
     foreach ($client in $clients) {
         $isFile = $false
         try { $isFile = [IO.File]::Exists((ConvertTo-LongPath $client.File)) } catch { }
@@ -718,7 +734,8 @@ try {
     $foundAny = $hitList.Count -gt 0 -or $clientList.Count -gt 0
     $skipTotal = $skipKinds['権限なし'] + $skipKinds['その他のエラー']
     if ($foundAny -or $blockedUnknown) { $exitCode = 2 }
-    elseif ($skipTotal -gt 0) { $exitCode = 1 }
+    # ネットワーク上のパスでは、ほかの PC から使われていても分からないので、「使われていない」とは言えない
+    elseif ($skipTotal -gt 0 -or $targetIsNetwork) { $exitCode = 1 }
 
     $processRows = New-Object 'System.Collections.Generic.List[object]'
     foreach ($hit in $hitList) {
