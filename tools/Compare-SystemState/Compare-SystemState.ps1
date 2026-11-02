@@ -277,7 +277,7 @@ function Stop-WithError([string]$Message) {
 # " は Windows のパスに使えない文字なので、値に残っていたらこの問題とみなして止める
 function Stop-WithQuoteError([string]$Name, [string]$Value) {
     Stop-WithError (('{0} の値に引用符（"）が残っています: {1}' -f $Name, $Value) + "`r`n" +
-        'パスを引用符で囲むときは、最後に \ を付けないでください（例: -Reference "C:\tools\SystemSnapshot_1"）。最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
+        'パスを引用符で囲むときは、最後に \ を付けないでください（例: {0} "C:\tools\結果"）。' -f $Name + '最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
 }
 
 # .NET の IsPathRooted は | などの文字で例外を出すため、先頭の形で判定する
@@ -492,7 +492,7 @@ function Get-ActionText($Action) {
 
 #region 項目ごとの取得
 
-# 取得の途中で一部だけ読めなかったものを残す。$Skips は項目を読む間だけ差し替える
+# 取得の途中で一部だけ読めなかったものを残す。$currentSkips は項目を読む間だけ差し替える
 $currentSkips = $null
 function Add-PartialSkip([string]$ItemPath, [Exception]$Exception) {
     $ex = Get-InnerException $Exception
@@ -566,7 +566,9 @@ function Read-ItemPort($Rows) {
         if ($processNames.ContainsKey($OwnerId)) { $entry.Names.Add($processNames[$OwnerId]) }
         if ($serviceNames.ContainsKey($OwnerId)) { $entry.Services.AddRange($serviceNames[$OwnerId]) }
     }
-    foreach ($c in @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue)) { & $addEntry 'TCP' ([string]$c.LocalAddress) ([int]$c.LocalPort) ([int]$c.OwningProcess) }
+    foreach ($c in @(Get-NetTCPConnection -ErrorAction Stop)) {
+        if ("$($c.State)" -eq 'Listen') { & $addEntry 'TCP' ([string]$c.LocalAddress) ([int]$c.LocalPort) ([int]$c.OwningProcess) }
+    }
     foreach ($u in @(Get-NetUDPEndpoint -ErrorAction Stop)) { & $addEntry 'UDP' ([string]$u.LocalAddress) ([int]$u.LocalPort) ([int]$u.OwningProcess) }
     foreach ($entry in $merged.Values) {
         Add-Row $Rows $entry.Protocol $entry.Address $entry.Number (Join-Sorted $entry.Names.ToArray()) (Join-Sorted $entry.Services.ToArray())
@@ -612,7 +614,9 @@ function Read-ItemTask($Rows) {
 }
 
 function Read-ItemSoftware($Rows) {
-    $views = if ([Environment]::Is64BitOperatingSystem) { @(@('Registry64', '64 ビット'), @('Registry32', '32 ビット')) } else { @(, @('Registry32', '32 ビット')) }
+    $views = New-Object 'System.Collections.Generic.List[object]'
+    if ([Environment]::Is64BitOperatingSystem) { $views.Add([string[]]@('Registry64', '64 ビット')) }
+    $views.Add([string[]]@('Registry32', '32 ビット'))
     foreach ($view in $views) {
         $root = Open-MachineKey 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' $view[0]
         if (-not $root) { continue }
@@ -639,7 +643,7 @@ function Read-ItemSoftware($Rows) {
         } finally {
             $root.Dispose()
         }
-        foreach ($displayName in $found.Keys) {
+        foreach ($displayName in $found.get_Keys()) {
             Add-Row $Rows $displayName $view[1] (Join-Sorted $found[$displayName].Versions.ToArray()) $found[$displayName].Publisher
         }
     }
@@ -773,7 +777,7 @@ function Read-ItemFirewall($Rows) {
     }
 }
 
-# 行の並びと重なりをそろえる。Dictionary は突き合わせにもそのまま使う
+# 突き合わせる値 → 行 の表にする。同じ対象の重なりはここで除く
 function ConvertTo-RowTable($Rows, $Def) {
     $table = New-Object 'System.Collections.Generic.Dictionary[string,object]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($row in $Rows) {
@@ -784,9 +788,10 @@ function ConvertTo-RowTable($Rows, $Def) {
     return , $table
 }
 
+# Keys や Count という名前の対象（共有名や環境変数名）があると、$Table.Keys は表の中身を返すので、get_ で呼ぶ
 function Get-SortedKeys($Table) {
-    $keys = New-Object 'string[]' $Table.Count
-    $Table.Keys.CopyTo($keys, 0)
+    $keys = New-Object 'string[]' $Table.get_Count()
+    $Table.get_Keys().CopyTo($keys, 0)
     [Array]::Sort($keys, [StringComparer]::OrdinalIgnoreCase)
     return , $keys
 }
@@ -900,7 +905,7 @@ function Read-StateFolder([string]$Folder, [string]$Label, [string[]]$Names) {
     $info = @{}
     try {
         foreach ($line in ((Read-TextAuto $infoPath) -split '\r\n|\n|\r')) {
-            $separator = $line.IndexOf(' = ')
+            $separator = $line.IndexOf(' = ', [StringComparison]::Ordinal)
             if ($separator -gt 0) { $info[$line.Substring(0, $separator)] = $line.Substring($separator + 3) }
         }
     } catch {
@@ -972,7 +977,8 @@ function Get-TargetText([string]$Name, [string[]]$Row) {
         'Hosts' { return '{0} {1}' -f $Row[0], $Row[1] }
         'Firewall' {
             if ($Row[0] -eq 'プロファイル') { return 'プロファイル ' + $Row[1] }
-            return $(if ($Row[2]) { $Row[2] } else { $Row[1] })
+            # 同じ表示名の規則が多いので、ID も添える
+            return $(if ($Row[2]) { '{0}（{1}）' -f $Row[2], $Row[1] } else { $Row[1] })
         }
     }
     return $Row[0]
@@ -994,13 +1000,14 @@ function Test-DynamicPort([string[]]$Row) {
     return [int]::TryParse($Row[2], [ref]$number) -and $number -ge $DynamicPort
 }
 
-# 1 つの項目を比べて、結果の行を Results に加え、件数を返す
-function Compare-Item([string]$Name, $RefTable, $DifTable, $Results) {
+# 1 つの項目を比べて、結果の行を Results に加え、件数を返す。
+# RefPartial と DifPartial は、その側で一部を読めなかったこと。読めなかった対象が「追加」や「削除」に見えるので、確かな違いに数えない
+function Compare-Item([string]$Name, $RefTable, $DifTable, $Results, [bool]$RefPartial, [bool]$DifPartial) {
     $def = $ItemDefs[$Name]
     $counts = @{ Added = 0; Removed = 0; Changed = 0; Minor = 0 }
     $allKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($key in $RefTable.Keys) { [void]$allKeys.Add($key) }
-    foreach ($key in $DifTable.Keys) { [void]$allKeys.Add($key) }
+    foreach ($key in $RefTable.get_Keys()) { [void]$allKeys.Add($key) }
+    foreach ($key in $DifTable.get_Keys()) { [void]$allKeys.Add($key) }
     $keys = New-Object 'string[]' $allKeys.Count
     $allKeys.CopyTo($keys)
     [Array]::Sort($keys, [StringComparer]::OrdinalIgnoreCase)
@@ -1015,13 +1022,16 @@ function Compare-Item([string]$Name, $RefTable, $DifTable, $Results) {
 
         if ($null -eq $refRow -or $null -eq $difRow) {
             $isAdded = $null -eq $refRow
-            $result  = if ($isDynamic) { '参考' } elseif ($isAdded) { '追加' } else { '削除' }
-            if ($isDynamic) { $counts.Minor++ } elseif ($isAdded) { $counts.Added++ } else { $counts.Removed++ }
+            $unsure  = ($isAdded -and $RefPartial) -or (-not $isAdded -and $DifPartial)
+            $isMinor = $isDynamic -or $unsure
+            $result  = if ($isMinor) { '参考' } elseif ($isAdded) { '追加' } else { '削除' }
+            if ($isMinor) { $counts.Minor++ } elseif ($isAdded) { $counts.Added++ } else { $counts.Removed++ }
+            $kindText = if ($isAdded) { '追加' } else { '削除' }
             $allText = Get-AllValuesText $def $anyRow
             $Results.Add([pscustomobject]@{
                 Result = $result; Item = $Name; Target = $target; Attribute = ''
                 RefValue = $(if ($isAdded) { '' } else { $allText }); DifValue = $(if ($isAdded) { $allText } else { '' })
-                Note = $(if ($isDynamic) { '{0}（{1}）' -f $note, $(if ($isAdded) { '追加' } else { '削除' }) } else { '' })
+                Note = $(if ($unsure) { '{0}に見えるが、一部を読めなかったため確かではない' -f $kindText } elseif ($isDynamic) { '{0}（{1}）' -f $note, $kindText } else { '' })
                 Screen = Get-ScreenValuesText $def $anyRow
             })
             continue
@@ -1179,7 +1189,6 @@ $header     = New-Object 'System.Collections.Generic.List[string]'
 $tail       = New-Object 'System.Collections.Generic.List[string]'
 $countLines = @()
 $diffLines  = @()
-$diffShown  = 0
 try {
     if ($Snapshot) {
         #region スナップショットの保存
@@ -1197,11 +1206,11 @@ try {
         $header.Add((Format-Invariant '{0}   {1:yyyy-MM-dd HH:mm:ss}   管理者: {2}' $machineName $startTime $(if ($isAdmin) { 'はい' } else { 'いいえ' })))
         $rows = @(foreach ($name in $compareNames) {
             $itemState = $state.Items[$name]
-            , [string[]]@($ItemDefs[$name].Label, $(if ($itemState.Status) { $itemState.Status } else { Format-Invariant '{0:N0}' $itemState.Table.Count }))
+            , [string[]]@($ItemDefs[$name].Label, $(if ($itemState.Status) { $itemState.Status } else { Format-Invariant '{0:N0}' $itemState.Table.get_Count() }))
         })
         $countLines = Format-Table ([string[]]@('項目', '件数')) ([bool[]]@($false, $true)) $rows
-        $skipNotApplicable = @($state.Skips | Where-Object { $_[0] -ne '対象外' }).Count
-        if ($skipNotApplicable -gt 0) { $tail.Add((Format-Invariant '※ 取れなかったものが {0:N0} 件あります（skipped.csv を確認してください）' $skipNotApplicable)) }
+        $failedCount = @($state.Skips | Where-Object { $_[0] -ne '対象外' }).Count
+        if ($failedCount -gt 0) { $tail.Add((Format-Invariant '※ 取れなかったものが {0:N0} 件あります（skipped.csv を確認してください）' $failedCount)) }
         if (-not $isAdmin) { $tail.Add('※ 管理者として実行すると、取れる情報が増えます') }
         $tail.Add(('所要 {0}' -f (Format-Duration $sw.Elapsed)))
 
@@ -1234,7 +1243,9 @@ try {
                 $notCompared.Add($name)
                 continue
             }
-            $itemCount[$name] = Compare-Item $name $refItem.Table $difItem.Table $results
+            $refPartial = @($refState.Skips | Where-Object { $_[1] -eq $name }).Count -gt 0
+            $difPartial = @($difState.Skips | Where-Object { $_[1] -eq $name }).Count -gt 0
+            $itemCount[$name] = Compare-Item $name $refItem.Table $difItem.Table $results $refPartial $difPartial
         }
 
         $added = 0; $removed = 0; $changed = 0; $minor = 0
@@ -1243,6 +1254,10 @@ try {
         # 「対象外」は比べられなかったことに数えない
         $partialCount = @($skipRows | Where-Object { $_[0] -ne '対象外' -and $notCompared -notcontains $_[1] }).Count
         $problemCount = $notCompared.Count + $partialCount
+        $problemParts = @()
+        if ($notCompared.Count -gt 0) { $problemParts += Format-Invariant '比べられなかった項目が {0:N0} 件' $notCompared.Count }
+        if ($partialCount -gt 0) { $problemParts += Format-Invariant '読めなかった対象が {0:N0} 件' $partialCount }
+        $problemText = $problemParts -join '、'
         if ($diffTotal -gt 0) { $exitCode = 2 } elseif ($problemCount -gt 0) { $exitCode = 1 }
 
         # 見出し
@@ -1254,7 +1269,7 @@ try {
         } else {
             $header.Add((Format-Invariant '比較: {0} {1:yyyy-MM-dd HH:mm:ss}（管理者: {2}）  {3}' $difState.Host $difState.Time (& $adminText $difState.Admin) $difFolder))
         }
-        if ($refState.Boot -and $difState.Boot) {
+        if ($refState.Boot -and $difState.Boot -and $refState.Host -eq $difState.Host) {
             if ($refState.Boot -eq $difState.Boot) {
                 $header.Add('再起動: なし')
             } else {
@@ -1267,8 +1282,8 @@ try {
         $rows = @(foreach ($name in $compareNames) {
             $refItem = $refState.Items[$name]
             $difItem = $difState.Items[$name]
-            $refText = if ($refItem.Status) { $refItem.Status } else { Format-Invariant '{0:N0}' $refItem.Table.Count }
-            $difText = if ($difItem.Status) { $difItem.Status } else { Format-Invariant '{0:N0}' $difItem.Table.Count }
+            $refText = if ($refItem.Status) { $refItem.Status } else { Format-Invariant '{0:N0}' $refItem.Table.get_Count() }
+            $difText = if ($difItem.Status) { $difItem.Status } else { Format-Invariant '{0:N0}' $difItem.Table.get_Count() }
             if ($itemCount.ContainsKey($name)) {
                 $counts = $itemCount[$name]
                 , [string[]]@($ItemDefs[$name].Label, $refText, $difText, (Format-Invariant '{0:N0}' $counts.Added), (Format-Invariant '{0:N0}' $counts.Removed), (Format-Invariant '{0:N0}' $counts.Changed), (Format-Invariant '{0:N0}' $counts.Minor))
@@ -1289,12 +1304,12 @@ try {
         if ($diffTotal -gt 0) {
             $resultText = '結果: 違いあり'
         } elseif ($problemCount -gt 0) {
-            $resultText = Format-Invariant '結果: 違いなし（ただし、比べられなかった項目が {0:N0} 件あります。skipped.csv を確認してください）' $problemCount
+            $resultText = '結果: 違いなし（ただし、{0}あります。skipped.csv を確認してください）' -f $problemText
         } else {
             $resultText = '結果: 違いなし'
         }
         $tail.Add((Format-Invariant '{0}   追加 {1:N0} 件  削除 {2:N0} 件  変更 {3:N0} 件  参考 {4:N0} 件   所要 {5}' $resultText $added $removed $changed $minor (Format-Duration $sw.Elapsed)))
-        if ($problemCount -gt 0 -and $diffTotal -gt 0) { $tail.Add((Format-Invariant '比べられない項目 {0:N0} 件（skipped.csv を確認してください）' $problemCount)) }
+        if ($problemCount -gt 0 -and $diffTotal -gt 0) { $tail.Add(('※ {0}あります（skipped.csv を確認してください）' -f $problemText)) }
         if ($refState.Host -ne $difState.Host) { $tail.Add('※ 違うコンピューターの状態を比べています。名前や IP アドレスの違いも出ます') }
         if ($refState.Admin -ne $difState.Admin) { $tail.Add('※ 基準と比較で、管理者かどうかが違います。取れる情報の違いが、違いとして出ることがあります') }
         if (-not $refState.Admin -and -not $difState.Admin) { $tail.Add('※ 管理者として実行すると、取れる情報が増えます') }
@@ -1369,15 +1384,22 @@ if (-not $Snapshot) {
     } else {
         # 保存できたときは、画面には先頭の分だけを出す。保存しなかったときは、ほかに見る場所がないためすべて出す（表の 1 行目は見出し）
         $limit = if ($runDir) { $ScreenRows + 1 } else { $diffLines.Count }
-        $diffShown = [math]::Min($limit, $diffLines.Count)
-        for ($i = 0; $i -lt $diffShown; $i++) { Write-Host $diffLines[$i] }
-        if ($diffLines.Count -gt $diffShown) {
-            Write-Host (Format-Invariant '（ほか {0:N0} 件は differences.csv を参照してください）' ($diffLines.Count - $diffShown))
+        $shown = [math]::Min($limit, $diffLines.Count)
+        for ($i = 0; $i -lt $shown; $i++) { Write-Host $diffLines[$i] }
+        if ($diffLines.Count -gt $shown) {
+            Write-Host (Format-Invariant '（ほか {0:N0} 件は differences.csv を参照してください）' ($diffLines.Count - $shown))
         }
     }
     Write-Host ''
 }
-foreach ($line in $tail) { Write-Host $line }
+# 保存しなかったときは skipped.csv がないので、理由を画面に出す
+foreach ($line in $tail) { Write-Host $(if ($runDir) { $line } else { $line.Replace('skipped.csv を確認してください', '下の一覧を確認してください') }) }
+if (-not $Snapshot -and -not $runDir -and $skipRows.Count -gt 0) {
+    Write-Host ''
+    Write-Host '■ 比べられなかったもの' -ForegroundColor Cyan
+    $skipScreen = @(foreach ($skip in $skipRows) { , [string[]]@($skip[0], $ItemDefs[$skip[1]].Label, $skip[2]) })
+    foreach ($line in (Format-Table ([string[]]@('理由', '項目', '詳細')) ([bool[]]@($false, $false, $false)) $skipScreen)) { Write-Host $line }
+}
 
 if ($saveError) {
     Write-Warning ('結果を保存できませんでした: {0}' -f $saveError)
