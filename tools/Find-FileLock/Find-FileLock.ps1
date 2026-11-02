@@ -403,7 +403,10 @@ $dirType    = [IO.DirectoryInfo]
 $rpFlag     = [IO.FileAttributes]::ReparsePoint
 $hsFlag     = [IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System
 
+$skipPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
 function Add-Skip([string]$Reason, [string]$ItemPath, [string]$Detail) {
+    # 問い合わせと中を読むときの両方で拒否されたフォルダを、2 件に数えない
+    if (-not $skipPaths.Add($ItemPath)) { return }
     $skipped.Add([object[]]@($Reason, $ItemPath, $Detail))
     if ($skipKinds.Contains($Reason)) { $skipKinds[$Reason]++ }
 }
@@ -533,7 +536,7 @@ function Get-AccessText($Mask) {
     $writes = (0x2L -bor 0x4L -bor 0x40000000L -bor 0x10000000L)   # FILE_WRITE_DATA、FILE_APPEND_DATA、GENERIC_WRITE、GENERIC_ALL
     $canRead  = ($value -band $reads) -ne 0
     $canWrite = ($value -band $writes) -ne 0
-    if ($canRead -and $canWrite) { return '読み書き' }
+    if ($canWrite) { return '読み書き' }   # 書き込みだけの接続も、ロックの調査では読み書きと同じように扱う
     if ($canRead) { return '読み取り' }
     return 'その他'
 }
@@ -601,7 +604,14 @@ try {
     Write-Progress -Activity $ToolTitle -Status '開けるかを確かめています'
     if ($targetIsFile) { Add-OpenCheck $targetFull }
     foreach ($hit in $hits) { if ($hit.IsFile) { Add-OpenCheck $hit.File } }
-    foreach ($shared in $sharedFiles) { Add-OpenCheck $shared }
+    foreach ($shared in $sharedFiles) {
+        Add-OpenCheck $shared
+        # 問い合わせが共有違反になったのに、開けるかの確認でも確かめられなければ、調べられなかったものとして残す
+        $sharedCheck = $openChecks[$shared]
+        if ($sharedCheck.Read -ne '可' -and $sharedCheck.Read -ne $InUseText -and $sharedCheck.Write -ne $InUseText) {
+            Add-Skip 'その他のエラー' $shared ('問い合わせが共有違反になり、開けるかも確かめられません（{0}）' -f $sharedCheck.Read)
+        }
+    }
     foreach ($client in $clients) {
         $isFile = $false
         try { $isFile = [IO.File]::Exists((ConvertTo-LongPath $client.File)) } catch { }
@@ -890,7 +900,7 @@ for ($i = 0; $i -lt $sections.Count; $i++) {
     $shown = [math]::Min($limit, $tableLines.Count)
     for ($j = 0; $j -lt $shown; $j++) { Write-Host $tableLines[$j] }
     if ($tableLines.Count -gt $shown) {
-        Write-Host (Format-Invariant '（ほか {0:N0} 行は locks.csv を参照してください）' ($tableLines.Count - $shown))
+        Write-Host (Format-Invariant '（ほか {0:N0} 行は {1} を参照してください）' ($tableLines.Count - $shown) $(if ($i -eq 2) { 'summary.txt' } else { 'locks.csv' }))
     }
 }
 Write-Host ''
