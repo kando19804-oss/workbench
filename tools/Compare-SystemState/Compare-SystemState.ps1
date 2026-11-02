@@ -101,7 +101,7 @@ $ItemDefs = [ordered]@{
     Service     = @{ Label = 'サービス'; File = 'services.csv'; Columns = 'サービス名', '表示名', '状態', 'スタートアップ', '実行ユーザー', '実行ファイル'
                      Keys = @('サービス名'); Compare = @('スタートアップ', '状態', '実行ユーザー', '実行ファイル'); Hidden = @('実行ファイル') }
     Port        = @{ Label = '待ち受けポート'; File = 'ports.csv'; Columns = 'プロトコル', 'ローカルアドレス', 'ポート', 'プロセス名', 'サービス'
-                     Keys = @('プロトコル', 'ローカルアドレス', 'ポート'); Compare = @('プロセス名', 'サービス'); Hidden = @() }
+                     Keys = @('プロトコル', 'ローカルアドレス', 'ポート'); Compare = @('プロセス名'); Hidden = @() }
     Task        = @{ Label = 'タスク'; File = 'tasks.csv'; Columns = 'パス', '有効', '実行ユーザー', 'トリガー', '操作'
                      Keys = @('パス'); Compare = @('有効', '実行ユーザー', 'トリガー', '操作'); Hidden = @('操作') }
     Software    = @{ Label = 'インストール済みソフト'; File = 'software.csv'; Columns = '名前', 'ビット', 'バージョン', '発行元'
@@ -920,6 +920,7 @@ function Read-StateFolder([string]$Folder, [string]$Label, [string[]]$Names) {
         Os = [string]$info['OS']; Boot = [string]$info['最終起動日時']; Items = @{}; Skips = New-Object 'System.Collections.Generic.List[object]'; Saved = @()
     }
     $state.Saved = @(foreach ($name in $ItemDefs.Keys) { if ($info.ContainsKey('項目.' + $name)) { $name } })
+    if ($state.Saved.Count -eq 0) { Stop-WithError $notSnapshot }
 
     # 保存したときに一部を読めなかった項目は、そのことを引き継ぐ。項目の見出しから名前に戻す
     $skipFile = Join-Path $Folder 'skipped.csv'
@@ -933,7 +934,10 @@ function Read-StateFolder([string]$Folder, [string]$Label, [string[]]$Names) {
                     }
                 }
             }
-        } catch { }
+        } catch {
+            # 一部を読めなかったことが分からないので、そのつもりで比べる
+            foreach ($name in $Names) { $state.Skips.Add([object[]]@('読めない', $name, ('skipped.csv: {0}' -f (Get-ErrorText (Get-InnerException $_.Exception))))) }
+        }
     }
 
     foreach ($name in $Names) {
