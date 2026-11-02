@@ -111,6 +111,7 @@ $CellLimit     = 32000    # CSV の 1 つの値の長さ（Excel のセルの上
 $ProgressMs    = 250      # 進捗表示の間隔（ミリ秒）
 $LongPathLength = 250     # この長さ以上の .evtx のパスは、\\?\ を付けて読む
 $ProviderPrefix = 'Microsoft-Windows-'
+$InvisibleMarks = New-Object Text.RegularExpressions.Regex '[‎‏]'   # 文字の向きを示す、見えない文字
 $NoMessage     = '（メッセージを取得できません）'
 $EventColumns  = '日時', 'ログ', 'レベル', 'イベントID', 'ソース', 'タスクのカテゴリ', 'コンピューター', 'ユーザー', 'メッセージ'
 $GroupColumns  = '件数', 'レベル', 'ログ', 'ソース', 'イベントID', '最初に発生', '最後に発生', 'メッセージ（1 行目）'
@@ -584,6 +585,8 @@ try {
                 # メッセージは、ソースの情報がないと取得できない（例外になることもある）
                 $message = $null
                 try { $message = $record.Message } catch { }
+                # Windows はメッセージの日時などに見えない文字（U+200E）を入れる。-Pattern で日時を探せるように取り除く
+                if ($message) { $message = $InvisibleMarks.Replace($message, '') }
                 if ($patternTerms.Count -gt 0) {
                     if (-not $message) { return }
                     $hit = $false
