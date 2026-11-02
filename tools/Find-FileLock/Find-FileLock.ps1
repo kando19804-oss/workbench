@@ -53,6 +53,12 @@ param(
     [switch]$NoSave
 )
 
+# 制約付き言語モード（AppLocker や WDAC の環境）では、.NET の型も Add-Type も使えないので、最初に止める
+if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
+    Write-Host 'Windows の API を呼ぶ準備ができません。制約付き言語モードか、コンパイラーの実行が禁止されている環境では使えません'
+    exit 1
+}
+
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
@@ -285,6 +291,8 @@ if (-not $Path) { Stop-WithError '調べるファイルかフォルダを -Path 
 $targetText = Remove-Quote $Path
 if ($targetText -eq '') { Stop-WithError '調べるファイルかフォルダを -Path で指定してください' }
 if ($targetText.Contains('"')) { Stop-WithQuoteError '-Path' $targetText }
+# コマンドプロンプトで "D:\" と書くと D: で届き、ドライブのルートではなく、そのドライブの現在のフォルダを指してしまう
+if ($targetText -match '^(\\\\\?\\)?[A-Za-z]:$') { $targetText += '\' }
 $targetFull = Resolve-FullPath (Resolve-StartPath $targetText)
 $targetLong = ConvertTo-LongPath $targetFull
 
@@ -301,6 +309,7 @@ $outputText = $null
 if ($OutputFolder) {
     $outputText = Remove-Quote $OutputFolder
     if ($outputText.Contains('"')) { Stop-WithQuoteError '-OutputFolder' $outputText }
+    if ($outputText -match '^(\\\\\?\\)?[A-Za-z]:$') { $outputText += '\' }
     $outputText = Resolve-StartPath $outputText
 }
 
@@ -310,7 +319,8 @@ if ($OutputFolder) {
 
 # NtQueryInformationFile の FileProcessIdsUsingFileInformation（47）で、ファイルやフォルダを開いているプロセスの番号を取る。
 # FILE_READ_ATTRIBUTES だけで開くので、共有違反にならず、ファイルの中身も読まない（オンライン専用ファイルもダウンロードされない）。
-# FILE_FLAG_OPEN_REPARSE_POINT で、リンクの先ではなくそのものを開く。戻り値は Windows のエラーコードで、0 が成功
+# openLink が真のときは FILE_FLAG_OPEN_REPARSE_POINT で、リンクの先ではなくそのものを開く（フォルダの中をたどるとき）。
+# -Path に指定した場所は、リンクなら先を調べる。戻り値は Windows のエラーコードで、0 が成功
 $nativeSource = @'
 using System;
 using System.Runtime.InteropServices;
@@ -330,12 +340,12 @@ namespace Workbench.FindFileLock {
         [DllImport("ntdll.dll")]
         private static extern int RtlNtStatusToDosError(int status);
 
-        public static int Query(string path, out int[] ids) {
+        public static int Query(string path, bool openLink, out int[] ids) {
             ids = new int[0];
             const uint FileReadAttributes = 0x80, ShareAll = 7, OpenExisting = 3, BackupSemantics = 0x02000000, OpenReparsePoint = 0x00200000;
             const int FileProcessIdsUsingFileInformation = 47;
             int infoLengthMismatch = unchecked((int)0xC0000004), bufferOverflow = unchecked((int)0x80000005);
-            using (SafeFileHandle handle = CreateFile(path, FileReadAttributes, ShareAll, IntPtr.Zero, OpenExisting, BackupSemantics | OpenReparsePoint, IntPtr.Zero)) {
+            using (SafeFileHandle handle = CreateFile(path, FileReadAttributes, ShareAll, IntPtr.Zero, OpenExisting, BackupSemantics | (openLink ? OpenReparsePoint : 0), IntPtr.Zero)) {
                 if (handle.IsInvalid) { return Marshal.GetLastWin32Error(); }
                 int size = 4096;
                 while (true) {
@@ -410,16 +420,18 @@ function Get-LinkName($Entry) {
 }
 
 # 1 つのファイルやフォルダを使っているプロセスを問い合わせる。問い合わせに使ったハンドルが数に入るので、このツール自身は除く
-function Find-UsingProcess([string]$LongPath, [bool]$IsFile) {
+function Find-UsingProcess([string]$LongPath, [bool]$IsFile, [bool]$OpenLink) {
     $display = ConvertTo-DisplayPath $LongPath
     $ids  = $null
     $code = 0
     try {
-        $code = [Workbench.FindFileLock.Native]::Query($LongPath, [ref]$ids)
+        $code = [Workbench.FindFileLock.Native]::Query($LongPath, $OpenLink, [ref]$ids)
     } catch {
         Add-Skip 'その他のエラー' $display (Get-ErrorText (Get-InnerException $_.Exception))
         return
     }
+    # 調べている間に消えたもの（ERROR_FILE_NOT_FOUND、ERROR_PATH_NOT_FOUND）は、もう使われていないので数えない
+    if ($code -eq 2 -or $code -eq 3) { return }
     if ($code -ne 0) {
         $detail = Get-ErrorText (New-Object ComponentModel.Win32Exception ([int]$code))
         Add-Skip $(if ($code -eq 5) { '権限なし' } else { 'その他のエラー' }) $display $detail
@@ -437,14 +449,11 @@ function Search-Folder([string]$RootLong) {
     $stack.Push((New-Object IO.DirectoryInfo $RootLong))
     while ($stack.Count -gt 0) {
         $dir = $stack.Pop()
-        if ($sw.ElapsedMilliseconds -ge $script:nextShow) {
-            Write-Progress -Activity $ToolTitle -Status (Format-Invariant '調べています: ファイル {0:N0} 件 / フォルダ {1:N0} 件' $script:fileCount $script:dirCount) -CurrentOperation (ConvertTo-DisplayPath $dir.FullName)
-            $script:nextShow = $sw.ElapsedMilliseconds + $ProgressMs
-        }
         try {
             $entries = $dir.GetFileSystemInfos()
         } catch {
             $ex = Get-InnerException $_.Exception
+            if ($ex -is [IO.DirectoryNotFoundException] -or $ex -is [IO.FileNotFoundException]) { continue }
             if ($ex -is [UnauthorizedAccessException]) {
                 Add-Skip '権限なし' (ConvertTo-DisplayPath $dir.FullName) 'アクセスが拒否されました'
             } else {
@@ -453,6 +462,10 @@ function Search-Folder([string]$RootLong) {
             continue
         }
         foreach ($entry in $entries) {
+            if ($sw.ElapsedMilliseconds -ge $script:nextShow) {
+                Write-Progress -Activity $ToolTitle -Status (Format-Invariant '調べています: ファイル {0:N0} 件 / フォルダ {1:N0} 件' $script:fileCount $script:dirCount) -CurrentOperation (ConvertTo-DisplayPath $entry.FullName)
+                $script:nextShow = $sw.ElapsedMilliseconds + $ProgressMs
+            }
             $linkName = $null
             if (($entry.Attributes -band $rpFlag) -eq $rpFlag) { $linkName = Get-LinkName $entry }
             if ($linkName) {
@@ -460,11 +473,11 @@ function Search-Folder([string]$RootLong) {
                 $skipped.Add([object[]]@('たどらなかったリンク', (ConvertTo-DisplayPath $entry.FullName), $linkName))
             } elseif ($entry -is $dirType) {
                 $script:dirCount++
-                Find-UsingProcess $entry.FullName $false
+                Find-UsingProcess $entry.FullName $false $true
                 $stack.Push($entry)
             } else {
                 $script:fileCount++
-                Find-UsingProcess $entry.FullName $true
+                Find-UsingProcess $entry.FullName $true $true
             }
         }
     }
@@ -534,11 +547,11 @@ try {
     Write-Progress -Activity $ToolTitle -Status '調べています'
     if ($targetIsDir) {
         $dirCount = 1L
-        Find-UsingProcess $targetLong $false
+        Find-UsingProcess $targetLong $false $false
         Search-Folder $targetLong
     } else {
         $fileCount = 1L
-        Find-UsingProcess $targetLong $true
+        Find-UsingProcess $targetLong $true $false
     }
 
     # 共有フォルダの接続は、このコンピューターが共有しているものだけが分かる。ネットワーク上のパスとは突き合わせられない
@@ -565,6 +578,8 @@ try {
                 $smbNote = '※ 共有フォルダの接続元を調べられませんでした（{0}）' -f (Get-ErrorText (Get-InnerException $_.Exception))
             }
         }
+    } elseif (-not $targetIsNetwork) {
+        $smbNote = '※ 共有フォルダの接続元を調べられませんでした（Get-SmbOpenFile が見つかりません）'
     }
 
     # 開けるかの確認の対象は、指定したファイルと、使っているものが見つかったファイル
@@ -649,13 +664,15 @@ try {
                 $services[$processId].Add([string]$s.Name)
             }
         } catch { }
+        # 行ごとに並べ替えないよう、ここで 1 つの文字列にしておく
+        foreach ($key in @($services.Keys)) { $services[$key] = @($services[$key].ToArray() | Sort-Object) -join ', ' }
     }
 
     # サービスの列。PID 4 は、プロセスではないことが分かるように注記する
     function Get-ServiceText([int]$ProcessId) {
         if ($ProcessId -eq 4) { return '（カーネル：共有フォルダ経由の接続など）' }
         if (-not $services.ContainsKey($ProcessId)) { return '' }
-        return (@($services[$ProcessId].ToArray() | Sort-Object) -join ', ')
+        return $services[$ProcessId]
     }
 
     # 管理者でないため取れなかった情報があるか（PID 4 は、管理者でも取れない項目があるので数えない）
@@ -737,7 +754,7 @@ try {
         $tail.Add(('結果: 使用中のものは見つかりません   所要 {0}' -f $elapsed))
     }
     if ($skipTotal -gt 0) {
-        $parts = @(foreach ($kind in $skipKinds.Keys) { if ($skipKinds[$kind] -gt 0) { '{0} {1:N0}' -f $kind, $skipKinds[$kind] } })
+        $parts = @(foreach ($kind in $skipKinds.Keys) { if ($skipKinds[$kind] -gt 0) { Format-Invariant '{0} {1:N0}' $kind $skipKinds[$kind] } })
         $tail.Add((Format-Invariant 'スキップ {0:N0} 件（{1}）' $skipTotal ($parts -join '・')))
     }
     if ($linkCount -gt 0) { $tail.Add((Format-Invariant 'たどらなかったリンク {0:N0} 件' $linkCount)) }
