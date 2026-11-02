@@ -226,7 +226,7 @@ exit $LASTEXITCODE
     Start-Sleep -Milliseconds 500
     $cwdRun = Invoke-Tool @('-Path', "$data\cwd")
     Assert-Equal '現在のフォルダとして使っているプロセスが出る' (@($cwdRun.Rows | Where-Object { $_.'PID' -eq "$($cwdProcess.Id)" }).Count) '1'
-    Assert-Equal 'フォルダの行は読み取りが空欄' (@($cwdRun.Rows | Where-Object { $_.'PID' -eq "$($cwdProcess.Id)" })[0].'読み取り') ''
+    Assert-Equal 'フォルダの行は読み取りが空欄' (@($cwdRun.Rows | Where-Object { $_.'PID' -eq "$($cwdProcess.Id)" } | ForEach-Object { $_.'読み取り' }) -join ',') ''
 
     Write-Section 'フォルダの中'
     $held.Add((Open-Held "$data\tree\a\b\deep.txt" ([IO.FileShare]::None)))
@@ -367,9 +367,9 @@ exit $LASTEXITCODE
     Assert-Equal '調べている間に消えた: スキップに数えない' $gone.Code '0'
     $apiDenied = Invoke-Fake "$data\free.txt" 'denied' ''
     Assert-Equal '権限なし: 終了コード 1' $apiDenied.Code '1'
-    Assert-Equal '権限なし: 理由' $apiDenied.Skips[0].'理由' '権限なし'
+    Assert-Equal '権限なし: 理由' (@($apiDenied.Skips | ForEach-Object { $_.'理由' }) -join ',') '権限なし'
     $apiError = Invoke-Fake "$data\free.txt" 'error' ''
-    Assert-Equal 'その他のエラー: 理由' $apiError.Skips[0].'理由' 'その他のエラー'
+    Assert-Equal 'その他のエラー: 理由' (@($apiError.Skips | ForEach-Object { $_.'理由' }) -join ',') 'その他のエラー'
     $sharing = Invoke-Fake "$data\held_none.txt" 'sharing' ''
     Assert-Equal '問い合わせが共有違反: 開けるかの確認で使用中' $sharing.Code '2'
     $linkMode = Invoke-Fake "$data\free.txt" 'link' ''
