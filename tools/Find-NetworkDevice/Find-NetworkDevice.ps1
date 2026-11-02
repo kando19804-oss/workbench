@@ -89,6 +89,13 @@ function Remove-Quote([string]$Text) {
     return $t
 }
 
+# 5.1 は 260 文字を超えるパスを通常の書き方では読めないため、内部では \\?\ 付きのパスを使う
+function ConvertTo-LongPath([string]$FullPath) {
+    if ($FullPath.StartsWith('\\?\')) { return $FullPath }
+    if ($FullPath.StartsWith('\\')) { return '\\?\UNC\' + $FullPath.Substring(2) }
+    return '\\?\' + $FullPath
+}
+
 # 日付や数値の区切り文字が、OS の地域設定によって変わらないようにする
 function Format-Invariant([string]$Format) {
     return [string]::Format($Invariant, $Format, [object[]]$args)
@@ -108,9 +115,11 @@ function Get-InnerException([Exception]$Exception) {
     return $Exception
 }
 
+# 例外メッセージに含まれる \\?\ 付きのパスを、表示用のパスに戻す。
 # .NET のメッセージは途中や末尾に改行が入ることがあるため、1 行にまとめる
 function Get-ErrorText([Exception]$Exception) {
-    return ($Exception.Message -replace '\s*[\r\n]+\s*', ' ').Trim()
+    $text = $Exception.Message.Replace('\\?\UNC\', '\\').Replace('\\?\', '')
+    return ($text -replace '\s*[\r\n]+\s*', ' ').Trim()
 }
 
 # CSV の 1 行
@@ -131,10 +140,21 @@ function Save-Csv([string]$FilePath, [string[]]$Columns, $Rows) {
     }
 }
 
-# Excel は、= + - @ で始まる値を数式に、数字と区切りの記号だけの値を数値や日付に変えてしまうため、その形の値は ="..." で囲む
+# Excel は、= + - @ で始まる値を数式に、数字と区切りの記号だけの値（2026-10-31、001）や「.1」「1e5」を
+# 数値や日付に変えてしまうため、その形の値は ="..." で囲む
 $excelRisk = New-Object Text.RegularExpressions.Regex ('^(?:[=+\-@]|[\d\s.,/:+\-]+$)')
 function Protect-ExcelText([string]$Text) {
-    if ($Text -eq '' -or -not $excelRisk.IsMatch($Text)) { return $Text }
+    if ($Text -eq '') { return $Text }
+    $risky = $excelRisk.IsMatch($Text)
+    if (-not $risky) {
+        # 全角の数字も Excel は数値にするため、半角にそろえてから判定する。
+        # 壊れた文字（対になっていないサロゲート）を含むと Normalize が例外を出すので、そのときはそのまま判定する
+        $normalized = $Text
+        try { $normalized = $Text.Normalize([Text.NormalizationForm]::FormKC) } catch { }
+        $number = 0.0
+        $risky = [double]::TryParse($normalized.TrimEnd('%'), [Globalization.NumberStyles]::Float, $Invariant, [ref]$number)
+    }
+    if (-not $risky) { return $Text }
     return '="' + $Text.Replace('"', '""') + '"'
 }
 
@@ -366,8 +386,8 @@ if (-not $NoSave) {
         $runDir  = Join-Path $baseDir $runName
         # 中断や失敗のときはこのフォルダごと消すため、既存のフォルダと名前が重ならないようにする
         $suffix = 1
-        while (Test-Path -LiteralPath $runDir) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
-        [void][IO.Directory]::CreateDirectory($runDir)
+        while ([IO.Directory]::Exists((ConvertTo-LongPath $runDir)) -or [IO.File]::Exists((ConvertTo-LongPath $runDir))) { $suffix++; $runDir = Join-Path $baseDir ('{0}_{1}' -f $runName, $suffix) }
+        [void][IO.Directory]::CreateDirectory((ConvertTo-LongPath $runDir))
     } catch {
         $saveWarning = '保存先に書き込めないため、結果は保存しません: {0}（{1}）' -f $baseDir, (Get-ErrorText (Get-InnerException $_.Exception))
         $runDir = $null
@@ -377,12 +397,42 @@ if (-not $NoSave) {
 
 #endregion
 
+#region 探す範囲の表示
+
+# どこに ping を送るかを、送る前に画面に出す（思っていた範囲と違うときに、Ctrl+C で止められるように）
+$lines = New-Object 'System.Collections.Generic.List[string]'
+$lines.Add((Format-Invariant 'ネットワークの機器一覧 (Find-NetworkDevice {0})' $ScriptVersion))
+$outside = @()
+foreach ($net in $networks) {
+    $count = $net.Last - $net.First + 1
+    $where = if ($net.Adapter) { '   ' + $net.Adapter.Name } else { '' }
+    $lines.Add((Format-Invariant '対象: {0}（{1} ～ {2}・{3:N0} 件）{4}' $net.Label (ConvertTo-IpText $net.First) (ConvertTo-IpText $net.Last) $count $where))
+    if ($net.Coverage -ne 'inside') { $outside += $net }
+}
+$selfText = @($adapters | Where-Object { $_.Gateways.Count -gt 0 } | ForEach-Object { $_.Ip }) -join ', '
+if (-not $selfText) { $selfText = @($adapters | ForEach-Object { $_.Ip }) -join ', ' }
+$lines.Add((Format-Invariant '{0:yyyy-MM-dd HH:mm:ss}   {1}（{2}）' $startTime $machineName $selfText))
+foreach ($note in $tooLarge) { $lines.Add($note) }
+foreach ($net in $outside) {
+    if ($net.Coverage -eq 'partial') {
+        $lines.Add(('※ {0} の一部は、この PC のネットワークの外です。その部分は MAC アドレスが分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
+    } else {
+        $lines.Add(('※ {0} は、この PC のネットワークの外です。MAC アドレスは分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
+    }
+}
+$lines.Add('')
+foreach ($line in $lines) {
+    if ($line.StartsWith('※')) { Write-Host $line -ForegroundColor Yellow } else { Write-Host $line }
+}
+$shownLines = $lines.Count
+
+#endregion
+
 # 探している途中や保存の途中で Ctrl+C されたときや、保存に失敗したときは、書きかけの結果を残さない
 $finished   = $false
 $unexpected = $false
 $saveError  = $null
 $sw         = [Diagnostics.Stopwatch]::StartNew()
-$lines      = New-Object 'System.Collections.Generic.List[string]'
 $devices    = @{}   # IP の数値 → 機器
 try {
     #region ping
@@ -496,13 +546,17 @@ try {
             } catch { }
         }
         if ($dnsTasks.Count -gt 0) { try { [void][Threading.Tasks.Task]::WaitAll($dnsTasks.ToArray(), $NameWaitMs) } catch { } }
+        $named = 0
         foreach ($job in $dnsJobs) {
             $task = $job.Task
             if ($task.Status -ne 'RanToCompletion') { continue }
             $hostName = [string]$task.Result.HostName
             # 名前が分からないときは、IP アドレスがそのまま返ることがある
-            if ($hostName -and $hostName -ne (ConvertTo-IpText $job.Device.Ip)) { $job.Device.Name = $hostName; $job.Device.NameBy = 'DNS' }
+            if ($hostName -and $hostName -ne (ConvertTo-IpText $job.Device.Ip)) { $job.Device.Name = $hostName; $job.Device.NameBy = 'DNS'; $named++ }
         }
+        # 終わらない問い合わせはキャンセルできず、残っているとプロセスの終わりが遅れる（1,000 件を積み上げると 5 分近く）。
+        # 名前が 1 つも取れず、答えの返らない問い合わせが残っているときは、これ以上始めない（残りは NetBIOS で調べる）
+        if ($named -eq 0 -and @($dnsJobs | Where-Object { -not $_.Task.IsCompleted }).Count -gt 0) { break }
     }
 
     # DNS で分からなかった機器は、NetBIOS の名前（ノード状態）を UDP 137 番に問い合わせる。1 つのソケットからまとめて送り、まとめて受け取る
@@ -568,27 +622,6 @@ try {
     #region 画面と summary.txt の内容
 
     $sorted = @($devices.Values | Sort-Object -Property Ip)
-    $lines.Add((Format-Invariant 'ネットワークの機器一覧 (Find-NetworkDevice {0})' $ScriptVersion))
-    $outside = @()
-    foreach ($net in $networks) {
-        $count = $net.Last - $net.First + 1
-        $where = if ($net.Adapter) { '   ' + $net.Adapter.Name } else { '' }
-        $lines.Add((Format-Invariant '対象: {0}（{1} ～ {2}・{3:N0} 件）{4}' $net.Label (ConvertTo-IpText $net.First) (ConvertTo-IpText $net.Last) $count $where))
-        if ($net.Coverage -ne 'inside') { $outside += $net }
-    }
-    $selfText = @($adapters | Where-Object { $_.Gateways.Count -gt 0 } | ForEach-Object { $_.Ip }) -join ', '
-    if (-not $selfText) { $selfText = @($adapters | ForEach-Object { $_.Ip }) -join ', ' }
-    $lines.Add((Format-Invariant '{0:yyyy-MM-dd HH:mm:ss}   {1}（{2}）' $startTime $machineName $selfText))
-    foreach ($note in $tooLarge) { $lines.Add($note) }
-    foreach ($net in $outside) {
-        if ($net.Coverage -eq 'partial') {
-            $lines.Add(('※ {0} の一部は、この PC のネットワークの外です。その部分は MAC アドレスが分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
-        } else {
-            $lines.Add(('※ {0} は、この PC のネットワークの外です。MAC アドレスは分かりません（ping に応答した機器だけを載せます）' -f $net.Label))
-        }
-    }
-    $lines.Add('')
-
     $widthName = 8
     foreach ($device in $sorted) { $widthName = [math]::Max($widthName, (Get-DisplayWidth $device.Name)) }
     if ($sorted.Count -eq 0) {
@@ -615,14 +648,14 @@ try {
     if ($runDir) {
         try {
             $lines.Add(('保存先: {0}' -f $runDir))
-            [IO.File]::WriteAllLines((Join-Path $runDir 'summary.txt'), [string[]]$lines, $Utf8Bom)
+            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$lines, $Utf8Bom)
             # 1 台だけのときに配列がほどけないよう、List に入れる
             $rows = New-Object 'System.Collections.Generic.List[object]'
             foreach ($device in $sorted) {
                 $rows.Add([object[]]@((ConvertTo-IpText $device.Ip), (Protect-ExcelText $device.Name), $device.NameBy, $device.Mac, $device.Ping,
                     $(if ($null -ne $device.Ms) { $device.Ms.ToString('N0', $Invariant) } else { '' }), $device.Kind, $device.Network))
             }
-            Save-Csv (Join-Path $runDir 'devices.csv') $DeviceColumns $rows
+            Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'devices.csv')) $DeviceColumns $rows
         } catch {
             $saveError = Get-ErrorText (Get-InnerException $_.Exception)
         }
@@ -639,7 +672,7 @@ try {
     Write-Progress -Activity 'ネットワークの機器一覧' -Completed
     if (-not $finished -or $saveError) {
         # 消すのは、このツールが作った保存先のフォルダだけ
-        if ($runDir) { try { [IO.Directory]::Delete($runDir, $true) } catch { } }
+        if ($runDir) { try { [IO.Directory]::Delete((ConvertTo-LongPath $runDir), $true) } catch { } }
         if ($unexpected) { Write-Host 'エラーで止まりました。結果は保存していません。' -ForegroundColor Yellow }
         elseif (-not $finished) { Write-Host '中断しました。結果は保存していません。' -ForegroundColor Yellow }
     }
@@ -647,9 +680,9 @@ try {
 
 #region 画面表示
 
-foreach ($line in $lines) {
-    if ($line.StartsWith('保存先: ')) { continue }
-    if ($line.StartsWith('※')) { Write-Host $line -ForegroundColor Yellow } else { Write-Host $line }
+# 探す範囲は、ping を送る前に表示した
+for ($i = $shownLines; $i -lt $lines.Count; $i++) {
+    if (-not $lines[$i].StartsWith('保存先: ')) { Write-Host $lines[$i] }
 }
 if ($saveError) {
     Write-Warning ('結果を保存できませんでした: {0}' -f $saveError)
