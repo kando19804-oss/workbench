@@ -109,6 +109,8 @@ $ScreenEvents  = 20       # 画面に表示する新しい順の件数（保存�
 $ScreenMessage = 80       # 画面に表示するメッセージの長さ
 $CellLimit     = 32000    # CSV の 1 つの値の長さ（Excel のセルの上限 32,767 文字より少し短く）
 $ProgressMs    = 250      # 進捗表示の間隔（ミリ秒）
+$LongPathLength = 250     # この長さ以上の .evtx のパスは、\\?\ を付けて読む
+$ProviderPrefix = 'Microsoft-Windows-'
 $NoMessage     = '（メッセージを取得できません）'
 $EventColumns  = '日時', 'ログ', 'レベル', 'イベントID', 'ソース', 'タスクのカテゴリ', 'コンピューター', 'ユーザー', 'メッセージ'
 $GroupColumns  = '件数', 'レベル', 'ログ', 'ソース', 'イベントID', '最初に発生', '最後に発生', 'メッセージ（1 行目）'
@@ -193,11 +195,21 @@ function Save-Csv([string]$FilePath, [string[]]$Columns, $Rows) {
     }
 }
 
-# Excel は、= + - @ で始まる値を数式に、数字と区切りの記号だけの値を数値や日付に変えてしまうため、その形の値は ="..." で囲む。
-# 式に書けない 255 文字を超える値は、先頭に空白を足す
+# Excel は、= + - @ で始まる値を数式に、数字と区切りの記号だけの値（2026-10-31、001）や「.1」「1e5」を
+# 数値や日付に変えてしまうため、その形の値は ="..." で囲む。式に書けない 255 文字を超える値は、先頭に空白を足す
 $excelRisk = New-Object Text.RegularExpressions.Regex ('^(?:[=+\-@]|[\d\s.,/:+\-]+$)')
 function Protect-ExcelText([string]$Text) {
-    if ($Text -eq '' -or -not $excelRisk.IsMatch($Text)) { return $Text }
+    if ($Text -eq '') { return $Text }
+    $risky = $excelRisk.IsMatch($Text)
+    if (-not $risky) {
+        # 全角の数字も Excel は数値にするため、半角にそろえてから判定する。
+        # 壊れた文字（対になっていないサロゲート）を含むと Normalize が例外を出すので、そのときはそのまま判定する
+        $normalized = $Text
+        try { $normalized = $Text.Normalize([Text.NormalizationForm]::FormKC) } catch { }
+        $number = 0.0
+        $risky = [double]::TryParse($normalized.TrimEnd('%'), [Globalization.NumberStyles]::Float, $Invariant, [ref]$number)
+    }
+    if (-not $risky) { return $Text }
     if ($Text.Length -le 255) { return '="' + $Text.Replace('"', '""') + '"' }
     return ' ' + $Text
 }
@@ -288,8 +300,7 @@ function ConvertTo-PointInTime([string]$Text, [string]$Name) {
     return @{ Time = $parsed; Relative = '' }
 }
 
-# 例外の連なり（InnerException）のどこかに、指定した種類の例外があるか。
-# Get-WinEvent は、権限がなくてログの情報を取れないとき、UnauthorizedAccessException をふつうの例外で包んで出すため
+# 例外の連なり（InnerException）のどこかに、指定した種類の例外があるか
 function Test-InnerException([Exception]$Exception, [type]$Type) {
     while ($Exception) {
         if ($Exception -is $Type) { return $true }
@@ -298,9 +309,22 @@ function Test-InnerException([Exception]$Exception, [type]$Type) {
     return $false
 }
 
-# Get-WinEvent は FilterHashtable の Path をワイルドカードとして解決するため、[ ] * ? と ` を文字どおりに扱うようエスケープする
-function ConvertTo-LiteralPattern([string]$Text) {
-    return $Text.Replace('`', '``').Replace('[', '`[').Replace(']', '`]').Replace('*', '`*').Replace('?', '`?')
+# Get-WinEvent の Path はワイルドカードとして解決されるため、[ ] * ? と ` を文字どおりに扱うようエスケープする。
+# 260 文字以上のパスは \\?\ を付けないと読めない（? もエスケープするので、7 でも読める）
+function ConvertTo-EvtxPath([string]$FullPath) {
+    $text = if ($FullPath.Length -ge $LongPathLength) { ConvertTo-LongPath $FullPath } else { $FullPath }
+    return $text.Replace('`', '``').Replace('[', '`[').Replace(']', '`]').Replace('*', '`*').Replace('?', '`?')
+}
+
+# イベント ビューアーの「ソース」と同じように、先頭の Microsoft-Windows- を省く
+function ConvertTo-SourceName([string]$Provider) {
+    if ($Provider.StartsWith($ProviderPrefix, [StringComparison]::OrdinalIgnoreCase)) { return $Provider.Substring($ProviderPrefix.Length) }
+    return $Provider
+}
+
+# イベントログの側で絞るための式（XPath）に書く日時
+function ConvertTo-QueryTime([datetime]$Time) {
+    return $Time.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', $Invariant)
 }
 
 # リパースポイントのうち、リンクと判定できたものの種類を返す（OneDrive のフォルダもリパースポイントなので、それ以外は $null）
@@ -408,8 +432,8 @@ function ConvertTo-IdList([string]$Text, [string]$Name) {
     return , $list
 }
 $idList      = ConvertTo-IdList $Id '-Id'
-# FilterHashtable の Id は検索の式の or に展開され、レベルなどと合わせて 20 個ほどを超えるとイベントログの API がエラーにする。
-# レベル（最大 6 つ）と合わせても収まるよう、ID が多いときは取り出した後に絞る
+# 検索の式に書ける条件の数には上限がある（レベル 6 つと期間に、ID 22 個までは通り、23 個でエラーになった）。
+# レベルと合わせても余裕を持って収まるよう、ID が多いときは取り出した後に絞る
 $MaxQueryIds = 15
 $idSet = New-Object 'System.Collections.Generic.HashSet[int]'
 foreach ($value in $idList) { [void]$idSet.Add($value) }
@@ -418,6 +442,8 @@ $excludeList = ConvertTo-IdList $ExcludeId '-ExcludeId'
 $excludeSet  = New-Object 'System.Collections.Generic.HashSet[int]'
 foreach ($value in $excludeList) { [void]$excludeSet.Add($value) }
 $sourceList  = Split-List $Source
+$sourceKeys  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+foreach ($value in $sourceList) { [void]$sourceKeys.Add((ConvertTo-SourceName $value)) }
 $patternTerms = @(foreach ($term in ($(if ($Pattern) { $Pattern } else { '' }) -split '\|')) { if ($term.Trim()) { $term.Trim() } })
 
 $outText = $null
@@ -446,11 +472,14 @@ if ($useFiles) {
             $full = [IO.Path]::GetFullPath($full)
         } catch { }
         if ([IO.File]::Exists((ConvertTo-LongPath $full))) {
-            $targets.Add(@{ Label = $full; Filter = @{ Path = (ConvertTo-LiteralPattern $full) } })
+            $targets.Add(@{ Label = $full; Filter = @{ Path = (ConvertTo-EvtxPath $full) } })
         } elseif ([IO.Directory]::Exists((ConvertTo-LongPath $full))) {
             # フォルダの下の .evtx を探す。リンクはたどらず、読めないフォルダは飛ばす
+            # （ドライブのルートは、最後の \ を外すと \\?\D: になって読めない）
             $stack = New-Object 'System.Collections.Generic.Stack[string]'
-            $stack.Push((ConvertTo-LongPath $full.TrimEnd('\')))
+            $top = $full.TrimEnd('\')
+            if ($top -match '^[A-Za-z]:$') { $top += '\' }
+            $stack.Push((ConvertTo-LongPath $top))
             while ($stack.Count -gt 0) {
                 $dir = $stack.Pop()
                 try { $entries = (New-Object IO.DirectoryInfo $dir).GetFileSystemInfos() } catch {
@@ -471,7 +500,7 @@ if ($useFiles) {
                     if ($entry -is [IO.DirectoryInfo]) { $subDirs.Add($entry.FullName) }
                     elseif ($entry.Extension -ieq '.evtx') {
                         $file = ConvertTo-DisplayPath $entry.FullName
-                        $targets.Add(@{ Label = $file; Filter = @{ Path = (ConvertTo-LiteralPattern $file) } })
+                        $targets.Add(@{ Label = $file; Filter = @{ Path = (ConvertTo-EvtxPath $file) } })
                     }
                 }
                 for ($i = $subDirs.Count - 1; $i -ge 0; $i--) { $stack.Push($subDirs[$i]) }
@@ -525,33 +554,33 @@ $lines      = New-Object 'System.Collections.Generic.List[string]'
 try {
     #region 読み取り
 
-    $readCount = 0
+    # -FilterHashtable は使わない。権限のないログや壊れた .evtx でも「該当なし」と同じエラーを返して区別できず、
+    # 名前に & を含む .evtx も読めないため
+    $query = "*[System[({0}) and TimeCreated[@SystemTime>='{1}' and @SystemTime<='{2}']" -f (@($levelValues | ForEach-Object { "Level=$_" }) -join ' or '),
+        (ConvertTo-QueryTime $sinceInfo.Time), (ConvertTo-QueryTime $endTime)
+    if ($idInQuery) { $query += ' and ({0})' -f (@($idList | ForEach-Object { "EventID=$_" }) -join ' or ') }
+    $query += ']]'
+
     $nextProgress = 0L
     foreach ($target in $targets) {
         $filter = $target.Filter
-        $filter['StartTime'] = $sinceInfo.Time
-        $filter['EndTime']   = $endTime
-        $filter['Level']     = [int[]]$levelValues.ToArray()
-        if ($idInQuery) { $filter['Id'] = [int[]]$idList.ToArray() }
+        $countBefore = $events.Count
         Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
         try {
-            # 1 件ずつ受け取って、読みながら絞り込む（すべてを先にメモリへ読み込まないため）
-            Get-WinEvent -FilterHashtable $filter -ErrorAction Stop | ForEach-Object {
+            # 1 件ずつ受け取って、読みながら絞り込む（すべてを先にメモリへ読み込まないため）。
+            # -Oldest は、壊れた .evtx でも壊れた場所の手前まで読むため（新しい順だと、最後のほうが壊れていると 1 件も読めない）。
+            # 分析とデバッグのログも、-Oldest でないと読めない。並べ替えは後で行う
+            Get-WinEvent @filter -FilterXPath $query -Oldest -ErrorAction Stop | ForEach-Object {
                 $record = $_
-                $readCount++
                 if ($sw.ElapsedMilliseconds -ge $nextProgress) {
                     Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
                     $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
                 }
                 if ($excludeSet.Count -gt 0 -and $excludeSet.Contains([int]$record.Id)) { return }
                 if ($idList.Count -gt 0 -and -not $idInQuery -and -not $idSet.Contains([int]$record.Id)) { return }
-                # ソースは、ここで絞る（ProviderName で絞ると、この PC にないソースのときにエラーになり、ほかのサーバーの .evtx を読めないため）
-                if ($sourceList.Count -gt 0) {
-                    $providerName = [string]$record.ProviderName
-                    $sourceHit = $false
-                    foreach ($name in $sourceList) { if ([string]::Equals($providerName, $name, [StringComparison]::OrdinalIgnoreCase)) { $sourceHit = $true; break } }
-                    if (-not $sourceHit) { return }
-                }
+                # ソースは、Microsoft-Windows- を省いた名前でも探せるように、ここで絞る
+                $sourceName = ConvertTo-SourceName ([string]$record.ProviderName)
+                if ($sourceKeys.Count -gt 0 -and -not $sourceKeys.Contains($sourceName)) { return }
                 # メッセージは、ソースの情報がないと取得できない（例外になることもある）
                 $message = $null
                 try { $message = $record.Message } catch { }
@@ -568,33 +597,34 @@ try {
                 $levelName  = if ($LevelNames.ContainsKey($levelValue)) { $LevelNames[$levelValue] } else { [string]$levelValue }
                 $events.Add([pscustomobject]@{
                     Time = $record.TimeCreated; Log = [string]$record.LogName; LevelValue = $levelValue; Level = $levelName; Id = [int]$record.Id
-                    Source = [string]$record.ProviderName; Task = $task; Machine = [string]$record.MachineName; User = (Get-AccountName $record.UserId)
+                    Source = $sourceName; Task = $task; Machine = [string]$record.MachineName; User = (Get-AccountName $record.UserId)
                     Message = $message; FirstLine = (Get-FirstLine $message)
                 })
             }
         } catch {
             $errorId = [string]$_.FullyQualifiedErrorId
-            $ex = Get-InnerException $_.Exception
-            if ($errorId -like 'NoMatchingEventsFound*') {
-                # 該当するイベントがなかっただけ
-            } elseif ($errorId -like 'NoMatchingLogsFound*') {
-                Add-Skip 'ログがない' $target.Label 'この PC にはないログです'
-            } elseif (Test-InnerException $_.Exception ([UnauthorizedAccessException])) {
-                Add-Skip '権限なし' $target.Label 'アクセスが拒否されました'
-            } elseif ($useFiles) {
-                Add-Skip 'ファイルを読めない' $target.Label (Get-ErrorText $ex)
-            } else {
-                Add-Skip 'その他のエラー' $target.Label (Get-ErrorText $ex)
+            # 該当するイベントがなかっただけのときは、読めたものとして扱う
+            if ($errorId -notlike 'NoMatchingEventsFound*') {
+                $ex = Get-InnerException $_.Exception
+                if ($errorId -like 'NoMatchingLogsFound*') {
+                    Add-Skip 'ログがない' $target.Label 'この PC にはないログです'
+                } elseif (Test-InnerException $_.Exception ([UnauthorizedAccessException])) {
+                    Add-Skip '権限なし' $target.Label 'アクセスが拒否されました'
+                } else {
+                    $detail = Get-ErrorText $ex
+                    if ($events.Count -gt $countBefore) { $detail = Format-Invariant '途中まで読んだ（イベント {0:N0} 件は結果に含む）: {1}' ($events.Count - $countBefore) $detail }
+                    Add-Skip $(if ($useFiles) { 'ファイルを読めない' } else { 'その他のエラー' }) $target.Label $detail
+                }
+                $target['Failed'] = $true
             }
-            $target['Failed'] = $true
         }
     }
     $elapsed = $sw.Elapsed
     Write-Progress -Activity 'イベントログ抽出' -Completed
 
-    # すべての対象を読めなかったときは、「該当なし」と区別して止める
+    # すべての対象を読めなかったときは、「該当なし」と区別して止める（途中まで読めたイベントがあれば、それを出す）
     $failedTargets = @($targets | Where-Object { $_.ContainsKey('Failed') }).Count
-    if ($failedTargets -eq $targets.Count) {
+    if ($failedTargets -eq $targets.Count -and $events.Count -eq 0) {
         $fatal = '読めるログがありませんでした。' + (@($skipped | ForEach-Object { '{0}: {1}（{2}）' -f $_[1], $_[0], $_[2] }) -join ' / ')
         if (-not $isAdmin -and $skipKinds['権限なし'] -gt 0) { $fatal += "`r`n" + '※ 管理者として実行すると、Security などのログも読めます' }
     }
@@ -699,13 +729,14 @@ try {
                 $rows = New-Object 'System.Collections.Generic.List[object]'
                 foreach ($ev in $sorted) {
                     $cell = if ($ev.Message.Length -gt $CellLimit) { $ev.Message.Substring(0, $CellLimit) } else { $ev.Message }
-                    $rows.Add([object[]]@($ev.Time.ToString($TimeFormat, $Invariant), $ev.Log, $ev.Level, $ev.Id, $ev.Source, (Protect-ExcelText $ev.Task),
-                        $ev.Machine, $ev.User, (Protect-ExcelText $cell)))
+                    # ソースの名前は、管理者でなくても好きな名前で書き込めるので、ログの中の値はどれも数式の対策をする
+                    $rows.Add([object[]]@($ev.Time.ToString($TimeFormat, $Invariant), (Protect-ExcelText $ev.Log), $ev.Level, $ev.Id, (Protect-ExcelText $ev.Source), (Protect-ExcelText $ev.Task),
+                        (Protect-ExcelText $ev.Machine), (Protect-ExcelText $ev.User), (Protect-ExcelText $cell)))
                 }
                 Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'events.csv')) $EventColumns $rows
                 $rows = New-Object 'System.Collections.Generic.List[object]'
                 foreach ($group in $groupList) {
-                    $rows.Add([object[]]@($group.Count.ToString('N0', $Invariant), $group.Level, $group.Log, $group.Source, $group.Id,
+                    $rows.Add([object[]]@($group.Count.ToString('N0', $Invariant), $group.Level, (Protect-ExcelText $group.Log), (Protect-ExcelText $group.Source), $group.Id,
                         $group.First.ToString($TimeFormat, $Invariant), $group.Last.ToString($TimeFormat, $Invariant), (Protect-ExcelText $group.FirstLine)))
                 }
                 Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'summary.csv')) $GroupColumns $rows
