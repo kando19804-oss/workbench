@@ -19,5 +19,15 @@ SearchLog_*/
 # Search-EventLog の実行結果（既定ではスクリプトと同じフォルダに保存される）
 EventLog_*/
 
+# Compare-Folder の実行結果とスナップショット（既定ではスクリプトと同じフォルダに保存される）
+FolderDiff_*/
+FolderSnapshot_*/
+
+# Export-TaskList の実行結果（既定ではスクリプトと同じフォルダに保存される）
+TaskList_*/
+
+# Convert-TextEncoding の実行結果（既定ではスクリプトと同じフォルダに保存される）
+TextEncoding_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
