@@ -169,9 +169,10 @@ function Format-Duration([TimeSpan]$Span) {
 }
 
 # .NET や COM のメソッドで起きた例外は MethodInvocationException に、プロパティ（タスクの Definition など）を読むときに
-# 起きた例外は GetValueInvocationException に包まれて届くため、元の例外を取り出す（どちらも ExtendedTypeSystemException の仲間）
+# 起きた例外は GetValueInvocationException に包まれて届くため、元の例外を取り出す（どちらも ExtendedTypeSystemException の仲間）。
+# InvokeMember（グループのメンバーを読むとき）の例外は TargetInvocationException に包まれる
 function Get-InnerException([Exception]$Exception) {
-    while ($Exception -is [Management.Automation.ExtendedTypeSystemException] -and $Exception.InnerException) {
+    while (($Exception -is [Management.Automation.ExtendedTypeSystemException] -or $Exception -is [Reflection.TargetInvocationException]) -and $Exception.InnerException) {
         $Exception = $Exception.InnerException
     }
     return $Exception
