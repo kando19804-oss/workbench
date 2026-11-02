@@ -302,7 +302,7 @@ exit $LASTEXITCODE
     if (Test-Path -LiteralPath ($substDrive + ':\c')) {
         $script:substUsed = $substDrive
         $rootBat = "$workRoot\root.cmd"
-        Write-Text $rootBat ("@echo off`r`nchcp 65001 > nul`r`ncd /d {0}:\c`r`n{1} -NoProfile -ExecutionPolicy Bypass -File ""{2}"" -Path ""{0}:\"" -NoSave`r`nexit /b %ERRORLEVEL%`r`n" -f $substDrive, $Exe, $tool)
+        Write-Text $rootBat ("@echo off`r`nchcp 65001 > nul`r`ncd /d {0}:\c`r`n{1} -NoProfile -ExecutionPolicy Bypass -File ""{2}"" -NoSave -Path ""{0}:\""`r`nexit /b %ERRORLEVEL%`r`n" -f $substDrive, $Exe, $tool)
         $rootLog = ConvertTo-FlatText (& cmd.exe /c $rootBat 2>&1 | Out-String)
         Assert-Equal 'ドライブ名だけの値はルートを指す' (Test-Contains $rootLog ('対象: {0}:\' -f $substDrive)) 'True'
         Assert-Equal '現在のフォルダを調べない' (Test-Contains $rootLog ('対象: {0}:\c' -f $substDrive)) 'False'
