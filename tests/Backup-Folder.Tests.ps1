@@ -858,4 +858,5 @@ try {
     Write-Host ''
 }
 
+'  END'
 exit $script:failCount
