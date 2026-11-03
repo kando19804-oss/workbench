@@ -108,6 +108,7 @@ $FileColumns    = 'グループ', '実体', 'ファイル', 'ファイル名', '
 $CopyColumns    = '名前の形', '元との比較', 'ファイル', '元と思われるファイル', 'サイズ(MB)', 'サイズ(バイト)', '元のサイズ(バイト)', '最終更新日時', '元の最終更新日時', '備考'
 $SkipColumns    = '理由', 'パス', '詳細'
 $TimeFormat     = 'yyyy/MM/dd HH:mm:ss'
+$BadTimeText    = '更新日時が範囲外です'
 # オンライン専用ファイルの属性（OFFLINE・RECALL_ON_OPEN・RECALL_ON_DATA_ACCESS）。読むとダウンロードが始まる
 $OnlineMask     = 0x00441000
 $Invariant      = [Globalization.CultureInfo]::InvariantCulture
@@ -667,7 +668,7 @@ function Get-FileItem($Entry) {
     $full = $Entry.FullName
     $item = $null
     if ($itemByPath.TryGetValue($full, [ref]$item)) { return $item }
-    # 更新日時が範囲外のファイル（日時が壊れたものなど）は、日時を読むと例外になる。比べずに記録だけ残す
+    # 更新日時が範囲外のファイル（日時が壊れたものなど）は、日時を読むと $null が返るか、例外になる。比べる前の Update-ItemInfo で記録する
     $time = $null
     $timeError = $null
     try { $time = $Entry.LastWriteTimeUtc } catch { $timeError = Get-ErrorText (Get-InnerException $_.Exception) }
@@ -708,7 +709,12 @@ function Update-ItemInfo($Item) {
             return $false
         }
         $Item.Size = $info.Length
-        $Item.Time = $info.LastWriteTimeUtc
+        $newTime = $info.LastWriteTimeUtc
+        if ($null -eq $newTime) {
+            Add-ItemFailure $Item 'その他のエラー' $BadTimeText
+            return $false
+        }
+        $Item.Time = $newTime
         return $true
     } catch {
         Add-ReadFailure $Item $_.Exception
