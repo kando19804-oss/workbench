@@ -99,6 +99,7 @@ $ScriptVersion  = '1.0.0'
 $ScreenRows     = 200       # 画面に表示する証明書の件数（保存するときだけ。超えた分はファイルを見てもらう）
 $ProgressMs     = 250       # 進捗表示の間隔（ミリ秒）
 $MaxCertFile    = 10MB      # 証明書として読むファイルの大きさの上限（間違えて巨大なファイルを指定したときに備える）
+$MaxBundleCerts = 50        # フォルダの中で見つけたファイルに、これより多く証明書が入っていたら CA の一式として読まない
 $OutputPrefix   = 'CertificateExpiry_'
 $DefaultStores  = 'LocalMachine\My', 'LocalMachine\WebHosting', 'LocalMachine\Remote Desktop', 'CurrentUser\My'
 $CertExtensions = '.cer', '.crt', '.pem', '.der'
@@ -602,6 +603,8 @@ $excludedCount = 0
 $linkCount     = 0
 $secretCount   = 0
 $readFiles  = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)   # -Path の指定が重なっても、同じファイルを二重に数えない
+$directFiles = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)  # -Path に直接指定したファイル。CA の一式でも読む
+foreach ($item in $pathTargets) { if (-not $item.IsFolder) { [void]$directFiles.Add((ConvertTo-DisplayPath (ConvertTo-LongPath $item.Full))) } }
 $progress   = @{ Next = 0L }
 $sw         = [Diagnostics.Stopwatch]::StartNew()
 
@@ -615,6 +618,10 @@ function Show-Progress([string]$Status) {
     Write-Progress -Activity '証明書期限一覧' -Status $Status
     $progress.Next = $sw.ElapsedMilliseconds + $ProgressMs
 }
+
+# 証明書の名前には、NUL・改行・エスケープ文字なども入れられる（-Target では接続先が決める値）。
+# そのまま出すと画面とファイルが崩れるので、制御文字は ? に置き換える
+function ConvertTo-PlainName([string]$Text) { return ($Text -replace '\p{Cc}', '?') }
 
 # 別名(SAN) の拡張を読む。Format() の文字は OS の言語で変わるため、DER を自分で読む。
 # 中身は GeneralName の並びで、DNS 名は [2]（0x82）、IP アドレスは [7]（0x87）
@@ -641,7 +648,7 @@ function Get-SanNames($Cert) {
                 $length = & $readLength
                 $i = $script:derIndex
                 if ($tag -eq 0x82) {
-                    $names.Add([Text.Encoding]::ASCII.GetString($raw, $i, $length))
+                    $names.Add((ConvertTo-PlainName ([Text.Encoding]::ASCII.GetString($raw, $i, $length))))
                 } elseif ($tag -eq 0x87 -and ($length -eq 4 -or $length -eq 16)) {
                     $address = New-Object 'byte[]' $length
                     [Array]::Copy($raw, $i, $address, 0, $length)
@@ -667,7 +674,7 @@ function Get-UsageText($Cert) {
 
 # 証明書を一覧に加える。$Scope は「更新済み」を比べる範囲（同じストア、同じフォルダ）で、接続先は $null
 function Add-CertRecord($Cert, [string]$Kind, [string]$Place, $Scope, [string]$KeyText, [string]$Note) {
-    $subject = $Cert.Subject
+    $subject = ConvertTo-PlainName $Cert.Subject
     foreach ($rule in $excludeRules) {
         if ($rule.Matcher.IsMatch($subject)) {
             $script:excludedCount++
@@ -680,10 +687,10 @@ function Add-CertRecord($Cert, [string]$Kind, [string]$Place, $Scope, [string]$K
     foreach ($sanName in $sanNames) { $sanSorted.Add($sanName.ToLowerInvariant()) }
     $sanSorted.Sort([StringComparer]::Ordinal)
     $friendly = ''
-    try { $friendly = $Cert.FriendlyName } catch { }
+    try { $friendly = ConvertTo-PlainName $Cert.FriendlyName } catch { }
     $certs.Add([pscustomobject]@{
         Status = ''; DaysLeft = 0; NotAfter = $Cert.NotAfter; NotBefore = $Cert.NotBefore; Kind = $Kind; Place = $Place; Scope = $Scope
-        Subject = $subject; San = ($sanNames -join ', '); SanKey = ($sanSorted -join ','); Issuer = $Cert.Issuer; Usage = (Get-UsageText $Cert)
+        Subject = $subject; San = ($sanNames -join ', '); SanKey = ($sanSorted -join ','); Issuer = (ConvertTo-PlainName $Cert.Issuer); Usage = (Get-UsageText $Cert)
         KeyText = $KeyText; Iis = ''; IisNames = ''; Friendly = $friendly; Thumbprint = $Cert.Thumbprint; Note = $Note
     })
 }
@@ -820,6 +827,13 @@ function Read-CertFile([string]$LongPath) {
     }
     $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes)   # PEM の区切りは ASCII なので、どの文字コードでも探せるように 1 バイトずつ文字にする
     $blocks = [regex]::Matches($text, '-----BEGIN (?:TRUSTED |X509 )?CERTIFICATE-----(.*?)-----END', [Text.RegularExpressions.RegexOptions]::Singleline)
+    # CA の一式（Git や Python などに入っているルート証明書の束）は、ソフトの更新で入れ替わるもので、1 枚ずつ対応するものではない。
+    # 期限切れが表を埋めて終了コードもいつも 2 になるので、フォルダの中で見つけたものは読まない
+    if ($blocks.Count -gt $MaxBundleCerts -and -not $directFiles.Contains($display)) {
+        $script:secretCount++
+        Add-Skip '読まない形式' $display (Format-Invariant '証明書が {0:N0} 枚入っているため、CA の一式として調べていません（このファイルを -Path に指定すると調べます）' $blocks.Count)
+        return
+    }
     # 証明書の始まりだけがあって終わりがないのは、途中で切れたファイル。読めた分は調べて、切れていることを残す
     $beginCount = ([regex]::Matches($text, '-----BEGIN (?:TRUSTED |X509 )?CERTIFICATE-----')).Count
     $truncated  = $beginCount -gt $blocks.Count
@@ -850,7 +864,8 @@ function Read-CertFile([string]$LongPath) {
             Add-CertRecord ($certType::new([byte[]]$source)) 'ファイル' $display $scope '' ''
         }
     } catch {
-        Add-Skip '読めない' $display (Get-ErrorText (Get-InnerException $_.Exception))
+        # .NET のメッセージ（「要求されたオブジェクトが見つかりません」など）だけでは、ファイルがないように読める
+        Add-Skip '読めない' $display ('証明書として読めません: {0}' -f (Get-ErrorText (Get-InnerException $_.Exception)))
     }
 }
 
