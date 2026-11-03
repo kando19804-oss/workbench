@@ -11,7 +11,7 @@ argument-hint: "<ツール名>"
 ## 手順
 
 1. `tests/<名前>.Tests.ps1` を作る（すでにあれば足す）。構成は `tests/Get-DiskUsage.Tests.ps1` に合わせる
-   - `Assert-Equal`、`Write-Skip`、`Write-Section` で結果を出し、終了コードは失敗の件数にする
+   - `Assert-Equal`、`Write-Skip`、`Write-Section` で結果を出し、終了コードは失敗の件数にする。最後の `exit` の直前で `'  END'` を出す（`Invoke-Tests.ps1` が、最後まで走ったかを確かめる）
    - ダミー環境は一時フォルダに作り、終了時に削除する。アクセス拒否などの設定は、必ず元に戻してから削除する
    - 入れるテスト
      - 正常系: README の使い方の例と、パラメーターの組み合わせ

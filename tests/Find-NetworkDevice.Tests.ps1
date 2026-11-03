@@ -760,4 +760,5 @@ foreach ($socket in $sockets.Values) { $socket.Close() }
     if ($savedEncoding) { try { [Console]::OutputEncoding = $savedEncoding } catch { } }
 }
 
+'  END'
 exit $script:failCount
