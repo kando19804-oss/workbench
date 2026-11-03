@@ -209,6 +209,7 @@ try {
     Copy-Item -LiteralPath $repoTool -Destination $tool
 
     # 待ち受けるだけのプロセス。同じ番号 P で、TCP の IPv4・IPv6 と UDP を待ち受ける。
+    # P は乱数で選ぶ（番号 0 で OS に任せると連番になり、続いた番号がふさがっていると何回試しても取れない）。
     # Q は P より桁の少ない番号（番号を文字として並べると順番が逆になる）。CLOSE は受け付けたらすぐ閉じ（TimeWait を作る）、
     # HOLD は受け付けた接続を持ち続ける（接続中を作る）
     $portFile = Join-Path $workRoot 'listener-ports.txt'
@@ -217,11 +218,10 @@ try {
     [IO.File]::WriteAllLines($listenerScript, [string[]]@(
         'param($PortFile, $StopFile, $Tag)'
         '$t4 = $null; $t6 = $null; $u4 = $null'
-        'for ($i = 0; $i -lt 30 -and -not $t4; $i++) {'
-        '    $a = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback, 0); $a.Start(); $p = $a.LocalEndpoint.Port; $b = $null'
-        '    if ($p -lt 10000) { $a.Stop(); continue }'
-        '    try { $b = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::IPv6Loopback, $p); $b.Start(); $u4 = New-Object Net.Sockets.UdpClient (New-Object Net.IPEndPoint ([Net.IPAddress]::Loopback, $p)); $t4 = $a; $t6 = $b }'
-        '    catch { if ($b) { $b.Stop() }; $a.Stop() }'
+        'foreach ($n in (Get-Random -InputObject (10000..40000) -Count 100)) {'
+        '    $a = $null; $b = $null'
+        '    try { $a = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback, $n); $a.Start(); $b = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::IPv6Loopback, $n); $b.Start(); $u4 = New-Object Net.Sockets.UdpClient (New-Object Net.IPEndPoint ([Net.IPAddress]::Loopback, $n)); $t4 = $a; $t6 = $b; break }'
+        '    catch { if ($b) { $b.Stop() }; if ($a) { $a.Stop() } }'
         '}'
         '$q = $null'
         'foreach ($n in (Get-Random -InputObject (9000..9899) -Count 100)) { try { $q = New-Object Net.Sockets.TcpListener ([Net.IPAddress]::Loopback, $n); $q.Start(); break } catch { $q = $null } }'
@@ -665,4 +665,5 @@ try {
     if ($savedEncoding) { try { [Console]::OutputEncoding = $savedEncoding } catch { } }
 }
 
+'  END'
 exit $script:failCount
