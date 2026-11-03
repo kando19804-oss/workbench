@@ -144,6 +144,13 @@ function New-AdapterTool([string]$Name, [object[]]$Adapters) {
     New-PatchedTool $Name '$adapters  = Get-LocalAdapter' ($code -join "`r`n")
 }
 
+# 作ったツールのコピーを、さらに書き換える
+function Edit-PatchedTool([string]$File, [string]$From, [string]$To) {
+    $text = [IO.File]::ReadAllText($File)
+    if (-not $text.Contains($From)) { throw "書き換える場所が見つかりません: $From" }
+    [IO.File]::WriteAllText($File, $text.Replace($From, $To), $utf8Bom)
+}
+
 # 偽の arp コマンドが返す表を書く（表示の言語に頼っていないことを確かめるため、見出しは日本語にする）
 function Set-FakeArp([string[]]$Rows) {
     $lines = @('', 'インターフェイス: 127.0.1.5 --- 0x5', '  インターネット アドレス 物理アドレス     種類') + $Rows
@@ -189,7 +196,7 @@ $toolNames = Join-Path $workRoot 'toolnames\Find-NetworkDevice.ps1'
 $savedPath = $env:PATH
 $fakeBin   = Join-Path $workRoot 'fakebin'
 [void][IO.Directory]::CreateDirectory($fakeBin)
-[IO.File]::WriteAllLines((Join-Path $fakeBin 'arp.cmd'), [string[]]@('@echo off', 'type "%~dp0arp.txt"'), [Text.Encoding]::ASCII)
+[IO.File]::WriteAllLines((Join-Path $fakeBin 'arp.cmd'), [string[]]@('@echo off', 'if exist "%~dp0arp.first" (', '  del "%~dp0arp.first"', '  type "%~dp0arp.empty"', ') else (', '  type "%~dp0arp.txt"', ')'), [Text.Encoding]::ASCII)
 $responder = $null
 $responderStop = Join-Path $workRoot 'responder.stop'
 
@@ -368,6 +375,12 @@ try {
         Assert-Equal '応答なしの行' ('{0}/{1}/{2}/{3}' -f $row.'ping', $row.'応答時間(ms)', $row.'MAC アドレス', $row.'種類') '応答なし//AA-BB-CC-00-02-10/ゲートウェイ'
         Assert-Equal '応答なしの件数' $run.Log.Contains('機器 1 台（ping に応答 0・応答なし 1）') 'True'
         Assert-Equal '画面の ping の欄' $run.Log.Contains('応答なし  ゲートウェイ') 'True'
+        # 2 回目の ping で初めて ARP に答えた機器も載せる（偽の arp コマンドは、arp.first があるときだけ 1 回目の表を返す）
+        [IO.File]::WriteAllLines((Join-Path $fakeBin 'arp.empty'), [string[]]@('', 'Interface: 192.0.2.5 --- 0x5'), [Text.Encoding]::ASCII)
+        [IO.File]::WriteAllText((Join-Path $fakeBin 'arp.first'), 'first')
+        $run = Invoke-Tool 'silentsecond' @('-Range', '192.0.2.10', '-Timeout', '200') $silentTool
+        $row = Get-Row (Read-Devices $run.Dir) '192.0.2.10'
+        Assert-Equal '2 回目の後に ARP の表を読み直す' ('{0}/{1}' -f $row.'ping', $row.'MAC アドレス') '応答なし/AA-BB-CC-00-02-10'
 
         Write-Section '機器が見つからないとき'
         $run = Invoke-Tool 'none' @('-Range', '192.0.2.11', '-Timeout', '200')
@@ -377,7 +390,8 @@ try {
         Assert-Equal '見出しだけの CSV を保存する' ('{0}/{1}' -f @(Read-Devices $run.Dir).Count, [IO.File]::Exists((Join-Path $run.Dir 'devices.csv'))) '0/True'
 
         Write-Section '-Timeout'
-        foreach ($case in @(@('200', 0.2, 2.5), @('2500', 2.5, 5.0))) {
+        # 2 回送るので、待ち時間の 2 倍と、ARP の表を読む前の待ち（0.5 秒を 2 回）がかかる
+        foreach ($case in @(@('200', 0.4, 3.0), @('2500', 5.0, 8.0))) {
             $run = Invoke-Tool ('timeout' + $case[0]) @('-Range', '192.0.2.11', '-Timeout', $case[0])
             $seconds = [double]::Parse([regex]::Match($run.Log, '所要 ([\d.]+)秒').Groups[1].Value, [Globalization.CultureInfo]::InvariantCulture)
             Assert-Equal ('-Timeout {0} の所要時間（{1} 秒）' -f $case[0], $seconds) ($seconds -ge $case[1] -and $seconds -lt $case[2]) 'True'
@@ -386,8 +400,31 @@ try {
         Write-Skip 'ping に応答しない機器' '文書用のアドレス 192.0.2.x が応答するネットワークのため'
     }
 
+    Write-Section 'もう 1 回 ping を送る（最初の ping を省いたコピーと、送る件数を表示するコピーで確かめる）'
+    # 実機確認で見つかった問題: 省電力で眠っている iPhone が、1 回の ping では見つからなかった
+    $firstRound = 'Send-PingRound $targets ''ping を送っています'''
+    $countRetry = 'if ($retryTargets.Count -gt 0) {'
+    $showRetry  = 'Write-Host (''RETRY='' + $retryTargets.Count); if ($retryTargets.Count -gt 0) {'
+    Set-FakeArp @('  127.0.1.1             aa-bb-cc-00-00-01     動的        ', '  127.0.1.7             aa-bb-cc-00-00-07     動的        ', '  127.0.1.8             00-00-00-00-00-00     無効        ', '  127.0.0.20            aa-bb-cc-00-00-20     動的        ')
+    $retryTool = New-AdapterTool 'retry' @(, @('テスト LAN', '127.0.1.5', 24, 'AA-BB-CC-00-00-05', '127.0.1.1'))
+    Edit-PatchedTool $retryTool $firstRound ''
+    Edit-PatchedTool $retryTool $countRetry $showRetry
+    $run = Invoke-Tool 'retryfound' @('-Range', '127.0.1.1-127.0.1.10') $retryTool
+    $rows = Read-Devices $run.Dir
+    # 対象は 9 件（この PC を除く）。ARP の表にある .1 と .7 を除いた 7 件に送る。無効の行の .8 には送る
+    Assert-Equal '応答がなく ARP の表にもない IP アドレスにだけ送る' ([regex]::Match($run.Log, 'RETRY=\d+').Value) 'RETRY=7'
+    Assert-Equal '2 回目に応答した機器を載せる' ('{0}/{1}' -f (Get-Row $rows '127.0.1.2').'ping', (Get-Row $rows '127.0.1.8').'ping') '応答/応答'
+    Assert-Equal 'ARP の表にある機器は応答なしのまま載せる' ('{0}/{1}' -f (Get-Row $rows '127.0.1.7').'ping', (Get-Row $rows '127.0.1.7').'MAC アドレス') '応答なし/AA-BB-CC-00-00-07'
+    $run = Invoke-Tool 'retryoutside' @('-Range', '127.0.0.20') $retryTool
+    Assert-Equal 'ネットワークの外の ARP の行は数えず、もう 1 回送る' ('{0}/{1}' -f [regex]::Match($run.Log, 'RETRY=\d+').Value, (Get-Row (Read-Devices $run.Dir) '127.0.0.20').'ping') 'RETRY=1/応答'
+    $countTool = New-PatchedTool 'retrycount' $countRetry $showRetry
+    $run = Invoke-Tool 'retrynone' @('-Range', '127.0.0.8-127.0.0.9') $countTool
+    Assert-Equal '全部応答したら 2 回目は送らない' ([regex]::Match($run.Log, 'RETRY=\d+').Value) 'RETRY=0'
+    # 分けて送る境目（64 件）で飛ばすと、2 回目が拾ってしまって結果では気づけないので、2 回目の件数で確かめる
+    $run = Invoke-Tool 'retrybatch' @('-Range', '127.0.3.1-127.0.3.200') $countTool
+    Assert-Equal '1 回目で 200 件すべてに送る' ([regex]::Match($run.Log, 'RETRY=\d+').Value) 'RETRY=0'
+
     Write-Section '範囲を自動で決める（アダプターを差し替えて、ループバックに ping を送る）'
-    Set-FakeArp @('  127.0.1.1             aa-bb-cc-00-00-01     動的        ')
     $autoTool = New-AdapterTool 'auto' @(
         @('ゲートウェイなし', '127.0.2.5', 24, 'AA-BB-CC-00-02-05', ''),
         @('テスト LAN', '127.0.1.5', 30, 'AA-BB-CC-00-00-05', '127.0.1.6')
@@ -401,12 +438,25 @@ try {
     Assert-Equal 'この PC の IP アドレスは、ゲートウェイのあるアダプターのものを出す' $run.Log.Contains('（127.0.1.5）') 'True'
     $run = Invoke-Tool 'nogw' @('-Range', '127.0.0.8') (New-AdapterTool 'nogw' @(, @('ゲートウェイなし', '127.0.2.5', 24, 'AA-BB-CC-00-02-05', '')))
     Assert-Equal 'ゲートウェイのあるアダプターがないときは、あるものを出す' $run.Log.Contains('（127.0.2.5）') 'True'
-    $run = Invoke-Tool 'autotwo' @() (New-AdapterTool 'auto2' @(
+    # 複数のネットワークを自動で探すと、VPN の先の会社のネットワークなどにも確認なしで ping を送るので、止まって選んでもらう
+    $twoTool = New-AdapterTool 'auto2' @(
         @('有線', '127.0.1.5', 30, 'AA-BB-CC-00-00-05', '127.0.1.6'),
-        @('無線', '127.0.2.5', 30, 'AA-BB-CC-00-02-05', '127.0.2.6')
+        @('VPN', '127.0.2.5', 30, 'AA-BB-CC-00-02-05', '127.0.2.6')
+    )
+    $run = Invoke-Tool 'autotwo' @() $twoTool
+    Assert-Equal '複数のネットワークは止まる（結果を残さない）' ('{0}/{1}' -f $run.Code, [bool]$run.Dir) '1/False'
+    Assert-Equal '止まるときの案内' $run.Log.Contains('探すネットワークが 2 つあります。どこに ping を送るかを -Range で指定してください（例: -Range "127.0.1.4/30"）') 'True'
+    Assert-Equal '止まるときに候補を出す' ('{0}/{1}' -f $run.Log.Contains('127.0.1.4/30（有線）'), $run.Log.Contains('127.0.2.4/30（VPN）')) 'True/True'
+    Assert-Equal 'ping を送らずに止まる（対象の行を出さない）' $run.Log.Contains('対象: ') 'False'
+    $run = Invoke-Tool 'autotwolarge' @() (New-AdapterTool 'auto2l' @(
+        @('有線', '127.0.1.5', 30, 'AA-BB-CC-00-00-05', '127.0.1.6'),
+        @('無線', '127.0.2.5', 30, 'AA-BB-CC-00-02-05', '127.0.2.6'),
+        @('大きい VPN', '10.1.2.3', 16, 'AA-BB-CC-00-10-03', '10.1.0.1')
     ))
-    Assert-Equal '複数のネットワークを探す' (Get-CodeAndIps $run) '0/127.0.1.5,127.0.1.6,127.0.2.5,127.0.2.6'
-    Assert-Equal 'ネットワークごとの対象の行' ('{0}/{1}' -f $run.Log.Contains('   有線'), $run.Log.Contains('   無線')) 'True/True'
+    Assert-Equal '複数で止まるときは大きすぎるネットワークも知らせる' ('{0}/{1}' -f $run.Code, $run.Log.Contains('※ 10.1.0.0/16（大きい VPN）は大きすぎるため')) '1/True'
+    $run = Invoke-Tool 'twonets' @('-Range', '127.0.1.5-127.0.1.6,127.0.2.5-127.0.2.6') $twoTool
+    Assert-Equal '-Range で指定すれば複数のネットワークを探す' (Get-CodeAndIps $run) '0/127.0.1.5,127.0.1.6,127.0.2.5,127.0.2.6'
+    Assert-Equal '範囲ごとの対象の行' ('{0}/{1}' -f $run.Log.Contains('   有線'), $run.Log.Contains('   VPN')) 'True/True'
     Assert-Equal '両方の IP アドレスを出す' $run.Log.Contains('（127.0.1.5, 127.0.2.5）') 'True'
     $run = Invoke-Tool 'autosame' @() (New-AdapterTool 'auto3' @(
         @('有線', '127.0.1.5', 30, 'AA-BB-CC-00-00-05', '127.0.1.6'),
