@@ -1107,6 +1107,27 @@ try {
         }
     }
 
+    # CurrentUser の Root や CA には、Windows が LocalMachine の証明書も見せる。同じ証明書が 2 行並ばないよう、
+    # 同じ名前の LocalMachine のストアにも読んだ証明書は、CurrentUser の行を省く。
+    # 更新済みの判定は Windows が見せるとおりの中身で行いたいので、判定の後で省く
+    $machineCerts = @{}
+    foreach ($cert in $certs) {
+        if ($cert.Kind -eq 'ストア' -and $cert.Place.StartsWith('LocalMachine\', [StringComparison]::Ordinal)) {
+            $machineCerts[$cert.Place.Substring(13) + '|' + $cert.Thumbprint] = $true
+        }
+    }
+    $overlapCount = 0
+    $keptCerts = New-Object 'System.Collections.Generic.List[object]'
+    foreach ($cert in $certs) {
+        if ($cert.Kind -eq 'ストア' -and $cert.Place.StartsWith('CurrentUser\', [StringComparison]::Ordinal) -and $machineCerts.ContainsKey($cert.Place.Substring(12) + '|' + $cert.Thumbprint)) {
+            $overlapCount++
+            Add-Skip '除外指定' ('{0}: {1}' -f $cert.Place, $cert.Subject) ('同じ証明書が LocalMachine\{0} にあります' -f $cert.Place.Substring(12))
+            continue
+        }
+        $keptCerts.Add($cert)
+    }
+    $certs = $keptCerts
+
     $sortedCerts = @($certs | Sort-Object -Property NotAfter, Place, Thumbprint)
     $counts = @{ '期限切れ' = 0; '期限間近' = 0; '更新済み' = 0; '有効' = 0; '有効期間前' = 0 }
     foreach ($cert in $sortedCerts) { $counts[$cert.Status]++ }
@@ -1151,6 +1172,7 @@ try {
     if ($secretCount -gt 0) { $notes += Format-Invariant '読まない形式 {0:N0} 件' $secretCount }
     if ($linkCount -gt 0) { $notes += Format-Invariant 'たどらなかったリンク {0:N0} 件' $linkCount }
     if ($notes.Count -gt 0) { $lines.Add(($notes -join '  ')) }
+    if ($overlapCount -gt 0) { $lines.Add((Format-Invariant 'LocalMachine と重なる証明書 {0:N0} 件は省きました' $overlapCount)) }
     if (-not $iisReadable) {
         $iisNote = '※ IIS の設定を読めなかった部分があるため、サイトとの紐付けが足りないことがあります。ストアの証明書は更新済みにしていません'
         if (-not $isAdmin) { $iisNote += '（管理者として実行すると読めることがあります）' }
