@@ -814,6 +814,10 @@ function Read-CertFile([string]$LongPath) {
         Add-Skip $reason $display (Get-ErrorText $ex)
         return
     }
+    if ($bytes.Length -eq 0) {
+        Add-Skip '読めない' $display '空のファイルです'
+        return
+    }
     $text = [Text.Encoding]::GetEncoding(28591).GetString($bytes)   # PEM の区切りは ASCII なので、どの文字コードでも探せるように 1 バイトずつ文字にする
     $blocks = [regex]::Matches($text, '-----BEGIN (?:TRUSTED |X509 )?CERTIFICATE-----(.*?)-----END', [Text.RegularExpressions.RegexOptions]::Singleline)
     # 証明書の始まりだけがあって終わりがないのは、途中で切れたファイル。読めた分は調べて、切れていることを残す
