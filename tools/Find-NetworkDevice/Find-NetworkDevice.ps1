@@ -64,6 +64,7 @@ $ScriptVersion  = '1.0.0'
 $MaxAuto        = 1024    # 自動で決めた範囲の上限（1 つのネットワークあたり）
 $MaxManual      = 4096    # -Range で指定した範囲の上限（合計）
 $Parallel       = 64      # 同時に送る ping の数
+$ArpWaitMs      = 500     # ping を送り終えてから ARP の表を読むまで待つ時間
 $NameWaitMs     = 3000    # 名前の問い合わせ（DNS の逆引き・NetBIOS）を待つ時間
 $DeviceColumns  = 'IP アドレス', '名前', '名前の調べ方', 'MAC アドレス', 'ping', '応答時間(ms)', '種類', 'ネットワーク'
 $Invariant      = [Globalization.CultureInfo]::InvariantCulture
@@ -286,6 +287,60 @@ function Test-LocalAddress([long]$Value) {
     return $false
 }
 
+# List の IP アドレスに ping を送り、応答した機器を $devices に入れる
+function Send-PingRound($List, [string]$Label) {
+    $done = 0
+    for ($offset = 0; $offset -lt $List.Count; $offset += $Parallel) {
+        Write-Progress -Activity 'ネットワークの機器一覧' -Status (Format-Invariant '{0}: {1:N0} / {2:N0} 件' $Label $done $List.Count) -PercentComplete ([int](100 * $done / [math]::Max(1, $List.Count)))
+        $batch = New-Object 'System.Collections.Generic.List[object]'
+        $tasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
+        for ($i = $offset; $i -lt [math]::Min($offset + $Parallel, $List.Count); $i++) {
+            $pinger = New-Object Net.NetworkInformation.Ping
+            $job = @{ Target = $List[$i]; Pinger = $pinger; Task = $null }
+            try {
+                $job.Task = $pinger.SendPingAsync((ConvertTo-IpText $List[$i].Value), $Timeout)
+                $tasks.Add($job.Task)
+            } catch { }
+            $batch.Add($job)
+        }
+        # 待ち時間を過ぎても終わらないものは、応答なしとみなす
+        try { [void][Threading.Tasks.Task]::WaitAll($tasks.ToArray(), $Timeout + 1000) } catch { }
+        foreach ($job in $batch) {
+            $task = $job.Task
+            if ($task -and $task.Status -eq 'RanToCompletion' -and "$($task.Result.Status)" -eq 'Success') {
+                $value = $job.Target.Value
+                $devices[$value] = [pscustomobject]@{ Ip = $value; Name = ''; NameBy = ''; Mac = ''; Ping = '応答'; Ms = [long]$task.Result.RoundtripTime; Kind = ''; Network = $job.Target.Network.Label }
+            }
+            try { $job.Pinger.Dispose() } catch { }
+        }
+        $done += $batch.Count
+    }
+}
+
+# Windows が覚えている ARP の表（IP の数値 → MAC アドレス）を読む。
+# 表示の言語（見出しは日本語のことがある）に頼らないよう、IP アドレスと MAC アドレスの形の行だけを読む
+function Read-ArpTable {
+    Write-Progress -Activity 'ネットワークの機器一覧' -Status 'ARP の表を読んでいます'
+    $arpLines = @()
+    try { $arpLines = @(& arp -a 2>$null) } catch { }
+    $table = @{}
+    foreach ($line in $arpLines) {
+        $ipText = $null; $macText = $null
+        if ($line -match '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s') {
+            $ipText = $Matches[1]; $macText = $Matches[2]
+        } elseif (-not $OnWindows -and $line -match '\((\d{1,3}(?:\.\d{1,3}){3})\) at ([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})') {
+            $ipText = $Matches[1]; $macText = $Matches[2]
+        }
+        if (-not $ipText) { continue }
+        $mac = Format-Mac $macText
+        # ブロードキャスト・マルチキャスト・未解決の行は機器ではない
+        if ($mac -eq 'FF-FF-FF-FF-FF-FF' -or $mac -eq '00-00-00-00-00-00' -or $mac.StartsWith('01-00-5E')) { continue }
+        $value = ConvertTo-IpNumber $ipText
+        if ($null -ne $value) { $table[$value] = $mac }
+    }
+    return $table
+}
+
 #endregion
 
 #region 引数の確認
@@ -360,6 +415,11 @@ if ($Range.Count -gt 0) {
     }
     if ($networks.Count -eq 0) {
         Stop-WithError ('探すネットワークを決められません（既定のゲートウェイが設定されたネットワーク アダプターがありません）。' + "`r`n" + '-Range で範囲を指定してください（例: -Range "192.168.1.0/24"）')
+    }
+    # 複数のネットワークを自動で探すと、VPN の先の会社のネットワークなどにも、確認なしで ping を送ることになる。ping を送る前に止まって選んでもらう
+    if ($networks.Count -gt 1) {
+        $choices = @($networks | ForEach-Object { '  {0}（{1}）' -f $_.Label, $_.Adapter.Name })
+        Stop-WithError ((@(('探すネットワークが {0} つあります。どこに ping を送るかを -Range で指定してください（例: -Range "{1}"）' -f $networks.Count, $networks[0].Label)) + $choices + @($tooLarge)) -join "`r`n")
     }
 }
 
@@ -455,58 +515,23 @@ try {
         }
     }
 
-    $done = 0
-    for ($offset = 0; $offset -lt $targets.Count; $offset += $Parallel) {
-        Write-Progress -Activity 'ネットワークの機器一覧' -Status (Format-Invariant 'ping を送っています: {0:N0} / {1:N0} 件' $done $targets.Count) -PercentComplete ([int](100 * $done / [math]::Max(1, $targets.Count)))
-        $batch = New-Object 'System.Collections.Generic.List[object]'
-        $tasks = New-Object 'System.Collections.Generic.List[System.Threading.Tasks.Task]'
-        for ($i = $offset; $i -lt [math]::Min($offset + $Parallel, $targets.Count); $i++) {
-            $pinger = New-Object Net.NetworkInformation.Ping
-            $job = @{ Target = $targets[$i]; Pinger = $pinger; Task = $null }
-            try {
-                $job.Task = $pinger.SendPingAsync((ConvertTo-IpText $targets[$i].Value), $Timeout)
-                $tasks.Add($job.Task)
-            } catch { }
-            $batch.Add($job)
-        }
-        # 待ち時間を過ぎても終わらないものは、応答なしとみなす
-        try { [void][Threading.Tasks.Task]::WaitAll($tasks.ToArray(), $Timeout + 1000) } catch { }
-        foreach ($job in $batch) {
-            $task = $job.Task
-            if ($task -and $task.Status -eq 'RanToCompletion' -and "$($task.Result.Status)" -eq 'Success') {
-                $value = $job.Target.Value
-                $devices[$value] = [pscustomobject]@{ Ip = $value; Name = ''; NameBy = ''; Mac = ''; Ping = '応答'; Ms = [long]$task.Result.RoundtripTime; Kind = ''; Network = $job.Target.Network.Label }
-            }
-            try { $job.Pinger.Dispose() } catch { }
-        }
-        $done += $batch.Count
+    Send-PingRound $targets 'ping を送っています'
+    # ping を送ると Windows が ARP で MAC アドレスを調べるので、少し待ってから ARP の表を読む
+    Start-Sleep -Milliseconds $ArpWaitMs
+    $arpTable = Read-ArpTable
+    # 省電力で眠っている機器（画面の消えたスマートフォンなど）は、最初の 1 回に間に合わないことがある。
+    # 応答がなく、ARP の表にもない IP アドレスに、もう 1 回だけ送る
+    $retryTargets = @($targets | Where-Object { -not $devices.ContainsKey($_.Value) -and -not ($arpTable.ContainsKey($_.Value) -and (Test-LocalAddress $_.Value)) })
+    if ($retryTargets.Count -gt 0) {
+        Send-PingRound $retryTargets 'もう 1 回 ping を送っています'
+        Start-Sleep -Milliseconds $ArpWaitMs
+        $arpTable = Read-ArpTable
     }
 
     #endregion
 
     #region ARP
 
-    # ping を送ると Windows が ARP で MAC アドレスを調べるので、少し待ってから ARP の表を読む。
-    # 表示の言語（見出しは日本語のことがある）に頼らないよう、IP アドレスと MAC アドレスの形の行だけを読む
-    Write-Progress -Activity 'ネットワークの機器一覧' -Status 'ARP の表を読んでいます'
-    Start-Sleep -Milliseconds 500
-    $arpLines = @()
-    try { $arpLines = @(& arp -a 2>$null) } catch { }
-    $arpTable = @{}
-    foreach ($line in $arpLines) {
-        $ipText = $null; $macText = $null
-        if ($line -match '^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})\s') {
-            $ipText = $Matches[1]; $macText = $Matches[2]
-        } elseif (-not $OnWindows -and $line -match '\((\d{1,3}(?:\.\d{1,3}){3})\) at ([0-9a-fA-F]{1,2}(?::[0-9a-fA-F]{1,2}){5})') {
-            $ipText = $Matches[1]; $macText = $Matches[2]
-        }
-        if (-not $ipText) { continue }
-        $mac = Format-Mac $macText
-        # ブロードキャスト・マルチキャスト・未解決の行は機器ではない
-        if ($mac -eq 'FF-FF-FF-FF-FF-FF' -or $mac -eq '00-00-00-00-00-00' -or $mac.StartsWith('01-00-5E')) { continue }
-        $value = ConvertTo-IpNumber $ipText
-        if ($null -ne $value) { $arpTable[$value] = $mac }
-    }
     foreach ($net in $networks) {
         foreach ($value in @($arpTable.Keys)) {
             if ($value -lt $net.First -or $value -gt $net.Last) { continue }
