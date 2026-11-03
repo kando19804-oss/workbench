@@ -8,7 +8,7 @@
     本物のストア（個人など）には書き込みません。読むだけです。秘密鍵は、ストアに「秘密鍵あり」の印だけを残し、
     鍵そのものは残しません。テスト専用のストアは、終了時に削除します。
 
-    証明書ファイル（DER・PEM・途中で切れた PEM・秘密鍵・PFX など）、ループバックに立てた TLS サーバーへの接続、
+    証明書ファイル（DER・PEM・途中で切れた PEM・秘密鍵・PFX・CA の一式など）、ループバックに立てた TLS サーバーへの接続、
     偽の applicationHost.config を使った IIS の紐付け、設定ファイル、止まる場合も確かめます。
     ダミー環境は終了時に削除します。
 
@@ -355,7 +355,7 @@ try {
     Add-TestCert 'nosubject' '' @('wb-nosubject.example.jp') -300 15.5
     Add-TestCert 'ip' 'CN=wb-ip' @('wb-ip.example.jp') -10 100 @{ Ip = @('192.0.2.7', '2001:db8::7') }
     Add-TestCert 'ipOnly' 'CN=wb-iponly' @() -10 100 @{ Ip = @('192.0.2.8') }
-    Add-TestCert 'plain' 'CN=wb-plain' @() -10 100
+    Add-TestCert 'plain' 'CN=wb-plain' @() -10 100 @{ Friendly = "wb-fr`nie$([char]27)ndly" }
     Add-TestCert 'usage' 'CN=wb-usage' @('wb-usage.example.jp') -10 100 @{ Usage = @('1.3.6.1.5.5.7.3.1', '1.3.6.1.5.5.7.3.2', '1.3.6.1.5.5.7.3.3', '1.3.6.1.5.5.7.3.4', '1.3.6.1.5.5.7.3.8', '1.3.6.1.5.5.7.3.9', '1.3.6.1.4.1.311.10.3.4', '1.3.6.1.4.1.311.20.2.2', '1.2.3.4.5') }
     Add-TestCert 'bracket' 'CN=wb-[b]' @('wb-bracket.example.jp') -10 100
     Add-TestCert 'bracketPlain' 'CN=wb-b' @('wb-bracketplain.example.jp') -10 100
@@ -394,6 +394,9 @@ try {
     # ストアに入れず、ファイルと TLS サーバーで使う
     Add-TestCert 'local' 'CN=localhost' @('localhost') -10 100 @{ NoStore = $true }
     Add-TestCert 'fileOk' 'CN=wb-file' @('wb-file.example.jp') -10 300 @{ NoStore = $true }
+    # 名前に制御文字が入った証明書（NUL はサブジェクトに入れると Windows が空で返すので、別名に入れる）
+    Add-TestCert 'ctrlSan' 'CN=wb-ctrlsan' @() -10 20.5 @{ NoStore = $true; RawDns = @("wb-a.example.jp`0evil.example.jp", "wb-b`r`nb.example.jp", "wb-c$([char]27)[31mc.example.jp") }
+    Add-TestCert 'ctrlSub' "CN=`"wb-ctrl`nsub$([char]27)[31mx`"" @('wb-ctrlsub.example.jp') -10 20.5 @{ NoStore = $true }
     $userStore.Close()
     $userStore2.Close()
     $userStore3.Close()
@@ -452,6 +455,7 @@ try {
     Assert-Equal '日本語のサブジェクト' (Get-Cell $run 'japanese' 'サブジェクト') 'CN=日本語の証明書'
     Assert-Equal '用途は OS の言語によらない' (Get-Cell $run 'usage' '用途') 'サーバー認証, クライアント認証, コード署名, 電子メールの保護, タイムスタンプ, OCSP 署名, 暗号化ファイルシステム, スマートカード ログオン, 1.2.3.4.5'
     Assert-Equal '用途がない証明書' (Get-Cell $run 'plain' '用途') ''
+    Assert-Equal 'フレンドリ名の制御文字は ? にする' (Get-Cell $run 'plain' 'フレンドリ名') 'wb-fr?ie?ndly'
     $times = [string[]]@($run.Certs | ForEach-Object { $_.'有効期限' })
     $sortedTimes = [string[]]$times.Clone()
     [Array]::Sort($sortedTimes, [StringComparer]::Ordinal)
@@ -710,6 +714,9 @@ try {
     Assert-Equal '中身が PKCS#7 の詳細' (Get-SkipDetail $fileRun "$files\p7.crt") '証明書 1 枚の形式ではないため、開いていません（Pkcs7）'
     Assert-Equal '途中で切れた PEM の詳細' (Get-SkipDetail $fileRun "$files\truncated.pem") '証明書の途中でファイルが切れています'
     Assert-Equal '0 バイトのファイルの詳細' (Get-SkipDetail $fileRun "$files\zero.cer") '空のファイルです'
+    foreach ($name in 'broken.crt', 'badbase64.pem', 'notcert.pem') {
+        Assert-Equal "$name の詳細は「証明書として読めません」で始まる" ((Get-SkipDetail $fileRun "$files\$name").StartsWith('証明書として読めません: ', [StringComparison]::Ordinal)) 'True'
+    }
     Assert-Equal 'skipped の詳細は 1 行' (@($fileRun.Skipped | Where-Object { $_.'詳細' -match '[\r\n]' }).Count) 0
     Assert-Equal 'スキップの行（読めない・リンク・読まない形式）' (Get-SummaryLine $fileRun 'スキップ ') 'スキップ 8 件（読めない）  読まない形式 8 件  たどらなかったリンク 1 件'
 
@@ -752,16 +759,53 @@ try {
     Assert-Equal '件数の行' (Get-CountLine $r) '証明書 6 件  期限切れ 1 件  期限間近 1 件  更新済み 1 件  有効 2 件  有効期間前 1 件'
     $r = Invoke-Tool @('-Path', $countDir, '-Exclude', 'CN=wb-future,CN=wb-valid')
     Assert-Equal '有効期間前がなければ出さない・除外の件数' (Get-CountLine $r) '証明書 4 件  期限切れ 1 件  期限間近 1 件  更新済み 1 件  有効 1 件  除外 2 件'
-    $manyDir = "$workRoot\many"
-    New-TextFile "$manyDir\many.pem" ((ConvertTo-Pem $rawOf['near']) * 1234)
-    $r = Invoke-Tool @('-Path', $manyDir)
+    $manyFile = "$workRoot\many\many.pem"
+    New-TextFile $manyFile ((ConvertTo-Pem $rawOf['near']) * 1234)
+    $r = Invoke-Tool @('-Path', $manyFile)
     Assert-Equal '件数の 3 桁区切り' (Get-CountLine $r) '証明書 1,234 件  期限切れ 0 件  期限間近 1,234 件  更新済み 0 件  有効 0 件'
     Assert-Equal '画面の表は 200 件まで' ([regex]::Matches($r.Log, [regex]::Escape(' CN=wb-near')).Count) 200
     Assert-Equal '超えた分の案内' (Test-Contains $r.Log '（ほか 1,034 件は certificates.csv を参照してください）') 'True'
     Assert-Equal 'summary.txt はすべて書く' (@($r.Summary | Where-Object { $_ -like '* CN=wb-near' }).Count) 1234
     Assert-Equal 'summary.txt に超えた分の案内を書かない' (@($r.Summary | Where-Object { $_ -like '（ほか*' }).Count) 0
-    $r = Invoke-NoSave @('-Path', $manyDir)
+    $r = Invoke-NoSave @('-Path', $manyFile)
     Assert-Equal '-NoSave のときはすべて表示する' ('{0}/{1}' -f [regex]::Matches($r.Log, [regex]::Escape(' CN=wb-near')).Count, (Test-Contains $r.Log '（ほか')) '1234/False'
+
+    Write-Section 'CA の一式（証明書の多いファイル）'
+    $bundleDir = "$workRoot\bundles"
+    New-TextFile "$bundleDir\at50.pem" ((ConvertTo-Pem $rawOf['valid']) * 50)
+    New-TextFile "$bundleDir\at51.pem" ((ConvertTo-Pem $rawOf['expired']) * 51)
+    New-TextFile "$bundleDir\sub\ca-bundle.crt" ((ConvertTo-Pem $rawOf['expired']) * 1234)
+    New-TextFile "$bundleDir\cutbundle.pem" (((ConvertTo-Pem $rawOf['expired']) * 51) + "-----BEGIN CERTIFICATE-----`r`nMIIB")
+    $r = Invoke-Tool @('-Path', $bundleDir)
+    Assert-Equal '50 枚のファイルは調べる' (@(Get-PlaceRows $r "$bundleDir\at50.pem").Count) 50
+    Assert-Equal '51 枚のファイルは行に出さない' (@(Get-PlaceRows $r "$bundleDir\at51.pem").Count) 0
+    Assert-Equal '51 枚のファイルは「読まない形式」' (Get-SkipReason $r "$bundleDir\at51.pem") '読まない形式'
+    Assert-Equal '詳細に枚数（3 桁区切り）と調べ方を書く' (Get-SkipDetail $r "$bundleDir\sub\ca-bundle.crt") '証明書が 1,234 枚入っているため、CA の一式として調べていません（このファイルを -Path に指定すると調べます）'
+    Assert-Equal '途中で切れた CA の一式も「読まない形式」だけ' (Get-SkipReason $r "$bundleDir\cutbundle.pem") '読まない形式'
+    Assert-Equal '「読まない形式」に数える' (Get-SummaryLine $r '読まない形式 ') '読まない形式 3 件'
+    Assert-Equal '期限切れの入った CA の一式は、終了コードと件数に影響しない' ('{0}/{1}' -f $r.Code, (Get-CountLine $r)) '0/証明書 50 件  期限切れ 0 件  期限間近 0 件  更新済み 0 件  有効 50 件'
+    $r = Invoke-Tool @('-Path', "$bundleDir\at51.pem")
+    Assert-Equal '直接指定なら 51 枚でも調べる' ('{0}/{1}/{2}' -f $r.Code, @($r.Certs).Count, @($r.Skipped).Count) '2/51/0'
+    foreach ($case in @(
+        @('フォルダが先', "$bundleDir,$bundleDir\at51.pem"), @('ファイルが先', "$bundleDir\at51.pem,$bundleDir"), @('大文字と小文字が違う', "$bundleDir,$bundleDir\AT51.PEM")
+    )) {
+        $r = Invoke-Tool @('-Path', $case[1])
+        Assert-Equal "フォルダと重なっても直接指定は調べる（$($case[0])）" ('{0}/{1}' -f @(Get-PlaceRows $r "$bundleDir\at51.pem").Count, (Get-SkipReason $r "$bundleDir\at51.pem")) '51/'
+    }
+
+    Write-Section '名前の制御文字'
+    $ctrlDir = "$workRoot\ctrl"
+    New-TestFile "$ctrlDir\san.cer" $rawOf['ctrlSan']
+    New-TestFile "$ctrlDir\sub.cer" $rawOf['ctrlSub']
+    $r = Invoke-Tool @('-Path', $ctrlDir)
+    Assert-Equal '別名の制御文字は ? にする' (Get-Cell $r 'ctrlSan' '別名(SAN)') 'wb-a.example.jp?evil.example.jp, wb-b??b.example.jp, wb-c?[31mc.example.jp'
+    Assert-Equal 'サブジェクトの制御文字は ? にする' (Get-Cell $r 'ctrlSub' 'サブジェクト') 'CN="wb-ctrl?sub?[31mx"'
+    Assert-Equal '発行者の制御文字は ? にする' (Get-Cell $r 'ctrlSub' '発行者') 'CN="wb-ctrl?sub?[31mx"'
+    Assert-Equal 'certificates.csv は 1 件 1 行' ([IO.File]::ReadAllLines((Join-Path $r.Dir 'certificates.csv')).Count) 3
+    # -eq は NUL を無視することがあるので、正規表現で探す
+    $controlChars = '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F-\x9F]'
+    Assert-Equal '保存したファイルに制御文字が残っていない' ([regex]::IsMatch(((Get-ChildItem -LiteralPath $r.Dir | ForEach-Object { [IO.File]::ReadAllText($_.FullName) }) -join ''), $controlChars)) 'False'
+    Assert-Equal '画面に制御文字が残っていない' ([regex]::IsMatch($r.Log, $controlChars)) 'False'
 
     Write-Section '読めない場所と、終了コード'
     New-TextFile "$workRoot\mix\ok.crt" (ConvertTo-Pem $rawOf['valid'])
@@ -1261,13 +1305,13 @@ foreach ($client in $held) { $client.Close() }
     } else {
         Write-Skip 'ないドライブ' '空いているドライブ文字がないため'
     }
-    $r = Invoke-Plain @('-Path', $manyDir, '-OutputFolder', "$workRoot\notdir")
+    $r = Invoke-Plain @('-Path', $manyFile, '-OutputFolder', "$workRoot\notdir")
     Assert-Equal '保存できないときは表をすべて出す' ([regex]::Matches($r.Log, [regex]::Escape(' CN=wb-near')).Count) 1234
     $patched = New-PatchedTool 'savefail' "Save-Csv (ConvertTo-LongPath (Join-Path `$runDir 'certificates.csv'))" "throw 'disk full'; Save-Csv (ConvertTo-LongPath (Join-Path `$runDir 'certificates.csv'))"
     $r = Invoke-Tool @('-Path', "$workRoot\m3") $patched
     Assert-Equal '保存に失敗: 警告を出して書きかけを残さない' ('{0}/{1}/{2}' -f $r.Code, (Test-Contains $r.Log '結果を保存できませんでした: disk full'), [bool]$r.Dir) '2/True/False'
     Assert-Equal '保存に失敗: 画面には表を出し、保存先は出さない' ('{0}/{1}' -f (Test-Contains $r.Log 'CN=wb-near'), (Test-Contains $r.Log '保存先:')) 'True/False'
-    $r = Invoke-Tool @('-Path', $manyDir) $patched
+    $r = Invoke-Tool @('-Path', $manyFile) $patched
     Assert-Equal '保存に失敗: 表をすべて出す' ([regex]::Matches($r.Log, [regex]::Escape(' CN=wb-near')).Count) 1234
     $patched = New-PatchedTool 'crash' '$sortedCerts = @($certs | Sort-Object' "throw 'boom'; `$sortedCerts = @(`$certs | Sort-Object"
     $r = Invoke-Tool @('-Path', "$workRoot\m3") $patched
@@ -1333,7 +1377,7 @@ foreach ($client in $held) { $client.Close() }
     $control = "$(& $Exe -NoProfile -Command $cultureProbe)"
     if ($control -and $control -ne '2026/10/29 08:05:00|1.5') {
         $cultureOut = "$workRoot\out_culture"
-        $command = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; & '{0}' -Path '{1}' -OutputFolder '{2}' | Out-Null" -f $tool.Replace("'", "''"), $manyDir.Replace("'", "''"), $cultureOut.Replace("'", "''")
+        $command = "[Threading.Thread]::CurrentThread.CurrentCulture = 'fi-FI'; & '{0}' -Path '{1}' -OutputFolder '{2}' | Out-Null" -f $tool.Replace("'", "''"), $manyFile.Replace("'", "''"), $cultureOut.Replace("'", "''")
         $null = & $Exe -NoProfile -ExecutionPolicy Bypass -Command $command 2>&1
         $cultureDir = Get-RunDir $cultureOut
         $summaryText = if ($cultureDir) { [IO.File]::ReadAllText((Join-Path $cultureDir 'summary.txt')) } else { '' }
