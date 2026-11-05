@@ -850,4 +850,5 @@ try {
     if ($savedEncoding) { try { [Console]::OutputEncoding = $savedEncoding } catch { } }
 }
 
+'  END'
 exit $script:failCount

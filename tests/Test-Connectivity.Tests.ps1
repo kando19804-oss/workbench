@@ -674,7 +674,8 @@ try {
         '$listener.Start()'
         '''UP='' + (Wait-Text ''NG → OK'')'
         '$listener.Stop()'
-        '''DOWN='' + (Wait-Text ''OK → NG'')'
+        # ツールは変化の行を出してから結果を確定するので、その後の状態の行まで待ってから止める（確定の前に止めると、1 つ前の確認の結果が残る）
+        '''DOWN='' + (Wait-Text ''(?s)OK → NG.*（確認 \d+ 回目  OK 1 件'')'
         '$ps.Stop()'
         '''STOPPED='' + $handle.IsCompleted'
         '''INFO='' + (Get-Info).Replace("`r", ''<CR>'').Replace("`n", ''<LF>'')'
@@ -819,4 +820,5 @@ try {
     if ($savedEncoding) { try { [Console]::OutputEncoding = $savedEncoding } catch { } }
 }
 
+'  END'
 exit $script:failCount
