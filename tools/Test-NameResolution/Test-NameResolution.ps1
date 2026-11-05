@@ -382,6 +382,10 @@ function ConvertTo-IpText($Address) {
 
 function Test-IPv6Text([string]$IpText) { return $IpText.Contains(':') }
 
+# DNS の名前（CNAME、逆引きなど）は、答えるサーバーが決める値で、エスケープ文字や改行も入れられる。
+# そのまま出すと画面とファイルが崩れるので、制御文字は ? に置き換える
+function ConvertTo-PlainName([string]$Text) { return ($Text -replace '\p{Cc}', '?') }
+
 # 期待する IP アドレスの文字列（; で区切る）を、そろえた表記の配列にする。正しくない値があれば、その値を Bad に入れる
 function ConvertFrom-ExpectedText([string]$Text) {
     $values = New-Object 'System.Collections.Generic.List[string]'
@@ -801,7 +805,10 @@ function Get-DnsSuffix {
     return , $found
 }
 
-# Resolve-DnsName のエラーを分類する。文の言語によらないよう、番号と ID で見分ける
+# Resolve-DnsName のエラーを分類する。文の言語によらないよう、番号と ID で見分ける。
+# DNS が動いていないサーバー（ポートが閉じている）や経路のないサーバーは、タイムアウトを待たずに接続のエラーが返るので、これも「応答しない」とする
+# （ネットワークのエラー: 1231、1232、10050、10051、10054、10061、10064、10065。タイムアウト: 1460、10060）
+$NoResponseCodes = 1231, 1232, 1460, 10050, 10051, 10054, 10060, 10061, 10064, 10065
 function Get-DnsErrorKind($ErrorRecord) {
     $code = 0
     $ex = $ErrorRecord.Exception
@@ -809,8 +816,22 @@ function Get-DnsErrorKind($ErrorRecord) {
     $id = [string]$ErrorRecord.FullyQualifiedErrorId
     if ($code -eq 9003 -or $id -match 'DNS_ERROR_RCODE_NAME_ERROR|\b9003\b') { return 'NoName' }
     if ($code -eq 9501 -or $id -match 'DNS_INFO_NO_RECORDS|\b9501\b') { return 'NoData' }
-    if ($code -eq 1460 -or $code -eq 10060 -or $id -match 'ERROR_TIMEOUT|WSAETIMEDOUT|\b1460\b|\b10060\b') { return 'NoResponse' }
+    if ($NoResponseCodes -contains $code -or $id -match 'ERROR_TIMEOUT|WSAETIMEDOUT|\b(?:1231|1232|1460|10050|10051|10054|10060|10061|10064|10065)\b') { return 'NoResponse' }
     return 'Other'
+}
+
+# エラーの文は「名前 : 内容」の形で、内容は OS の言語で変わる。DNS サーバーが返したエラーは RCODE の名前で書き、それ以外は名前を除いて書く
+function Get-DnsErrorText($ErrorRecord) {
+    $ex = $ErrorRecord.Exception
+    if ($ex -is [ComponentModel.Win32Exception]) {
+        switch ($ex.NativeErrorCode) {
+            9001 { return 'FORMERR' }
+            9002 { return 'SERVFAIL' }
+            9004 { return 'NOTIMP' }
+            9005 { return 'REFUSED' }
+        }
+    }
+    return ((Get-ErrorText (Get-InnerException $ex)) -replace '^\S+ : ', '')
 }
 
 function Get-RecordValue($Record, [string]$Property) {
@@ -826,7 +847,7 @@ function Invoke-DnsQuery([string]$Name, [string]$Type, [string]$DnsServer) {
         $records = @(Resolve-DnsName -Name $Name -Type $Type -DnsOnly -NoHostsFile -Server $DnsServer -ErrorAction Stop)
         return @{ Kind = 'Ok'; Records = @($records | Where-Object { [string](Get-RecordValue $_ 'Section') -eq 'Answer' }); Detail = '' }
     } catch {
-        return @{ Kind = (Get-DnsErrorKind $_); Records = @(); Detail = (Get-ErrorText (Get-InnerException $_.Exception)) }
+        return @{ Kind = (Get-DnsErrorKind $_); Records = @(); Detail = (Get-DnsErrorText $_) }
     }
 }
 
@@ -851,7 +872,7 @@ function Get-ServerAnswer([string]$Name, [string]$DnsServer, $Suffixes) {
         $resolvedName = ''
         $ttl = -1
         $noResponseCount = 0
-        $sawOther = $null
+        $otherDetails = New-Object 'System.Collections.Generic.List[string]'
         $typeWarnings = New-Object 'System.Collections.Generic.List[string]'
         foreach ($type in 'A', 'AAAA') {
             $query = Invoke-DnsQuery $candidate $type $DnsServer
@@ -861,7 +882,7 @@ function Get-ServerAnswer([string]$Name, [string]$DnsServer, $Suffixes) {
                 continue
             }
             if ($query.Kind -eq 'Other') {
-                $sawOther = $query.Detail
+                $otherDetails.Add($query.Detail)
                 $typeWarnings.Add(('{0}: {1}' -f $type, $query.Detail))
                 continue
             }
@@ -885,6 +906,11 @@ function Get-ServerAnswer([string]$Name, [string]$DnsServer, $Suffixes) {
                 }
             }
         }
+        # A と AAAA が同じエラーなら、1 つにまとめる
+        if ($otherDetails.Count -eq 2 -and [string]::Equals($otherDetails[0], $otherDetails[1], [StringComparison]::Ordinal)) {
+            $typeWarnings.Clear()
+            $typeWarnings.Add($otherDetails[0])
+        }
         # A と AAAA のどちらも応答しないときだけ、応答しないサーバーとして数える
         if ($noResponseCount -eq 2) {
             $failStreak[$DnsServer] = [int]$(if ($failStreak.ContainsKey($DnsServer)) { $failStreak[$DnsServer] } else { 0 }) + 1
@@ -906,7 +932,7 @@ function Get-ServerAnswer([string]$Name, [string]$DnsServer, $Suffixes) {
             return $answer
         }
         # 片方が答えられず、もう片方に IP アドレスがないときは、「ない」とは言い切れない
-        if ($sawOther -or $noResponseCount -gt 0) {
+        if ($otherDetails.Count -gt 0 -or $noResponseCount -gt 0) {
             $answer.State = 'Error'
             $answer.Detail = $typeWarnings -join '、'
             $answer.Warning = ''
@@ -1209,15 +1235,15 @@ try {
         $ttlValues = @($okAnswers | Where-Object { $_.Ttl -ge 0 } | ForEach-Object { $_.Ttl } | Sort-Object)
 
         $results.Add([pscustomobject]@{
-            Verdict = $verdict; Name = $item.Name; Source = $sourceText
+            Verdict = $verdict; Name = (ConvertTo-PlainName $item.Name); Source = $sourceText
             OsText = $(if ($osFound) { Join-Ip $osIps } else { '-' })
             HostsText = (Join-Ip $hostsIps); HostsLine = $hostsLineText
-            DnsDisplay = $dnsDisplay; DnsCsv = ($dnsCsvParts -join ' / ')
-            Resolved = $(if ($firstOk) { $firstOk.Resolved } else { '' })
-            Cname = $(if ($firstOk) { ($firstOk.Chain -join ' → ') } else { '' })
+            DnsDisplay = $dnsDisplay; DnsCsv = (ConvertTo-PlainName ($dnsCsvParts -join ' / '))
+            Resolved = $(if ($firstOk) { ConvertTo-PlainName $firstOk.Resolved } else { '' })
+            Cname = $(if ($firstOk) { ConvertTo-PlainName ($firstOk.Chain -join ' → ') } else { '' })
             Ttl = $(if ($ttlValues.Count -gt 0) { ([long]$ttlValues[0]).ToString('N0', $Invariant) } else { '' })
-            Expected = ($expected -join ';'); ReverseText = ($reverseParts -join ' / ')
-            Memo = $item.Memo; Note = ($notes -join '、')
+            Expected = ($expected -join ';'); ReverseText = (ConvertTo-PlainName ($reverseParts -join ' / '))
+            Memo = $item.Memo; Note = (ConvertTo-PlainName ($notes -join '、'))
         })
     }
 
