@@ -89,6 +89,7 @@ $ErrorActionPreference = 'Stop'
 
 $ScriptVersion  = '1.0.0'
 $ScreenRows     = 200       # 画面に表示する件数（保存するときだけ。超えた分はファイルを見てもらう）
+$IpCellWidth    = 40        # 表の「OS の結果」「DNS の結果」の幅（半角の文字数）。超える分は「ほか N 件」にまとめる
 $ProgressMs     = 250       # 進捗表示の間隔（ミリ秒）
 $DeadServerLimit = 3        # この回数続けて応答しない DNS サーバーには、その後は聞かない
 $OutputPrefix   = 'NameResolution_'
@@ -993,6 +994,21 @@ function Test-ExpectedMatch([string[]]$Actual, [string[]]$Expected) {
 
 function Join-Ip($Ips) { return (@($Ips) -join ', ') }
 
+# 画面と summary.txt の表に出す IP アドレス。この PC の名前のように数が多いと、表の列がすべての行で広がって折り返されるので、
+# 幅を超える分は「ほか N 件」にまとめる。最初の 1 つは必ず出す。すべての値は results.csv に書く
+function Format-IpCell($Ips) {
+    $list = @($Ips)
+    $text = [string]$list[0]
+    for ($i = 1; $i -lt $list.Count; $i++) {
+        $next = $text + ', ' + $list[$i]
+        $rest = $list.Count - $i - 1
+        $more = if ($rest -gt 0) { Format-Invariant ' ほか {0:N0} 件' $rest } else { '' }
+        if ((Get-DisplayWidth ($next + $more)) -gt $IpCellWidth) { return $text + (Format-Invariant ' ほか {0:N0} 件' ($list.Count - $i)) }
+        $text = $next
+    }
+    return $text
+}
+
 #endregion
 
 #region 保存先の準備
@@ -1143,35 +1159,42 @@ try {
             $attention = $true
             $notes.Add('DNS サーバーによって答えが違う')
         }
+        # 同じ言葉の備考は、サーバーをまとめて 1 つにする（DNS サーバー 10.0.0.53、10.0.0.54 が応答しない）
+        $deadServers = @($answers | Where-Object { $_.State -eq 'NoResponse' } | ForEach-Object { $_.Server })
+        if ($deadServers.Count -gt 0) {
+            $attention = $true
+            $notes.Add(('DNS サーバー {0} が応答しない' -f ($deadServers -join '、')))
+        }
+        $skippedServers = @($answers | Where-Object { $_.State -eq 'Skipped' } | ForEach-Object { $_.Server })
+        if ($skippedServers.Count -gt 0) {
+            $attention = $true
+            $notes.Add(('DNS サーバー {0} は応答しないので聞いていない' -f ($skippedServers -join '、')))
+        }
+        # エラーは、同じ内容のサーバーをまとめる（DNS サーバー 10.0.0.53、10.0.0.54: SERVFAIL）
+        $errorServers = New-Object 'System.Collections.Specialized.OrderedDictionary'
         foreach ($answer in $answers) {
-            if ($answer.State -eq 'NoResponse') {
-                $attention = $true
-                $notes.Add(('DNS サーバー {0} が応答しない' -f $answer.Server))
-            } elseif ($answer.State -eq 'Skipped') {
-                $attention = $true
-                $notes.Add(('DNS サーバー {0} は応答しないので聞いていない' -f $answer.Server))
-            } elseif ($answer.State -eq 'Error') {
-                $attention = $true
-                $notes.Add(('DNS サーバー {0}: {1}' -f $answer.Server, $answer.Detail))
-            } elseif ($answer.State -eq 'Ok' -and $answer.Warning) {
-                # A だけが答えて AAAA が失敗したときなど
-                $attention = $true
-                $notes.Add(('DNS サーバー {0}: {1}' -f $answer.Server, $answer.Warning))
-            }
+            $errorText = ''
+            if ($answer.State -eq 'Error') { $errorText = $answer.Detail }
+            elseif ($answer.State -eq 'Ok') { $errorText = $answer.Warning }   # A だけが答えて AAAA が失敗したときなど
+            if (-not $errorText) { continue }
+            if (-not $errorServers.Contains($errorText)) { $errorServers.Add($errorText, (New-Object 'System.Collections.Generic.List[string]')) }
+            $errorServers[$errorText].Add($answer.Server)
+        }
+        foreach ($errorText in $errorServers.Keys) {
+            $attention = $true
+            $notes.Add(('DNS サーバー {0}: {1}' -f ($errorServers[$errorText] -join '、'), $errorText))
         }
 
-        # 期待する IP アドレス。OS の結果と、答えたすべての DNS サーバーの両方と比べる
+        # 期待する IP アドレス。OS の結果と、答えたすべての DNS サーバーの両方と比べ、違うところを 1 つの備考にまとめる
         $expected = @($item.Expected)
         if ($expected.Count -gt 0) {
-            if ($osFound -and -not (Test-ExpectedMatch $osIps $expected)) {
+            $wrongParts = New-Object 'System.Collections.Generic.List[string]'
+            if ($osFound -and -not (Test-ExpectedMatch $osIps $expected)) { $wrongParts.Add('OS の結果') }
+            $wrongServers = @($answers | Where-Object { ($_.State -eq 'Ok' -or $_.State -eq 'None') -and -not (Test-ExpectedMatch @($_.Ips) $expected) } | ForEach-Object { $_.Server })
+            if ($wrongServers.Count -gt 0) { $wrongParts.Add('DNS サーバー ' + ($wrongServers -join '、')) }
+            if ($wrongParts.Count -gt 0) {
                 $attention = $true
-                $notes.Add('期待する IP アドレスと違う（OS の結果）')
-            }
-            foreach ($answer in $answers) {
-                if (($answer.State -eq 'Ok' -or $answer.State -eq 'None') -and -not (Test-ExpectedMatch @($answer.Ips) $expected)) {
-                    $attention = $true
-                    $notes.Add(('期待する IP アドレスと違う（DNS サーバー {0}）' -f $answer.Server))
-                }
+                $notes.Add(('期待する IP アドレスと違う（{0}）' -f ($wrongParts -join '、')))
             }
         }
 
@@ -1181,15 +1204,19 @@ try {
             $resolvedList = New-Object 'System.Collections.Generic.List[string]'
             $resolvedList.Add($item.Name)
             foreach ($answer in $okAnswers) { if ($answer.Resolved) { $resolvedList.Add($answer.Resolved) } }
+            # 備考は、同じ言葉の IP アドレスをまとめて 1 つにする（逆引きの登録がない（10.0.1.10、10.0.1.11））
+            $reverseWrong  = New-Object 'System.Collections.Generic.List[string]'
+            $reverseFailed = New-Object 'System.Collections.Generic.List[string]'
+            $reverseNone   = New-Object 'System.Collections.Generic.List[string]'
             foreach ($ipText in $osIps) {
                 $reverseNames = Get-ReverseName $ipText
                 if ($null -eq $reverseNames) {
                     $attention = $true
                     $reverseParts.Add(('{0}: 聞けなかった' -f $ipText))
-                    $notes.Add(('逆引きを聞けなかった（{0}）' -f $ipText))
+                    $reverseFailed.Add($ipText)
                 } elseif ($reverseNames.Count -eq 0) {
                     $reverseParts.Add(('{0}: なし' -f $ipText))
-                    $notes.Add(('逆引きの登録がない（{0}）' -f $ipText))
+                    $reverseNone.Add($ipText)
                 } elseif ($inputAddress) {
                     # IP アドレスを調べたときは、逆引きの名前がいちばん知りたい結果なので、画面にも出す
                     $reverseParts.Add(('{0}: {1}' -f $ipText, ($reverseNames -join ', ')))
@@ -1204,10 +1231,13 @@ try {
                     } else {
                         $attention = $true
                         $reverseParts.Add(('{0}: 違う（{1}）' -f $ipText, ($reverseNames -join ', ')))
-                        $notes.Add(('逆引きの名前が違う（{0} → {1}）' -f $ipText, ($reverseNames -join ', ')))
+                        $reverseWrong.Add(('{0} → {1}' -f $ipText, ($reverseNames -join ', ')))
                     }
                 }
             }
+            if ($reverseWrong.Count -gt 0) { $notes.Add(('逆引きの名前が違う（{0}）' -f ($reverseWrong -join '、'))) }
+            if ($reverseFailed.Count -gt 0) { $notes.Add(('逆引きを聞けなかった（{0}）' -f ($reverseFailed -join '、'))) }
+            if ($reverseNone.Count -gt 0) { $notes.Add(('逆引きの登録がない（{0}）' -f ($reverseNone -join '、'))) }
         }
 
         # 判定
@@ -1224,7 +1254,7 @@ try {
         # 表示の文字
         $dnsDisplay = '-'
         if ($okAnswers.Count -gt 0) {
-            $dnsDisplay = if ($answerKeys.Count -gt 1) { 'サーバーで違う' } else { Join-Ip $okAnswers[0].Ips }
+            $dnsDisplay = if ($answerKeys.Count -gt 1) { 'サーバーで違う' } else { Format-IpCell $okAnswers[0].Ips }
         }
         $dnsCsvParts = @($answers | ForEach-Object {
             $valueText = if ($_.State -eq 'Ok') { Join-Ip $_.Ips } else { $_.Detail }
@@ -1237,6 +1267,7 @@ try {
         $results.Add([pscustomobject]@{
             Verdict = $verdict; Name = (ConvertTo-PlainName $item.Name); Source = $sourceText
             OsText = $(if ($osFound) { Join-Ip $osIps } else { '-' })
+            OsDisplay = $(if ($osFound) { Format-IpCell $osIps } else { '-' })
             HostsText = (Join-Ip $hostsIps); HostsLine = $hostsLineText
             DnsDisplay = $dnsDisplay; DnsCsv = (ConvertTo-PlainName ($dnsCsvParts -join ' / '))
             Resolved = $(if ($firstOk) { ConvertTo-PlainName $firstOk.Resolved } else { '' })
@@ -1276,7 +1307,7 @@ try {
     foreach ($row in $results) {
         $widths.Name   = [math]::Max($widths.Name, (Get-DisplayWidth $row.Name))
         $widths.Source = [math]::Max($widths.Source, (Get-DisplayWidth $row.Source))
-        $widths.Os     = [math]::Max($widths.Os, (Get-DisplayWidth $row.OsText))
+        $widths.Os     = [math]::Max($widths.Os, (Get-DisplayWidth $row.OsDisplay))
         $widths.Dns    = [math]::Max($widths.Dns, (Get-DisplayWidth $row.DnsDisplay))
     }
     $tableHeader = (' ' + (Format-Column '判定' $widths.Verdict) + '  ' + (Format-Column '名前' $widths.Name) + '  ' + (Format-Column '引けた元' $widths.Source) + '  ' +
@@ -1285,7 +1316,7 @@ try {
     $rows = New-Object 'System.Collections.Generic.List[object]'
     foreach ($row in $results) {
         $text = (' ' + (Format-Column $row.Verdict $widths.Verdict) + '  ' + (Format-Column $row.Name $widths.Name) + '  ' + (Format-Column $row.Source $widths.Source) + '  ' +
-            (Format-Column $row.OsText $widths.Os) + '  ' + (Format-Column $row.DnsDisplay $widths.Dns) + '  ' + $row.Note).TrimEnd()
+            (Format-Column $row.OsDisplay $widths.Os) + '  ' + (Format-Column $row.DnsDisplay $widths.Dns) + '  ' + $row.Note).TrimEnd()
         $color = switch ($row.Verdict) { '注意' { 'Yellow' } '引けない' { 'Red' } default { '' } }
         $tableLines.Add(@($text, $color))
         $rows.Add([object[]]@(
