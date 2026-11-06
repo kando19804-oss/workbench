@@ -89,6 +89,11 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 管理者として実行した robocopy は、ACL で拒否したフォルダも読む（バックアップの特権）。PowerShell（.NET）からは読めないので、結果が食い違う
 - PowerShell から外部コマンドに、スペースを含み最後が `\` のパスを渡すと、自動で付く引用符と合わさって `\"` になる
 - `X509Certificate2.Subject` と `Issuer` は、名前に NUL が入っていると空を返す（5.1 と 7 の両方）。改行やエスケープ文字はそのまま返すので、画面やファイルに出す前に置き換える（`-Target` のように相手が決める値では特に）
+- 環境変数 `SystemRoot` を差し替えると、Winsock を初期化できず、`Dns.GetHostAddresses` がすべて失敗する（11003）。hosts の場所を変えて試すときは、ツールのコピーを書き換える
+- `Resolve-DnsName` は、DNS が動いていないサーバーにはすぐ 10054 を、答えないサーバーには 1 回 11 秒ほど待って 1460 を返す。登録のない種類（A だけの名前の AAAA など）はエラーにせず、Authority の SOA を返す。DNS サーバーが返す名前の制御文字は、そのまま返す
+- `Resolve-DnsName -Server` は OS の DNS のキャッシュを使わない。答えはキャッシュに入り `ipconfig /displaydns` に出るが、アプリの名前解決（`GetHostAddresses`、ping、`-Server` なしの `Resolve-DnsName`）とは別に持つので、アプリには効かない（OS の設定の DNS サーバーに `-Server` で聞いても同じ）
+- DNS のキャッシュの一覧（`Get-DnsClientCache`、`ipconfig /displaydns`）は、管理者でないと読めない。`Get-DnsClientCache` はエラーも出さずに 0 件を返す。アプリが使うキャッシュは、管理者でなくても `Resolve-DnsName -CacheOnly` で読める
+- `$( )` の中で返した要素 1 つの配列は、配列でなくなる（`$(if ($x) { @('a') })` は文字列になり、`ConvertTo-Json` で `[...]` にならない。5.1 と 7 の両方）。配列のまま返すときは `, @('a')` と書く
 
 ## テストの書き方の注意
 
@@ -104,6 +109,10 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 証明書のテストで `New-SelfSignedCertificate` を使わない。`CurrentUser\My` に作って `My` から消しても、`CurrentUser\CA`（中間証明機関）に鍵なしのコピーが残る（1 回のテストで本物のストアに 20 件残った）。テスト専用のストアを作る（`tests/Get-CertificateExpiry.Tests.ps1` を参照）
 - 本物の環境では起きない条件（保存の失敗、想定外のエラーなど）は、ツールの処理を 1 か所だけ書き換えたコピーを動かして確かめる（`tests/Search-EventLog.Tests.ps1` の `New-PatchedTool` を参照）
 - テストの最後の `exit` の直前で `'  END'` を出す。`tests/Invoke-Tests.ps1` は、この行がなければ「最後まで走らなかった」として失敗に数える（テストは例外にならずに黙って終わることがあり、合格の数が減るだけでは気づけない）
+- 管理者でないと読めない情報は、エラーにならずに空を返すことがある（DNS のキャッシュなど）。「入っていない」を確かめる項目は、入っているときにその方法で見えることを先に確かめる（Test-NameResolution の「キャッシュに入れない」は、管理者でない環境で何も確かめずに合格し、ユーザーの管理者の実行で初めて失敗した）
+- 表の列の幅を値に合わせて広げるツールは、長い値が 1 つあると、見出しとすべての行が画面の幅で折り返される。IP アドレスの多い名前（この PC の名前など）のような長い値で、実機の画面を見て確かめる
+- DNS の問い合わせは、ループバック（`127.x.x.x`）の UDP 53 番で答える補助スクリプトで確かめる（`tests/Test-NameResolution.Tests.ps1` を参照）。管理者でなくても待ち受けられ、0.0.0.0:53 を別のプロセスが使っていても待ち受けられる。番地は実行のたびに乱数で選ぶ。`.test` の名前を、本物の OS や DNS サーバーに聞かない
+- `Resolve-DnsName` を呼ぶと DnsClient モジュールが自動で読み込まれ、global に定義した同じモジュールの偽の関数（`Get-DnsClient` など）が本物に置き換わる。本物の `Resolve-DnsName` と偽の関数を一緒に使うときは、先に `Import-Module DnsClient` してから偽の関数を定義する
 
 ## コミット
 
