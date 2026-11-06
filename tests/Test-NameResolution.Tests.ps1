@@ -1222,9 +1222,14 @@ try {
         Assert-Equal '本物: 短い名前' (Get-Cell $liveShort 'web' '解決した名前') 'web.conn.test'
         $liveBare = Invoke-Fake @{ Args = @{ Target = 'bare'; Server = $dnsNormal }; RealDns = $true; Os = @{ 'bare' = @('10.0.0.7') } }
         Assert-Equal '本物: サフィックスなしの名前も DNS サーバーに届く' (Get-Cell $liveBare 'bare' 'DNS の結果') "${dnsNormal}: 10.0.0.7"
-        $cacheCount = 0
-        try { $cacheCount = @(Get-DnsClientCache -Entry 'web.test' -ErrorAction Stop).Count } catch { }
-        Assert-Equal '本物: OS の DNS キャッシュに入れない' $cacheCount 0
+        # -Server で聞いた答えは DNS のキャッシュに入る（ipconfig /displaydns に出る）が、アプリの名前解決が使うキャッシュとは別に持つ。
+        # Get-DnsClientCache は管理者でないとエラーも出さずに 0 件を返すので使わない。-CacheOnly は管理者でなくても、アプリが使うキャッシュを読める
+        $appCache = 'なし'
+        try {
+            $cached = @(Resolve-DnsName 'web.test' -Type A -CacheOnly -ErrorAction Stop | Where-Object { $_.Section -eq 'Answer' } | ForEach-Object { $_.IPAddress })
+            if ($cached.Count -gt 0) { $appCache = $cached -join ', ' }
+        } catch { }
+        Assert-Equal '本物: アプリが使う DNS のキャッシュに入れない' $appCache 'なし'
         # 答えない問い合わせは 1 回で約 11 秒かかる
         $sw = [Diagnostics.Stopwatch]::StartNew()
         $liveSilent = Invoke-Fake @{ Args = @{ Target = 'web.test'; Server = "$dnsSilent,$dnsSilentAaaa" }; RealDns = $true; Os = $liveOs }
