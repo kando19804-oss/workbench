@@ -353,6 +353,29 @@ exit $LASTEXITCODE
     Assert-Equal '解決した名前は最後の名前' (Get-Cell $cname 'alias.test' '解決した名前') 'end.test'
     Assert-Equal 'TTL は一番短いもの（CNAME の 300）' (Get-Cell $cname 'alias.test' 'TTL') '300'
 
+    Write-Section '表の IP アドレスの幅'
+    # この PC の名前のように IP アドレスが多いと、列の幅が広がってすべての行が折り返される。表では半角 40 文字分を超える分を「ほか N 件」にする
+    $manyIps = @(11..22 | ForEach-Object { "10.0.0.$_" })
+    $wide = Invoke-Fake @{ Args = @{ Target = 'many.test' }; Os = @{ 'many.test' = $manyIps }; Zone = (New-Zone @{ 'many.test' = $manyIps }) }
+    $wideLine = ' OK        many.test  DNS       10.0.0.11, 10.0.0.12 ほか 10 件  10.0.0.11, 10.0.0.12 ほか 10 件'
+    Assert-Equal '幅を超える分は「ほか N 件」（summary.txt。列の幅も省いた値に合わせる）' (@([IO.File]::ReadAllLines((Join-Path $wide.Dir 'summary.txt')) | Where-Object { $_.Contains('many.test') }) -join '|') $wideLine
+    Assert-Equal '幅を超える分は「ほか N 件」（画面）' (Test-Contains $wide.Log $wideLine) 'True'
+    Assert-Equal 'CSV にはすべて書く' ('{0}/{1}' -f (Get-Cell $wide 'many.test' 'OS の結果'), (Get-Cell $wide 'many.test' 'DNS の結果')) ('{0}/10.0.0.53: {0}' -f ($manyIps -join ', '))
+    $edgeIps = @{
+        'e40.test'   = @('10.0.0.101', '2001:db8::aaaa:bbbb:cccc:ddd')    # ちょうど 40 文字
+        'e41.test'   = @('10.0.0.101', '2001:db8::aaaa:bbbb:cccc:dddd')   # 41 文字
+        'v6.test'    = @('2001:db8:aaaa:bbbb:cccc:dddd:eeee:1', '2001:db8:aaaa:bbbb:cccc:dddd:eeee:2', '2001:db8:aaaa:bbbb:cccc:dddd:eeee:3')
+        'three.test' = @('10.0.0.11', '10.0.0.12', '10.0.0.13')           # 「ほか」を付けると 40 文字を超えるが、付けなければ入る
+    }
+    $edge = Invoke-Fake @{ Args = @{ Target = 'e40.test,e41.test,v6.test,three.test' }; Os = $edgeIps; Zone = (New-Zone $edgeIps) }
+    $edgeLines = [IO.File]::ReadAllLines((Join-Path $edge.Dir 'summary.txt'))
+    $edgeLine = @{}
+    foreach ($name in $edgeIps.Keys) { $edgeLine[$name] = [string](@($edgeLines | Where-Object { $_.Contains(" $name ") })[0]) }
+    Assert-Equal 'ちょうど 40 文字は省かない' (Test-Contains $edgeLine['e40.test'] '10.0.0.101, 2001:db8::aaaa:bbbb:cccc:ddd  ') 'True'
+    Assert-Equal '41 文字は省く' (Test-Contains $edgeLine['e41.test'] '10.0.0.101 ほか 1 件  ') 'True'
+    Assert-Equal '最初の 1 つは 40 文字を超えても出す' (Test-Contains $edgeLine['v6.test'] '2001:db8:aaaa:bbbb:cccc:dddd:eeee:1 ほか 2 件  ') 'True'
+    Assert-Equal '最後の 1 つは「ほか」なしで入れば出す' ('{0}/{1}' -f (Test-Contains $edgeLine['three.test'] '10.0.0.11, 10.0.0.12, 10.0.0.13  '), (Test-Contains $edgeLine['three.test'] 'ほか')) 'True/False'
+
     Write-Section '引けない'
     $fail = Invoke-Fake @{ Args = @{ Target = 'none.test' } }
     Assert-Equal '引けない' ('{0}/{1}/{2}' -f (Get-Verdict $fail 'none.test'), (Get-Cell $fail 'none.test' '引けた元'), $fail.Code) '引けない/-/2'
@@ -477,8 +500,11 @@ exit $LASTEXITCODE
     }
     $codes = Invoke-Fake @{ Args = @{ Target = 'a.test'; Server = ($codeServers -join ',') }; Os = $deadOs; Errors = $codeErrors }
     for ($i = 0; $i -lt $noResponseCodes.Count; $i++) {
-        Assert-Equal "エラー $($noResponseCodes[$i]) は応答しない" (Test-Note $codes 'a.test' "DNS サーバー 10.1.0.$($i + 1) が応答しない") 'True'
+        Assert-Equal "エラー $($noResponseCodes[$i]) は応答しない" (Test-Contains (Get-Cell $codes 'a.test' 'DNS の結果') "10.1.0.$($i + 1): 応答なし") 'True'
     }
+    Assert-Equal '応答しないサーバーは 1 つの備考にまとめる' (Get-Cell $codes 'a.test' '備考') ('DNS サーバー {0} が応答しない' -f ($codeServers -join '、'))
+    $deadTwo = Invoke-Fake @{ Args = @{ Target = 'a.test,b.test,c.test,d.test'; Server = '10.0.0.98,10.0.0.99' }; Os = $deadOs; Errors = @{ '10.0.0.98' = @{ A = 1460; AAAA = 1460 }; '10.0.0.99' = @{ A = 1460; AAAA = 1460 } } }
+    Assert-Equal '聞いていないサーバーも 1 つの備考にまとめる' (Get-Cell $deadTwo 'd.test' '備考') 'DNS サーバー 10.0.0.98、10.0.0.99 は応答しないので聞いていない'
     $idErrors = @{
         '10.2.0.1' = @{ A = 'ERROR_TIMEOUT'; AAAA = 'ERROR_TIMEOUT' }
         '10.2.0.2' = @{ A = 'WSAETIMEDOUT'; AAAA = 'WSAETIMEDOUT' }
@@ -498,6 +524,10 @@ exit $LASTEXITCODE
     Assert-Equal '片方がエラーなら注意（答えは残す）' ('{0}/{1}/{2}' -f (Get-Verdict $partial 'a.test'), (Get-Cell $partial 'a.test' '備考'), (Get-Cell $partial 'a.test' '引けた元')) '注意/DNS サーバー 10.0.0.78: A: SERVFAIL/DNS'
     $otherError = Invoke-Fake @{ Args = @{ Target = 'a.test'; Server = '10.0.0.78' }; Os = $deadOs; Errors = @{ '10.0.0.78' = @{ A = 9999; AAAA = 9999 } } }
     Assert-Equal 'そのほかのエラーは、名前を除いて 1 行で書く' (Get-Cell $otherError 'a.test' '備考') 'DNS サーバー 10.0.0.78: 何かのエラー'
+    $errorThree = Invoke-Fake @{ Args = @{ Target = 'a.test'; Server = '10.0.0.78,10.0.0.79,10.0.0.80' }; Os = $deadOs; Errors = @{ '10.0.0.78' = @{ A = 9002; AAAA = 9002 }; '10.0.0.79' = @{ A = 9005; AAAA = 9005 }; '10.0.0.80' = @{ A = 9002; AAAA = 9002 } } }
+    Assert-Equal '同じエラーのサーバーをまとめる（サーバーの順）' (Get-Cell $errorThree 'a.test' '備考') 'DNS サーバー 10.0.0.78、10.0.0.80: SERVFAIL、DNS サーバー 10.0.0.79: REFUSED'
+    $partialTwo = Invoke-Fake @{ Args = @{ Target = 'a.test'; Server = '10.0.0.78,10.0.0.79' }; Os = @{ 'a.test' = @('2001:db8::1') }; Errors = @{ '10.0.0.78' = @{ A = 9002 }; '10.0.0.79' = @{ A = 9002 } }; Zone = (New-Zone @{ 'a.test' = @('2001:db8::1') }) }
+    Assert-Equal '片方だけのエラーもまとめる' (Get-Cell $partialTwo 'a.test' '備考') 'DNS サーバー 10.0.0.78、10.0.0.79: A: SERVFAIL'
 
     $ctrlError = Invoke-Fake @{ Args = @{ Target = 'a.test'; Server = '10.0.0.78' }; Os = $deadOs; Errors = @{ '10.0.0.78' = @{ A = 9998; AAAA = 9998 } } }
     Assert-Equal 'エラーの文の制御文字も置き換える' ('{0}/{1}' -f (Get-Cell $ctrlError 'a.test' 'DNS の結果'), (Get-Cell $ctrlError 'a.test' '備考')) '10.0.0.78: 制御?文字/DNS サーバー 10.0.0.78: 制御?文字'
@@ -540,17 +570,19 @@ exit $LASTEXITCODE
     $match = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.10' }; Os = $webOs; Zone = $webZone }
     Assert-Equal '一致（種類が違う IP アドレスは比べない）' ('{0}/{1}/{2}' -f (Get-Verdict $match 'web.test'), (Get-Cell $match 'web.test' '期待する IP'), $match.Code) 'OK/10.0.2.10/0'
     $wrong = Invoke-Fake @{ Args = @{ Target = 'web.test=10.2.2.2' }; Os = $webOs; Zone = $webZone }
-    Assert-Equal '違う（OS と DNS の両方を比べる）' ('{0}/{1}/{2}/{3}' -f (Get-Verdict $wrong 'web.test'), (Test-Note $wrong 'web.test' '期待する IP アドレスと違う（OS の結果）'), (Test-Note $wrong 'web.test' '期待する IP アドレスと違う（DNS サーバー 10.0.0.53）'), $wrong.Code) '注意/True/True/2'
+    Assert-Equal '違う（OS と DNS の両方を比べ、1 つの備考にまとめる）' ('{0}/{1}/{2}' -f (Get-Verdict $wrong 'web.test'), (Get-Cell $wrong 'web.test' '備考'), $wrong.Code) '注意/期待する IP アドレスと違う（OS の結果、DNS サーバー 10.0.0.53）/2'
+    $wrongTwo = Invoke-Fake @{ Args = @{ Target = 'web.test=10.2.2.2' }; Servers = $two; Os = $webOs; Zone = $webZone }
+    Assert-Equal '違う DNS サーバーもまとめる' (Get-Cell $wrongTwo 'web.test' '備考') '期待する IP アドレスと違う（OS の結果、DNS サーバー 10.0.0.53、10.0.0.54）'
     $extra = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.10' }; Os = @{ 'web.test' = @('10.0.2.10') }; Zone = (New-Zone @{ 'web.test' = @('10.0.2.10', '10.2.2.2') }) }
-    Assert-Equal '期待していない同じ種類の IP アドレスがあれば違う' ('{0}/{1}' -f (Test-Note $extra 'web.test' '期待する IP アドレスと違う（DNS サーバー'), (Test-Note $extra 'web.test' '期待する IP アドレスと違う（OS の結果）')) 'True/False'
+    Assert-Equal '期待していない同じ種類の IP アドレスがあれば違う' (Get-Cell $extra 'web.test' '備考') '期待する IP アドレスと違う（DNS サーバー 10.0.0.53）'
     $missing = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.10;10.0.2.11' }; Os = @{ 'web.test' = @('10.0.2.10') }; Zone = (New-Zone @{ 'web.test' = @('10.0.2.10', '10.0.2.11') }) }
-    Assert-Equal '期待がすべて含まれていないと違う（DNS は OS の値を含むだけでは OK にしない）' ('{0}/{1}' -f (Test-Note $missing 'web.test' '期待する IP アドレスと違う（OS の結果）'), (Test-Note $missing 'web.test' '（DNS サーバー')) 'True/False'
+    Assert-Equal '期待がすべて含まれていないと違う（DNS は OS の値を含むだけでは OK にしない）' (Get-Cell $missing 'web.test' '備考') '期待する IP アドレスと違う（OS の結果）'
     $twoIps = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.11;10.0.2.10' }; Os = @{ 'web.test' = @('10.0.2.10', '10.0.2.11') }; Zone = (New-Zone @{ 'web.test' = @('10.0.2.10', '10.0.2.11') }) }
     Assert-Equal '複数の期待（順番は比べない）' ('{0}/{1}' -f (Get-Verdict $twoIps 'web.test'), (Get-Cell $twoIps 'web.test' '期待する IP')) 'OK/10.0.2.10;10.0.2.11'
     $v6Expected = Invoke-Fake @{ Args = @{ Target = 'web.test=2001:DB8:0::10' }; Os = $webOs; Zone = $webZone }
     Assert-Equal 'IPv6 の期待は書き方をそろえて比べる' ('{0}/{1}' -f (Get-Verdict $v6Expected 'web.test'), (Get-Cell $v6Expected 'web.test' '期待する IP')) 'OK/2001:db8::10'
     $hostsOkDnsOld = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.10' }; Hosts = '10.0.2.10 web.test'; Os = @{ 'web.test' = @('10.0.2.10') }; Zone = (New-Zone @{ 'web.test' = @('10.2.2.2') }) }
-    Assert-Equal 'hosts が期待どおりでも DNS が古ければ注意' ('{0}/{1}' -f (Test-Note $hostsOkDnsOld 'web.test' '期待する IP アドレスと違う（DNS サーバー'), (Test-Note $hostsOkDnsOld 'web.test' '（OS の結果）')) 'True/False'
+    Assert-Equal 'hosts が期待どおりでも DNS が古ければ注意' ('{0}/{1}' -f (Test-Note $hostsOkDnsOld 'web.test' '期待する IP アドレスと違う（DNS サーバー'), (Test-Note $hostsOkDnsOld 'web.test' 'OS の結果')) 'True/False'
     $expectNoDns = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.10' }; Os = @{ 'web.test' = @('10.0.2.10') } }
     Assert-Equal 'DNS に名前がなければ期待と違う' (Test-Note $expectNoDns 'web.test' '期待する IP アドレスと違う（DNS サーバー') 'True'
     $expectDead = Invoke-Fake @{ Args = @{ Target = 'web.test=10.0.2.10'; Server = '10.0.0.99' }; Os = @{ 'web.test' = @('10.0.2.10') }; Errors = $deadErrors }
@@ -577,6 +609,9 @@ exit $LASTEXITCODE
     Assert-Equal '登録がなければ判定を変えない' ('{0}/{1}/{2}' -f (Get-Verdict $revNone 'web.test'), (Test-Note $revNone 'web.test' '逆引きの登録がない（10.0.0.1）'), (Get-Cell $revNone 'web.test' '逆引き')) 'OK/True/10.0.0.1: なし'
     $revMulti = Invoke-Fake @{ Args = @{ Target = 'web.test'; Reverse = $true }; Os = @{ 'web.test' = @('10.0.0.1', '10.0.0.2') }; Zone = (New-Zone @{ 'web.test' = @('10.0.0.1', '10.0.0.2') }); Ptr = @{ '10.0.0.1' = @('web.test') } }
     Assert-Equal 'IP アドレスごとに書く' (Get-Cell $revMulti 'web.test' '逆引き') '10.0.0.1: 一致 / 10.0.0.2: なし'
+    $revManyIps = @('10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4', '10.0.0.5', '10.0.0.6')
+    $revMany = Invoke-Fake @{ Args = @{ Target = 'web.test'; Reverse = $true; Server = '10.0.0.66' }; Os = @{ 'web.test' = $revManyIps }; Zone = (New-Zone @{ 'web.test' = $revManyIps }); Errors = @{ '10.0.0.66' = @{ PTR = 1460; Except = @('10.0.0.3', '10.0.0.4', '10.0.0.5', '10.0.0.6') } }; Ptr = @{ '10.0.0.3' = @('other.test'); '10.0.0.4' = @('x.test', 'y.test') } }
+    Assert-Equal '逆引きの備考は、同じ言葉の IP アドレスをまとめる' (Get-Cell $revMany 'web.test' '備考') '逆引きの名前が違う（10.0.0.3 → other.test、10.0.0.4 → x.test, y.test）、逆引きを聞けなかった（10.0.0.1、10.0.0.2）、逆引きの登録がない（10.0.0.5、10.0.0.6）'
     $revOff = Invoke-Fake @{ Args = @{ Target = 'web.test' }; Os = $revOs; Zone = $revZone; Ptr = @{ '10.0.0.1' = @('other.test') } }
     Assert-Equal '-Reverse がなければ聞かない' ('{0}/{1}/{2}' -f (Get-Cell $revOff 'web.test' '逆引き'), (Get-QueryCount $revOff '* PTR *'), (Get-Verdict $revOff 'web.test')) '/0/OK'
     $revFail = Invoke-Fake @{ Args = @{ Target = 'none.test'; Reverse = $true } }
@@ -1164,7 +1199,7 @@ try {
         Assert-Equal '本物: A / AAAA の登録がない' ('{0}/{1}/{2}' -f (Get-Verdict $live 'nodata.test'), (Get-Cell $live 'nodata.test' '引けた元'), (Get-Cell $live 'nodata.test' 'DNS の結果')) "OK/その他/${dnsNormal}: A / AAAA の登録がない"
         Assert-Equal '本物: 名前が存在しない' ('{0}/{1}' -f (Get-Verdict $live 'none.test'), (Get-Cell $live 'none.test' 'DNS の結果')) "引けない/${dnsNormal}: 名前が存在しない"
         $liveExpect = Invoke-Fake @{ Args = @{ Target = 'v4.test=10.0.0.3,web.test=10.0.0.9'; Server = $dnsNormal }; RealDns = $true; Os = $liveOs }
-        Assert-Equal '本物: 期待する IP アドレス' ('{0}/{1}' -f (Get-Verdict $liveExpect 'v4.test'), (Test-Note $liveExpect 'web.test' "期待する IP アドレスと違う（DNS サーバー $dnsNormal）")) 'OK/True'
+        Assert-Equal '本物: 期待する IP アドレス' ('{0}/{1}' -f (Get-Verdict $liveExpect 'v4.test'), (Get-Cell $liveExpect 'web.test' '備考')) "OK/期待する IP アドレスと違う（OS の結果、DNS サーバー $dnsNormal）"
         $liveDiff = Invoke-Fake @{ Args = @{ Target = 'web.test'; Server = "$dnsNormal,$dnsOther" }; RealDns = $true; Os = $liveOs }
         Assert-Equal '本物: サーバーによって答えが違う' (Test-Note $liveDiff 'web.test' 'DNS サーバーによって答えが違う') 'True'
         $liveErr = Invoke-Fake @{ Args = @{ Target = 'web.test'; Server = "$dnsServfail,$dnsRefused,$closedDns,$dnsNormal" }; RealDns = $true; Os = $liveOs }
