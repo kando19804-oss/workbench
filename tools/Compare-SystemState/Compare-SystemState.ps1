@@ -507,16 +507,24 @@ function Open-MachineKey([string]$SubKey, [string]$View) {
     return $base.OpenSubKey($SubKey)
 }
 
-# ユーザーごとのサービスの種類を、レジストリの Type から調べる。
-# SERVICE_USER_SERVICE（0x40）はユーザーごとのサービス、SERVICE_USERSERVICE_INSTANCE（0x80）はログオンごとの実体（末尾が変わる）
-function Get-ServiceTypeBits([string]$Name) {
+# サービスのレジストリから、種類（Type）とトリガーの有無を調べる。
+# Type の SERVICE_USER_SERVICE（0x40）はユーザーごとのサービス、SERVICE_USERSERVICE_INSTANCE（0x80）はログオンごとの実体（末尾が変わる）。
+# TriggerInfo があるサービスは、Windows が必要なときに開始する（services.msc の「トリガー開始」）
+function Get-ServiceKeyInfo([string]$Name) {
+    $info = [pscustomobject]@{ Bits = 0; Trigger = $false }
     try {
         $key = Open-MachineKey ('SYSTEM\CurrentControlSet\Services\' + $Name) 'Default'
         if ($key) {
-            try { return [int]$key.GetValue('Type', 0) } finally { $key.Dispose() }
+            try {
+                $info.Bits = [int]$key.GetValue('Type', 0)
+                $triggerKey = $key.OpenSubKey('TriggerInfo')
+                if ($triggerKey) { $info.Trigger = $true; $triggerKey.Dispose() }
+            } finally {
+                $key.Dispose()
+            }
         }
     } catch { }
-    return 0
+    return $info
 }
 
 function Read-ItemService($Rows) {
@@ -528,10 +536,15 @@ function Read-ItemService($Rows) {
         if ($stateNames.ContainsKey($state)) { $state = $stateNames[$state] }
         $mode = [string]$s.StartMode
         if ($modeNames.ContainsKey($mode)) { $mode = $modeNames[$mode] }
-        if ($mode -eq '自動' -and (Get-OptionalValue $s 'DelayedAutoStart')) { $mode = '自動（遅延）' }
+        $keyInfo = Get-ServiceKeyInfo $name
+        # services.msc と同じく、遅延開始とトリガー開始を書き添える（「自動（遅延・トリガー）」「手動（トリガー）」）
+        $marks = @()
+        if ($mode -eq '自動' -and (Get-OptionalValue $s 'DelayedAutoStart')) { $marks += '遅延' }
+        if ($keyInfo.Trigger -and ($mode -eq '自動' -or $mode -eq '手動')) { $marks += 'トリガー' }
+        if ($marks.Count -gt 0) { $mode = '{0}（{1}）' -f $mode, ($marks -join '・') }
         $user = [string]$s.StartName
         # ユーザーごとのサービスは、ログオンのたびに名前の末尾と状態が変わるので、末尾を除いた名前にまとめ、状態と実行ユーザーは比べない
-        $bits = Get-ServiceTypeBits $name
+        $bits = $keyInfo.Bits
         if (($bits -band 0x40) -ne 0) {
             if (($bits -band 0x80) -ne 0) { $name = $name -replace '_[0-9a-fA-F]+$', '' }
             $state = ''
@@ -1047,13 +1060,28 @@ function Compare-Item([string]$Name, $RefTable, $DifTable, $Results, [bool]$RefP
             if ([string]::Equals($refRow[$index], $difRow[$index], [StringComparison]::Ordinal)) { continue }
             $isMinor = $isDynamic
             $rowNote = $note
-            # 手動開始のサービスは、必要なときだけ起動して止まるので、状態の変化だけなら通常の動き
+            # 手動開始のサービスと、遅延開始でトリガーも持つサービスは、Windows が必要なときに起動して止めるので、状態の変化だけなら通常の動き
             if ($Name -eq 'Service' -and $column -eq '状態') {
                 $modeIndex = $def.Index['スタートアップ']
-                if ($refRow[$modeIndex] -eq '手動' -and $difRow[$modeIndex] -eq '手動') {
+                $refMode = $refRow[$modeIndex]
+                $difMode = $difRow[$modeIndex]
+                if ($refMode.StartsWith('手動', [StringComparison]::Ordinal) -and $difMode.StartsWith('手動', [StringComparison]::Ordinal)) {
                     $isMinor = $true
                     $rowNote = '手動開始のサービスの状態の変化'
+                } elseif ($refMode -eq '自動（遅延・トリガー）' -and $difMode -eq '自動（遅延・トリガー）') {
+                    $isMinor = $true
+                    $rowNote = '遅延開始・トリガー開始のサービスの状態の変化'
+                } elseif ($refMode -eq '自動（トリガー）' -and $difMode -eq '自動（トリガー）' -and $refRow[$index] -eq '停止' -and $difRow[$index] -eq '実行中') {
+                    # 遅延でないトリガー開始のサービス（gpsvc など）は、Windows がトリガーで起動したものだけ通常の動きとする。
+                    # LanmanServer や Dnscache も同じ設定なので、止まったほうは違いに数える
+                    $isMinor = $true
+                    $rowNote = 'トリガー開始のサービスの起動'
                 }
+            }
+            # UDP は、同じ番号を複数のプロセスが共有することがある（mDNS の 5353 番など）ので、プロセス名の変化だけなら通常の動き
+            if ($Name -eq 'Port' -and $column -eq 'プロセス名' -and $refRow[0] -eq 'UDP' -and -not $isDynamic) {
+                $isMinor = $true
+                $rowNote = 'UDP の番号を使うプロセスの変化'
             }
             if ($isMinor) { $counts.Minor++ } else { $counts.Changed++ }
             $screen = if ($def.Hidden -contains $column) { '{0}が変わりました' -f $column } else { '{0}: {1} → {2}' -f $column, $refRow[$index], $difRow[$index] }
