@@ -609,7 +609,9 @@ try {
         # 問い合わせが共有違反になったのに、開けるかの確認でも確かめられなければ、調べられなかったものとして残す
         $sharedCheck = $openChecks[$shared]
         if ($sharedCheck.Read -ne '可' -and $sharedCheck.Read -ne $InUseText -and $sharedCheck.Write -ne $InUseText) {
-            Add-Skip 'その他のエラー' $shared ('問い合わせが共有違反になり、開けるかも確かめられません（{0}）' -f $sharedCheck.Read)
+            # 理由は「不可（権限なし）」の括弧の中だけを書く（括弧を二重にしない）
+            $reason = if ($sharedCheck.Read -eq '確かめていない') { 'オンライン専用ファイル' } else { $sharedCheck.Read -replace '^不可（(.*)）$', '$1' }
+            Add-Skip 'その他のエラー' $shared ('問い合わせが共有違反になり、開けるかも確かめられません（{0}）' -f $reason)
         }
     }
     foreach ($client in $clients) {
@@ -776,7 +778,7 @@ try {
         $tail.Add((Format-Invariant '結果: 使用中   プロセス {0:N0} 個  クライアント {1:N0} 件   所要 {2}' $pidSet.Count $clientList.Count $elapsed))
     } elseif ($blockedUnknown) {
         $tail.Add(('結果: 使用中（使っているものは特定できません）   所要 {0}' -f $elapsed))
-        $tail.Add('※ 使っているものは見つかりませんが、書き込みで開けないファイルがあります。別の PC から共有フォルダ経由で使われているかもしれません。ファイルサーバーの上で実行してください')
+        $tail.Add('※ 使っているものは見つかりませんが、書き込みで開けないファイルがあります。OS やドライバーが使っているか（pagefile.sys など）、別の PC から共有フォルダ経由で使われているのかもしれません。共有フォルダのファイルなら、ファイルサーバーの上で実行してください')
     } else {
         $tail.Add(('結果: 使用中のものは見つかりません   所要 {0}' -f $elapsed))
     }
