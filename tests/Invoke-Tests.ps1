@@ -27,6 +27,7 @@ param(
 
 Set-StrictMode -Version 2.0
 
+$EndMark = '  END'   # 各テストが、最後の exit の直前に出す行
 $targets = @(@{ Exe = 'powershell.exe'; Label = 'Windows PowerShell 5.1' })
 if (Get-Command pwsh -ErrorAction SilentlyContinue) {
     $targets += @{ Exe = 'pwsh'; Label = 'PowerShell 7' }
@@ -67,6 +68,13 @@ $results = foreach ($file in $testFiles) {
         $crashed = $false
         try {
             & $file.FullName -Exe $target.Exe | ForEach-Object { $lines.Add($_) }
+            # テストは、例外にならずに黙って終わることがある（Get-WinEvent -ListLog を Select-Object -First で受けたときなど）。
+            # そのときは合格の数が減るだけで気づけないので、テストの最後の行まで来たかを確かめる。
+            # テストの外に印を置いても、黙って終わるのはテストのスクリプトだけなので、印は出てしまう
+            if (@($lines | Where-Object { "$_" -ceq $EndMark }).Count -eq 0) {
+                $crashed = $true
+                Write-Host ('  テストが最後まで走りませんでした（例外は出ていません）。テストの exit の直前に ''{0}'' を出しているか、途中で黙って終わっていないかを確かめてください' -f $EndMark) -ForegroundColor Red
+            }
         } catch {
             $crashed = $true
             Write-Host ('  テストが途中で止まりました: {0}' -f $_.Exception.Message) -ForegroundColor Red
