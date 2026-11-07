@@ -16,6 +16,12 @@ Connectivity_*/
 PortProcess_*/
 SearchLog_*/
 
+# Find-NetworkDevice の実行結果（既定ではスクリプトと同じフォルダに保存される）
+NetworkDevice_*/
+
+# Search-EventLog の実行結果（既定ではスクリプトと同じフォルダに保存される）
+EventLog_*/
+
 # Compare-Folder の実行結果とスナップショット（既定ではスクリプトと同じフォルダに保存される）
 FolderDiff_*/
 FolderSnapshot_*/
