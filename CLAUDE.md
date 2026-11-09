@@ -97,6 +97,9 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - `NtQueryInformationFile` の `FileProcessIdsUsingFileInformation`（情報クラス 47）は、PC 全体のハンドルをたどるため、1 回に 30～40 ミリ秒かかる（ハンドルが 18.8 万個の PC。開くのは 0.1 ミリ秒）。フォルダの中を 1 件ずつ問い合わせると、1 万件で 5～6 分かかる。並べると本数どおり速くなる。問い合わせに使ったハンドル（属性の読み取りだけ）は結果に入らない。自分の PID が出るのは、読み込んでいる DLL や現在のフォルダを調べたとき
 - `[IO.Directory]::Delete($path, $true)` は、中にジャンクションがあると、ジャンクションを消したうえで「アクセスが拒否されました」の例外を出し、親のフォルダが残る（5.1 と 7 の両方。管理者でない環境で確かめた）。先にリンクだけを `[IO.Directory]::Delete($link)`（再帰なし）で消す
 - フォルダの ACL で一覧（RD）だけを拒否しても、親のフォルダを一覧できれば、そのフォルダの属性は読める（属性の読み取りだけで開ける）。読み取り（R）をまとめて拒否すると、開くことも一覧もできない
+- ファイアウォールの実際に効いている規則（`-PolicyStore ActiveStore`）は、管理者でないと権限のエラーになる。`-PolicyStore` なしの `Get-NetFirewallRule` は管理者でなくても読める（別の一覧なので、件数は同じとは限らない）
+- Windows 11 のサービスは、何もしなくても変わる。`gpsvc`（自動・トリガー）と `sppsvc`（自動・遅延・トリガー）は止まったり動いたりする。`BITS` はスタートアップまで変わることがある（自動（遅延）から手動へ。1 回見ただけで、原因は未確認）。トリガー開始かどうかは `HKLM\SYSTEM\CurrentControlSet\Services\<名前>\TriggerInfo` の有無で分かる
+- mDNS の UDP 5353 番は複数のプロセス（ブラウザー、svchost など）が共有するので、番号から調べたプロセス名は毎回変わる
 
 ## テストの書き方の注意
 
@@ -119,6 +122,9 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - テストの大きな `try` には `catch` を付けて、途中で止まったら失敗に数える。`catch` がないと、コマンドレットの止まるエラー（`Import-Csv` のファイルがないなど）のあと、何も言わずに `try` の後ろの `END` まで進む（`throw` ならスクリプトごと止まる）。Invoke-Tests でも合格の数が減るだけで、気づけない
 - 制約付き言語モードは、環境変数 `__PSLockdownPolicy` では試せない（5.1 はプロセスの環境変数では効かず、コンピューター全体の設定は環境を汚す）。起動した PowerShell の中で `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'` にしてから、`&` でツールを呼ぶ（5.1 と 7 の両方で効く）
 - わざとバグのテストを `Start-Process` で並べて流すときは、`-WorkingDirectory` に各コピーのフォルダを渡す。渡さないと、保存先を変えるバグが、起動した側の現在のフォルダ（リポジトリ）に結果を作る
+- COM の偽物を `Add-Member -MemberType ScriptMethod` で作ると、例外の包まれ方が本物と違う（本物は `MethodInvocationException` や `GetValueInvocationException` に包まれて届く）。例外の処理を確かめるときは、C# のクラスで作る（`tests/Compare-SystemState.Tests.ps1` を参照）
+- `New-Object` を global の関数で差し替えるときは、本物の結果を `,` で包んで返す。包まないと、コレクションが要素に分かれて出てくる
+- コマンドプロンプトの `\"` のヒントは、後ろに引数を続けて確かめる。`"C:\data\"` が最後の引数なら、残った `"` を外して普通に動くツールがある（`Remove-Quote`）。PowerShell から `cmd /c` に直接書くと引用符が変わるので、`.cmd` ファイルに書いて起動する
 
 ## コミット
 
