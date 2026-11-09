@@ -125,6 +125,7 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - COM の偽物を `Add-Member -MemberType ScriptMethod` で作ると、例外の包まれ方が本物と違う（本物は `MethodInvocationException` や `GetValueInvocationException` に包まれて届く）。例外の処理を確かめるときは、C# のクラスで作る（`tests/Compare-SystemState.Tests.ps1` を参照）
 - `New-Object` を global の関数で差し替えるときは、本物の結果を `,` で包んで返す。包まないと、コレクションが要素に分かれて出てくる
 - コマンドプロンプトの `\"` のヒントは、後ろに引数を続けて確かめる。`"C:\data\"` が最後の引数なら、残った `"` を外して普通に動くツールがある（`Remove-Quote`）。PowerShell から `cmd /c` に直接書くと引用符が変わるので、`.cmd` ファイルに書いて起動する
+- `[powershell]::Create()` の `Stop()` は、動いている最中に呼んでも、取りこぼして最後まで動き続けることがある（5.1 でも 7 でも。Convert-TextEncoding のテストの条件で 10 回に 5 回）。止まることを確かめる項目は、1 回の結果で判定せず、何度か試す
 
 ## コミット
 
