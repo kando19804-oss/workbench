@@ -32,5 +32,21 @@ TaskList_*/
 # Convert-TextEncoding の実行結果（既定ではスクリプトと同じフォルダに保存される）
 TextEncoding_*/
 
+# Find-DuplicateFile の実行結果（既定ではスクリプトと同じフォルダに保存される）
+DuplicateFile_*/
+
+# Get-CertificateExpiry の実行結果（既定ではスクリプトと同じフォルダに保存される）
+CertificateExpiry_*/
+
+# Test-NameResolution の実行結果（既定ではスクリプトと同じフォルダに保存される）
+NameResolution_*/
+
+# Find-FileLock の実行結果（既定ではスクリプトと同じフォルダに保存される）
+FileLock_*/
+
+# Compare-SystemState の実行結果とスナップショット（既定ではスクリプトと同じフォルダに保存される。パスワードが含まれることがある）
+SystemDiff_*/
+SystemSnapshot_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
