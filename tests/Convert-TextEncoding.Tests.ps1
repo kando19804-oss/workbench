@@ -661,7 +661,7 @@ try {
         '''AFTER='' + @(Get-ChildItem -LiteralPath $OutRoot -Directory -ErrorAction SilentlyContinue).Count'
         '''MESSAGE='' + @($ps.Streams.Information | Where-Object { $_.MessageData.ToString() -like ''中断*'' } | ForEach-Object { $_.MessageData.ToString() })'
     )
-    # 5.1 の Stop() は、止める合図を取りこぼして、最後まで動き続けることがある（7 では起きない）。止まるまで 3 回まで試す
+    # Stop() は、動いている最中に呼んでも、止める合図を取りこぼして最後まで動き続けることがある（5.1 でも 7 でも）。止まるまで 3 回まで試す
     $stopped = $false
     for ($attempt = 1; $attempt -le 3 -and -not $stopped; $attempt++) {
         $result = Invoke-Helper $stopScript @('-Tool', $tool, '-Target', $many, '-OutRoot', (Join-Path $workRoot "out\stop-scan$attempt"), '-Mode', 'scan')
@@ -677,7 +677,8 @@ try {
     $broken   = New-Object 'System.Collections.Generic.List[string]'
     $noBackup = New-Object 'System.Collections.Generic.List[string]'
     $stopped  = $false
-    for ($attempt = 1; $attempt -le 3 -and -not $stopped; $attempt++) {
+    # 取りこぼしは、このテストの条件だと 10 回に 5 回ほど起きる（3 回では 1 割ほどが全部外れて、たまに失敗していた）。止まるまで 10 回まで試す
+    for ($attempt = 1; $attempt -le 10 -and -not $stopped; $attempt++) {
         for ($i = 1; $i -le 1500; $i++) { [IO.File]::WriteAllBytes((Join-Path $many ('f{0:0000}.txt' -f $i)), $manyText) }
         $stopOut = Join-Path $workRoot "out\stop-conv$attempt"
         $result = Invoke-Helper $stopScript @('-Tool', $tool, '-Target', $many, '-OutRoot', $stopOut, '-Mode', 'convert')
@@ -704,10 +705,10 @@ try {
         Assert-Equal '変換の途中: 変換しなかったファイルの備考' (@($x.Files | Where-Object { $_.'結果' -eq '変換しなかった' } | ForEach-Object { $_.'備考' } | Select-Object -Unique) -join ',') '中断したため、変換していません'
         Assert-Equal '変換の途中: 表示' ((ConvertTo-FlatText $result['MESSAGE']) -like '中断しました。それまでに変換したファイルと、控えたファイルは残っています*') 'True'
     } elseif ($hostTag -eq '7') {
-        # 7 の Stop() は確実に効くため、止まらなければ、中断したときの処理の誤り
+        # 10 回続けて止まらなければ、取りこぼしではなく、中断したときの処理の誤り
         Assert-Equal '変換の途中で中断（7）' '止まらなかった' '止まった'
     } else {
-        Write-Skip '変換の途中で中断' '止める前に変換し終わったか、5.1 の Stop() が効かなかったため（3 回試した）'
+        Write-Skip '変換の途中で中断' '止める前に変換し終わったか、5.1 の Stop() が効かなかったため（10 回試した）'
     }
 
     Write-Section 'Ctrl+C（変換するときは、コンソールのキーの入力として受け取って止める）'
