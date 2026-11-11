@@ -28,7 +28,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-ServerInventory.ps1 -NoSave
 
 | パラメーター | 内容 | 既定値 |
 | --- | --- | --- |
-| `-OutputFolder` | 結果の保存先 | スクリプトと同じフォルダ |
+| `-OutputFolder` | 結果の保存先。管理者として開いた PowerShell からは、通常の権限で割り当てたネットワークドライブ（`Z:\` など）が見えないため、共有フォルダは `\\server\share` の形で指定してください | スクリプトと同じフォルダ |
 | `-NoSave` | 結果を保存せず、画面表示だけにします。`-OutputFolder` と一緒には使えません | なし |
 
 - 取る項目は、いつもすべてです。項目を選ぶパラメーターと設定ファイル（`-ConfigFile`）はありません。すべて取っても短い時間で終わり、変える条件がないためです
@@ -62,7 +62,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-ServerInventory.ps1 -NoSave
 | | インストール日 | `2024-04-01 10:00:00` |
 | | 最終起動 | `2026-11-03 23:05:00` |
 | | Windows フォルダ | `C:\Windows` |
-| | 表示言語 | `ja-JP` |
+| | OS の言語 | `ja-JP`（インストールしたときの言語。英語版に日本語の言語パックを入れて表示しているサーバーでは `en-US`） |
 | | システムロケール | `ja-JP` |
 | | タイムゾーン | `(UTC+09:00) 大阪、札幌、東京` |
 | | ライセンス認証 | `認証済み（VOLUME_KMSCLIENT）` `認証済み（TIMEBASED_EVAL、期限 2027-01-21）` `通知（TIMEBASED_EVAL）` |
@@ -75,7 +75,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-ServerInventory.ps1 -NoSave
 | | 使えるメモリ | `15.9 GB` |
 | | スロット `<スロットの名前>` | `8.0 GB、3,200 MHz、Crucial Technology CT8G4DFRA32A`（スロットごとに 1 行） |
 | 仮想メモリ | 管理 | `自動`（すべてのドライブのページングファイルのサイズを自動的に管理する）か `手動` |
-| | ページファイル `<パス>` | `初期 4,096 MB、最大 8,192 MB（現在 4,096 MB）` `システム管理サイズ（現在 2,048 MB）`（ファイルごとに 1 行） |
+| | ページファイル `<パス>` | `初期 4,096 MB、最大 8,192 MB（現在 4,096 MB）` `システム管理サイズ（現在 2,048 MB）` `自動（現在 4,096 MB）` `設定なし（現在 2,048 MB）`（設定を変えて、まだ再起動していないとき）（ファイルごとに 1 行。ページファイルがないときは、項目「ページファイル」・値「なし」の 1 行） |
 | メモリダンプ | 種類 | `自動メモリダンプ` `カーネルメモリダンプ` `完全メモリダンプ` `アクティブメモリダンプ` `最小メモリダンプ` `なし` |
 | | 保存先 | `%SystemRoot%\MEMORY.DMP` |
 | | 自動的に再起動 | `する` か `しない` |
@@ -95,7 +95,8 @@ powershell -ExecutionPolicy Bypass -File .\Get-ServerInventory.ps1 -NoSave
 | ネットワーク | DNS サフィックスの検索一覧 | `corp.example.local, example.local` |
 
 - ライセンス認証は、状態（`認証済み` `未認証` `猶予期間` `通知` など）と、かっこの中にチャネル（`RETAIL` `OEM_DM` `VOLUME_MAK` `VOLUME_KMSCLIENT` `TIMEBASED_EVAL` など）を書きます。評価版と猶予期間のときは、期限の日付も書き添えます（評価版は、期限が切れると 1 時間ごとにシャットダウンすることがあるためです）。KMS の認証は 7 日ごとに自動で更新されて期限が変わるので、書き添えません
-- 時刻同期と Windows Update は、グループポリシーで指定されていれば、その値を書きます。どちらから読んだかは備考に書きます
+- 時刻同期と Windows Update は、グループポリシーで指定されていれば、その値を書きます。どちらから読んだかは備考に書きます。リモートデスクトップも、グループポリシーで指定されていればその値を書き、備考に「グループポリシー」と書きます
+- 時刻同期の種類が NT5DS か NoSync のときは、NTP サーバーは使われません。ドメインに参加したサーバーにも既定の `time.windows.com,0x9` が残っていることが多いので、備考に「種類が NT5DS のため使われません」と書き添えます
 - ファイアウォールは、管理者のときはグループポリシーの分も含めた実際に効いている設定を、管理者でないときはこの PC で設定した値を書きます（実際に効いている設定は、管理者でないと読めないためです）。管理者でないときは、備考に「グループポリシーの分を含みません」と書きます
 - 取れなかった値は空欄にして、備考に理由を書きます
 
@@ -105,8 +106,8 @@ powershell -ExecutionPolicy Bypass -File .\Get-ServerInventory.ps1 -NoSave
 | --- | --- |
 | `disks.csv` | 物理ディスク。Windows のディスクの管理に出るもの（記憶域スペースの仮想ディスクや iSCSI のディスクも含みます） |
 | `volumes.csv` | パーティションごとの容量と空き。ドライブ文字のない EFI システムパーティションや回復パーティションも含みます |
-| `network.csv` | ネットワーク接続の画面に出るアダプター。切断中・無効・仮想のアダプターも含みます |
-| `routes.csv` | 再起動しても残る静的ルート（`route -p` や `New-NetRoute` で足したもの） |
+| `network.csv` | ネットワーク接続の画面に出るアダプター。切断中・無効・仮想のアダプターも含みます。無効のアダプターは、IP アドレスなどの設定が空欄になります（Windows が使っていない設定は読まないためです） |
+| `routes.csv` | 再起動しても残る静的ルート（`route -p` や `New-NetRoute` で足したもの）。固定 IP の設定で指定したデフォルトゲートウェイ（宛先 `0.0.0.0/0`）も、ここに出ることがあります |
 | `features.csv` | Windows Server では、サーバーマネージャーの「役割と機能」でインストール済みのもの。Windows 10 / 11 では、「Windows の機能」で有効なもの |
 | `software.csv` | インストール済みソフト。Windows の「プログラムと機能」に出るもの（コンピューター全体にインストールしたものだけ） |
 | `hotfixes.csv` | 更新プログラム（`Win32_QuickFixEngineering` の一覧）。新しい累積更新を入れると古いものが一覧から消えることがあるので、適用の状態は parameters.csv の OS のビルドと合わせて見てください |
@@ -115,11 +116,11 @@ powershell -ExecutionPolicy Bypass -File .\Get-ServerInventory.ps1 -NoSave
 | `localgroups.csv` | ローカルグループのメンバー（Administrators など） |
 | `shares.csv` | 共有フォルダ。管理共有（`ADMIN$`、`C$` など）も含みます |
 
-取るものの範囲は、[Compare-SystemState](../Compare-SystemState/README.md#取るものの範囲) と同じです。
+サービス、インストール済みソフト、ローカルユーザー・グループ、共有フォルダの範囲は、[Compare-SystemState](../Compare-SystemState/README.md#取るものの範囲) と同じです（ルートは違い、このツールは再起動しても残る静的ルートだけを取ります）。
 
 - **サービス**：スタートアップには、services.msc と同じく、遅延開始とトリガー開始を書き添えます（`自動（遅延）` `手動（トリガー）` など）。ログオンごとに名前の末尾が変わるユーザーごとのサービス（`CDPUserSvc_1a2b3` など）は、末尾を除いた名前で 1 つにまとめます
 - **インストール済みソフト**：同じ名前で複数のバージョンがあるときは、バージョンをまとめて 1 行にします
-- **ネットワーク**：IPv4 の設定を中心に取ります。IPv6 は、有効かどうかとアドレス（リンクローカルの `fe80::` を除く）だけです
+- **ネットワーク**：IPv4 の設定を中心に取ります。IPv6 は、有効かどうかとアドレスだけです。IPv6 のアドレスは、リンクローカル（`fe80::`）と一時アドレス（数時間ごとに変わるもの。`ipconfig` で「一時 IPv6 アドレス」と表示されるもの）を除きます
 - **ローカルユーザー・グループ**：ドメインコントローラーにはローカルユーザーがないので取らず、`skipped.csv` に「対象外」と残します。名前を解決できないメンバーは、SID のまま書きます
 
 ### 取らないもの
@@ -189,7 +190,8 @@ SERVER01   2026-11-11 21:30:00   管理者: はい
 - 条件によって、次の行も表示します
   - 取れなかった項目があるとき：「※ 取れなかった項目が 2 件あります（skipped.csv を確認してください）」
   - 管理者でなく、権限がなくて取れなかったものがあるとき：「※ 管理者として実行すると、取れる情報が増えます」
-  - 管理者でないとき：ファイアウォールの行に「（この PC の設定。グループポリシーの分を含みません）」
+  - 管理者でないとき：ファイアウォールの行に「（グループポリシーの分を含みません）」
+- ドメインに参加していないときは、「ドメイン」の行を「ワークグループ」と表示します（例: `ワークグループ  WORKGROUP（スタンドアロンのサーバー）`）
 - `-NoSave` のときと、保存できなかったときは、`skipped.csv` がないので、「skipped.csv を」の案内を「下の一覧を」に変え、理由の一覧を画面の最後に表示します
 
 ## 終了コード
@@ -243,12 +245,12 @@ CSV は BOM 付き UTF-8 で保存するため、Excel でダブルクリック�
 | `skipped.csv` | 理由、項目、詳細 |
 
 - 容量は、Windows の表示と同じく 1,024 で割った GB で、小数 1 桁まで書きます。バイトの列と数値は、`200,047,001,600` のように 3 桁区切りで書きます
-- 1 つのセルに値が複数あるとき（IP アドレス、DNS サーバーなど）は、`, ` で区切ります。DNS サーバーは設定の順、ほかは並べ替えた順です
+- 1 つのセルに値が複数あるとき（IP アドレス、DNS サーバーなど）は、`, ` で区切ります。DNS サーバーと DNS サフィックスの検索一覧は設定の順（問い合わせる順に意味があるため）、ほかは並べ替えた順です
 - 日時は `2026-11-11 21:30:00` の形で書きます
 - `features.csv` の種類は、Windows Server では「役割」「役割サービス」「機能」、Windows 10 / 11 では「Windows の機能」です。親は、役割サービスや下の階層の機能のときに、上の階層の名前を書きます
 - `volumes.csv` の種類は、「基本」「EFI システム」「予約（MSR）」「回復」などです。ドライブは、ドライブ文字かマウント先です
 - `network.csv` の状態は、「接続」「切断」「無効」です。ネットワークの種類は、「ドメイン」「プライベート」「パブリック」です
-- `shares.csv` の種類は、「ディスク」「プリンター」「IPC」「管理共有」です
+- `shares.csv` の種類は、「ディスク」「プリンター」「IPC」「管理共有」などです（ほかに「デバイス」「管理共有（プリンター）」など。表にない種類は、数値のまま書きます）
 - 名前や値のうち、Excel で数値・日付・数式に変わるもの（BIOS のバージョンの `2212`、ソフトのバージョンの `16.0` など）は、`="..."` の形で書きます。Excel では `2212` と表示されます
 - `skipped.csv` の理由は、「権限なし」「対象外」「その他のエラー」のいずれかです
 
@@ -265,7 +267,7 @@ CSV は BOM 付き UTF-8 で保存するため、Excel でダブルクリック�
 | --- | --- |
 | `-NoSave` と `-OutputFolder` を一緒に指定した | 「-NoSave のときは、-OutputFolder は指定できません」 |
 | 値に `"` が残っている（コマンドプロンプトで `"C:\data\"` のように最後を `\"` にした） | 「-OutputFolder の値に引用符（"）が残っています: …」と、正しい書き方 |
-| 保存先に書き込めない | 「保存先に書き込めません: \\fileserver\inventory（理由）」と、「-NoSave を付けると、画面に表示だけします」 |
+| 保存先に書き込めない | 「保存先に書き込めません: \\fileserver\inventory（理由）」と、「-NoSave を付けると、画面に表示だけします」。管理者として実行していて、ドライブが見つからないときは、「管理者として実行した PowerShell からは、通常の権限で割り当てたネットワークドライブは見えません。\\server\share の形で指定してください」も表示します |
 | 制約付き言語モード（AppLocker や WDAC の環境） | 「制約付き言語モードでは使えません（AppLocker や WDAC でスクリプトの実行が制限されている環境です）」 |
 
 集めた後で保存に失敗したとき（ディスクがいっぱいなど）は、警告を表示し、画面の表示だけで終わります（終了コード 1）。
@@ -276,17 +278,17 @@ CSV は BOM 付き UTF-8 で保存するため、Excel でダブルクリック�
 | --- | --- |
 | コンピューター、OS、CPU、メモリ | CIM（`Win32_ComputerSystem`、`Win32_OperatingSystem`、`Win32_BIOS`、`Win32_Processor`、`Win32_PhysicalMemory`）と、レジストリ（`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion`）。ファームウェアの種類は Windows の API（`GetFirmwareType`）、セキュアブートはレジストリ |
 | ライセンス認証 | CIM（`SoftwareLicensingProduct`） |
-| 仮想メモリ | CIM（`Win32_ComputerSystem`、`Win32_PageFileSetting`、`Win32_PageFileUsage`） |
-| メモリダンプ、リモートデスクトップ、UAC、時刻同期、Windows Update | レジストリ（`CrashControl`、`Terminal Server`、`Policies\System`、`W32Time\Parameters`、`Policies\Microsoft\Windows\WindowsUpdate` など） |
+| 仮想メモリ | CIM（`Win32_ComputerSystem`、`Win32_PageFileUsage`）と、レジストリ（`Memory Management` の `PagingFiles`） |
+| メモリダンプ、リモートデスクトップ、UAC、時刻同期、Windows Update | レジストリ（`CrashControl`、`Terminal Server`、`Policies\System`、`W32Time\Parameters`、`Policies\Microsoft\Windows\WindowsUpdate`、グループポリシーの `Policies\Microsoft\Windows NT\Terminal Services`・`Policies\Microsoft\W32Time` など） |
 | ファイアウォール | `Get-NetFirewallProfile` |
 | 電源プラン | `powercfg /getactivescheme` |
 | ディスク、ボリューム | `Get-Disk`、`Get-Partition`、`Get-Volume`、CIM（`Win32_Volume`） |
-| ネットワーク | `Get-NetAdapter`、`Get-NetIPAddress`、`Get-NetIPInterface`、`Get-DnsClient`、`Get-DnsClientServerAddress`、`Get-NetAdapterBinding`、`Get-NetConnectionProfile`、`Get-DnsClientGlobalSetting`、CIM（`Win32_NetworkAdapterConfiguration`） |
+| ネットワーク | `Get-NetAdapter`、`Get-NetIPAddress`、`Get-NetIPInterface`、`Get-NetRoute`（ゲートウェイ。今効いているルートから読みます）、`Get-DnsClient`、`Get-DnsClientServerAddress`、`Get-NetAdapterBinding`、`Get-NetConnectionProfile`、`Get-DnsClientGlobalSetting`、CIM（`Win32_NetworkAdapterConfiguration`） |
 | 静的ルート | `Get-NetRoute -PolicyStore PersistentStore` |
 | 役割と機能 | Windows Server では `Get-WindowsFeature`（サーバーマネージャーのモジュール。Windows Server に最初から入っています）、Windows 10 / 11 では CIM（`Win32_OptionalFeature`） |
 | インストール済みソフト | レジストリ（`HKLM` の `Uninstall`） |
 | 更新プログラム、サービス、ローカルユーザー、共有フォルダ | CIM（`Win32_QuickFixEngineering`、`Win32_Service`、`Win32_UserAccount`、`Win32_Share`）。遅延開始・トリガー開始とユーザーごとのサービスの判定はレジストリ |
-| ローカルグループのメンバー | WinNT プロバイダー（`Get-LocalGroupMember` は、名前を解決できないメンバーがあると失敗するため） |
+| ローカルグループのメンバー | グループの一覧は CIM（`Win32_Group`）、メンバーは WinNT プロバイダー（`Get-LocalGroupMember` は、名前を解決できないメンバーがあると失敗するため） |
 
 すべて Windows に最初から入っている機能です。ネットワークには出ません（ドメインのメンバー名を解決するときに、ドメインコントローラーに問い合わせることはあります）。
 
