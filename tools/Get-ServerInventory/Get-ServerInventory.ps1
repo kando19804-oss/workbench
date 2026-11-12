@@ -63,7 +63,7 @@ $ErrorActionPreference = 'Stop'
 $ScriptVersion = '1.0.0'
 $ToolName      = 'Get-ServerInventory'
 $ToolTitle     = 'パラメータシート出力'
-$CellWidth     = 40       # 画面の表の IP アドレスや DNS サーバーの幅（半角の文字数）。超える分は「ほか N 件」にまとめる
+$CellWidth     = 30       # 画面の表の IP アドレスや DNS サーバーの幅（半角の文字数）。超える分は「ほか N 件」にまとめる。3 列あるので、120 桁に収まるように 30 にする
 $ParamColumns  = '分類', '項目', '値', '備考'
 $SkipColumns   = '理由', '項目', '詳細'
 $TimeFormat    = 'yyyy-MM-dd HH:mm:ss'
@@ -1144,11 +1144,22 @@ function Read-ListService($Rows) {
     $modeNames  = @{ 'Auto' = '自動'; 'Manual' = '手動'; 'Disabled' = '無効'; 'Boot' = 'ブート'; 'System' = 'システム' }
     $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $list = New-Object 'System.Collections.Generic.List[object]'
+    $unreadable = New-Object 'System.Collections.Generic.List[string]'
     foreach ($service in (Get-CimList 'Win32_Service')) {
         $name  = [string]$service.Name
         $state = [string]$service.State
         if ($stateNames.ContainsKey($state)) { $state = $stateNames[$state] }
         $mode = [string]$service.StartMode
+        $user = [string]$service.StartName
+        $displayName = [string]$service.DisplayName
+        # Windows は、設定を読む権限のないサービス（管理者でないときの LSM など）を、スタートアップ Unknown・表示名はサービス名・実行ユーザーは空で返す。
+        # 表示名はサービス名で代用されているだけなので書かず、skipped.csv に残す
+        $isUnreadable = $mode -eq 'Unknown' -or -not $mode
+        if ($isUnreadable) {
+            $mode = '不明'
+            $displayName = ''
+            $user = ''
+        }
         if ($modeNames.ContainsKey($mode)) { $mode = $modeNames[$mode] }
         $keyInfo = Get-ServiceKeyInfo $name
         # services.msc と同じく、遅延開始とトリガー開始を書き添える（「自動（遅延・トリガー）」「手動（トリガー）」）
@@ -1156,8 +1167,6 @@ function Read-ListService($Rows) {
         if ($mode -eq '自動' -and (Get-OptionalValue $service 'DelayedAutoStart')) { $marks += '遅延' }
         if ($keyInfo.Trigger -and ($mode -eq '自動' -or $mode -eq '手動')) { $marks += 'トリガー' }
         if ($marks.Count -gt 0) { $mode = '{0}（{1}）' -f $mode, ($marks -join '・') }
-        $user = [string]$service.StartName
-        $displayName = [string]$service.DisplayName
         # ユーザーごとのサービスは、ログオンのたびに名前の末尾と状態が変わるので、末尾を除いた名前にまとめ、状態と実行ユーザーは書かない。
         # 表示名にも同じ末尾が付く（「Agent Activation Runtime_2f882f」）ので外す
         $bits = $keyInfo.Bits
@@ -1173,9 +1182,13 @@ function Read-ListService($Rows) {
             $user  = ''
         }
         if (-not $seen.Add($name)) { continue }
+        if ($isUnreadable) { $unreadable.Add($name) }
         Add-Row $list $name $displayName $mode $state $user
     }
     foreach ($row in @($list.ToArray() | Sort-Object { $_[0] })) { $Rows.Add($row) }
+    foreach ($name in @($unreadable.ToArray() | Sort-Object)) {
+        Add-PartialSkip $name (New-Object UnauthorizedAccessException 'スタートアップ・表示名・実行ユーザーを読めません（サービスの設定を読む権限がありません）')
+    }
 }
 
 # ドメインコントローラーには、ローカルユーザーがない
