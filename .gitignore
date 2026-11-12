@@ -51,5 +51,8 @@ SystemSnapshot_*/
 # Get-ServerInventory の実行結果（既定ではスクリプトと同じフォルダに保存される。サーバーの構成がそのまま分かる情報を含む）
 ServerInventory_*/
 
+# Get-LogonHistory の実行結果（既定ではスクリプトと同じフォルダに保存される。ユーザー名と接続元の IP アドレスを含む）
+LogonHistory_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
