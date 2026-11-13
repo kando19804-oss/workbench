@@ -115,6 +115,12 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - `Win32_Service` は、管理者でないと設定を読めないサービス（`LSM`、`NetSetupSvc` など）を、StartMode `Unknown`・表示名はサービス名・StartName 空で返す。管理者でないと一覧に出ないサービスもある（Windows Server 2025 の `ZTHELPER`）
 - Hyper-V の動的メモリの仮想マシンでは、`Win32_ComputerSystem.TotalPhysicalMemory` はその時点で割り当てられている量で、実行するたびに変わる（起動時メモリ 8 GB の VM で 2.3～2.9 GB）。`Win32_PhysicalMemory` の合計は起動時メモリの量
 - `Get-WindowsFeature` と `Win32_QuickFixEngineering` は、Windows の更新の仕組みが忙しいとき（起動の直後など）、数分から 20 分以上かかることがある（FGTEST-FS の管理者で `Get-WindowsFeature` が 84 秒、一般ユーザーで全体が 21 分。同じ条件でも 1 秒未満のこともある）
+- `Get-WinEvent` は、使わなくても記録ごとにメッセージを組み立てるので、記録が多いと遅い。`EventLogQuery` と `EventLogReader` で読み、値は `EventLogPropertySelector`（`Event/EventData/Data[@Name='TargetLogonId']` のような XPath）で名前で取ると、数十倍速い（Security ログ 17 MB で 1.6 秒）。260 文字以上のパスは `\\?\` が要る。管理者でないときの Security は `UnauthorizedAccessException`、ないログは `EventLogNotFoundException` になる。値は記録の型のまま届き、ログオン ID は UInt64、ログオンの失敗の状態コード（HexInt32）は負の Int32 になる
+- Sort-Object の文字列の比べ方は、5.1（.NET Framework の NLS）と 7（ICU）で違う。ハイフンなどの記号の扱いが変わり、`CORP\admin` と `CORP-FS\admin`、`Security.evtx` と `Security-old.evtx` の順が入れ替わる。出力の順を 5.1 と 7 でそろえるときは、文字の番号の順になるキー（大文字にそろえた文字の番号を 16 進数で並べた文字列など）で並べる
+- 5.1 では `New-Object` が遅い（`List` を 2 万回作ると 1.6 秒。`[System.Collections.Generic.List[object]]::new()` なら 0.02 秒）。関数の呼び出しも 1 回 13 マイクロ秒ほどかかり、`Add-Member` をパイプで 4 万回呼ぶと 5.6 秒かかる（プロパティを作るときに用意して代入すれば 0.04 秒）。何万件も回るループの中では避ける
+- `Set-StrictMode -Version 2.0` では、ハッシュテーブルにないキーを `$h.Failed` や `$_.Failed` のようにプロパティの形で読むとエラー（PropertyNotFoundException）になる（5.1 と 7 の両方）。後から足すキーも、作るときに入れておく
+- `switch` の中の `continue` は、外の `foreach` ではなく `switch` に効く。ループの残りの処理も動く（5.1 と 7 の両方）。ループを飛ばしたいときは `if` で分ける
+- `DllImport` で、戻り値が BOOLEAN（1 バイト）の API（`AuditQuerySystemPolicy` など）を `bool` で受けるときは、`[return: MarshalAs(UnmanagedType.U1)]` が要る。付けないと 4 バイトの BOOL として読み、失敗しても成功に見えることがある（その後の `PtrToStructure` が NullReference になる）
 
 ## テストの書き方の注意
 
@@ -126,7 +132,7 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - ユーザーの実機確認は管理者で行うので、ACL で作る「権限なし」は robocopy に効かない。管理者のときは飛ばす
 - `@( )` の中で `+` を使うときは括弧で囲む（`@("a" + "b", "c")` は、カンマが先に結び付く）
 - 結果の既定の保存先がスクリプトのフォルダのツールは、テストでは一時フォルダにコピーしたスクリプトを動かす
-- テストが本物の環境を汚したり、外へ通信したりしないようにする。ネットワークの範囲に ping を送らない（アダプターの情報を差し替えたコピーと、PATH の先頭に置いた偽の外部コマンドを使う）。イベントログに書き込まない（.evtx をテストの中で組み立てる。`tests/Search-EventLog.Tests.ps1` を参照）
+- テストが本物の環境を汚したり、外へ通信したりしないようにする。ネットワークの範囲に ping を送らない（アダプターの情報を差し替えたコピーと、PATH の先頭に置いた偽の外部コマンドを使う）。イベントログに書き込まない（.evtx をテストの中で組み立てる。`tests/Search-EventLog.Tests.ps1` を参照。名前付きの Data や UserData を持つ記録（Security ログ・セッションのログなど）を混ぜるときは、`tests/Get-LogonHistory.Tests.ps1` を参照）
 - 証明書のテストで `New-SelfSignedCertificate` を使わない。`CurrentUser\My` に作って `My` から消しても、`CurrentUser\CA`（中間証明機関）に鍵なしのコピーが残る（1 回のテストで本物のストアに 20 件残った）。テスト専用のストアを作る（`tests/Get-CertificateExpiry.Tests.ps1` を参照）
 - 本物の環境では起きない条件（保存の失敗、想定外のエラーなど）は、ツールの処理を 1 か所だけ書き換えたコピーを動かして確かめる（`tests/Search-EventLog.Tests.ps1` の `New-PatchedTool` を参照）
 - テストの最後の `exit` の直前で `'  END'` を出す。`tests/Invoke-Tests.ps1` は、この行がなければ「最後まで走らなかった」として失敗に数える（テストは例外にならずに黙って終わることがあり、合格の数が減るだけでは気づけない）
