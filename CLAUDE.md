@@ -121,6 +121,15 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - `Set-StrictMode -Version 2.0` では、ハッシュテーブルにないキーを `$h.Failed` や `$_.Failed` のようにプロパティの形で読むとエラー（PropertyNotFoundException）になる（5.1 と 7 の両方）。後から足すキーも、作るときに入れておく
 - `switch` の中の `continue` は、外の `foreach` ではなく `switch` に効く。ループの残りの処理も動く（5.1 と 7 の両方）。ループを飛ばしたいときは `if` で分ける
 - `DllImport` で、戻り値が BOOLEAN（1 バイト）の API（`AuditQuerySystemPolicy` など）を `bool` で受けるときは、`[return: MarshalAs(UnmanagedType.U1)]` が要る。付けないと 4 バイトの BOOL として読み、失敗しても成功に見えることがある（その後の `PtrToStructure` が NullReference になる）
+- WScript.Shell の `CreateShortcut` は、壊れた .lnk や 0 バイトのファイルでもエラーにせず空の値を返す。ショートカットかどうかは、ファイルの先頭（0x4C と ShellLink の CLSID）で確かめる。260 文字以上のパスは `\\?\` を付けても開けない
+- WScript.Shell は、コメントか作業フォルダが 261 文字以上の .lnk を正しく読めない（リンク先が空になり、ほかの項目に別の項目の文字が混ざる）。アイコンの場所は 259 文字、引数は 1,023 文字を超えると、書くときに黙って切る。コメントの `@%SystemRoot%\system32\shell32.dll,-22579` のような値は、訳した文に変えて返す。値を確かめるときは、.lnk の StringData を自分で読む
+- WScript.Shell で .lnk を別の場所に写して保存すると、相対パス（RelPath）が写した場所を基準に作り直される。IShellLink を IPersistStream でメモリ上に読み書きすると、LinkInfo や付加情報が落ちる。書き換えはその場で行う
+- エクスプローラーで作ったショートカットは、リンク先の表示名やパスの控え（PropertyStoreDataBlock、0xA0000009）を持つ。WScript.Shell で `TargetPath` を変えても控えは古いまま残る。Shell.Application の `ShellLinkObject`（`NameSpace(フォルダ).ParseName(名前).GetLink`）の `Path` で変えると、控えも作り直す
+- サーバーそのもの（`\\192.168.1.10`）を指すショートカットは、WScript.Shell の `TargetPath` が空になる。名前は ExtraData の EnvironmentVariableDataBlock（0xA0000001）にあり、Unicode の欄は空で ANSI の欄にだけ入っていることがある
+- `[IO.File]::GetAttributes` で共有フォルダを確かめるとき、`\\?\UNC\` を付けると共有のルートはどれも 161（パスが正しくない）になる。付けなければ、つながらないサーバーは 53（初回は 3～20 秒）、届かないアドレスは 1231、共有がないと 67、フォルダやファイルがないと 2・3。サーバーそのものにつながるかは、`\\サーバー\IPC$` が 2（見つからない）を返すかで分かる
+- `New-Object 型 (( 'a' + $b )), $c` のように、引数の先頭が `((` だと 5.1 の文法エラー（式に末尾の ')' がありません）になる。`[型]::new(...)` を使う
+- `[Array]::Sort($keys, $values, [StringComparer]::Ordinal)` は、PowerShell が型を合わせた写しを作って渡すことがあり、`$values` が並ばない。`[Array]::Sort([Array]$keys, [Array]$values, [Collections.IComparer][StringComparer]::Ordinal)` と書く
+- 書き換えた直後のショートカットは、ウイルス対策ソフトなどが削除の権限付きでしばらく開いていることがあり、`ReadAllBytes`（読み取りだけを共有）は「別のプロセスが使用中」になる。読むときは `FileShare` に `ReadWrite, Delete` を渡す
 
 ## テストの書き方の注意
 
@@ -150,6 +159,12 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - pwsh から `Start-Process powershell.exe` で 5.1 を起動すると、7 のモジュールの場所（`PSModulePath`）を引き継ぎ、`Get-FileHash` や `Get-Acl` が「モジュールを読み込むことができません」になる。わざとバグのテストを 5.1 で並べて流すときは、`powershell.exe` から起動する
 - どの処理に時間がかかっているかは、ツールを `[powershell]::Create()` で動かし、`Streams.Progress` の表示が変わった時刻を記録すると、ツールを変えずに測れる。Ctrl+C の合図にする表示が出るまでの秒数も、これで測る
 - 本物の状態の結果に、ツールが訳していない英語の値（`Unknown` など）が残っていないかを確かめる。Get-ServerInventory は、管理者でないときにサービスのスタートアップが `Unknown` のまま CSV に出ていたのを、テストの環境（管理者でない）で毎回出ていたのに見逃し、実機確認の一般ユーザーの実行で見つけた
+- 共有フォルダを 2 つのサーバーに見立てるときは、この PC の管理共有の `\\127.0.0.1\C$` と `\\localhost\C$`（`\\<PC 名>\C$` も）を使う。管理者でない環境でも開ける。`127.0.0.2` はすぐに 1231（届かない）を返すので、つながらないサーバーに使える（外へは通信しない）
+- `icacls /deny ... (W)` の W には同期（SYNCHRONIZE）も含まれ、読むこともできなくなる。書き込みだけを拒否するときは `(WD,AD)` にする
+- 共有フォルダ越しのアクセス拒否は、Windows が少し前の結果を覚えている（キャッシュ）ため、設定してもすぐには効かない。置き換え先の「権限なし」などは、ツールを書き換えたコピーで確かめる
+- テストの一時フォルダ（`GetTempPath`）と `%TEMP%`・`%TMP%` は、PC によって文字が一致しない（Windows Server の 8.3 形式の名前など）。環境変数の展開を確かめるときは、テストで環境変数を作って子のプロセスに引き継がせる
+- Windows Server の PowerShell 7（Windows ターミナル）では、Ctrl+C のキーを送る補助の `AttachConsole` がエラー 5 になることがある。キーを送れなかったときはスキップにする
+- 開発に使っている PC（Windows 11 Insider・ウイルスバスター・Acronis）は、Update-ShortcutTarget のテスト（管理共有越しに .lnk を数百個作り・書き換え・消し、プロセスを数十回起動する）の最中に 2 回ブルースクリーンになった（2026-11-13。スタックに Trend Micro の tmeyes.sys と condrv.sys）。このテストとわざとバグは、FGTEST の VM で流す
 
 ## コミット
 
