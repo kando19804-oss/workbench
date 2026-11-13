@@ -54,5 +54,8 @@ ServerInventory_*/
 # Get-LogonHistory の実行結果（既定ではスクリプトと同じフォルダに保存される。ユーザー名と接続元の IP アドレスを含む）
 LogonHistory_*/
 
+# Update-ShortcutTarget の実行結果（既定ではスクリプトと同じフォルダに保存される。共有フォルダのパスと、置き換える前のショートカットを含む）
+ShortcutTarget_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
