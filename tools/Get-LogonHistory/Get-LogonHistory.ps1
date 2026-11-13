@@ -297,7 +297,7 @@ function Test-InnerException([Exception]$Exception, [type]$Type) {
 
 # CSV の 1 行
 function ConvertTo-CsvLine([object[]]$Fields) {
-    $parts = New-Object 'string[]' $Fields.Count
+    $parts = [string[]]::new($Fields.Count)
     for ($i = 0; $i -lt $Fields.Count; $i++) { $parts[$i] = ([string]$Fields[$i]).Replace('"', '""') }
     return '"' + ($parts -join '","') + '"'
 }
@@ -354,12 +354,6 @@ function Get-DisplayWidth([string]$Text) {
     return $width
 }
 
-function Format-Cell([string]$Text, [int]$Width, [bool]$AlignRight) {
-    $pad = ' ' * [math]::Max(0, $Width - (Get-DisplayWidth $Text))
-    if ($AlignRight) { return $pad + $Text }
-    return $Text + $pad
-}
-
 # 画面の表の値を、半角 $Width 文字分までにする（超える分は … にする）
 function Limit-Width([string]$Text, [int]$Width) {
     if ((Get-DisplayWidth $Text) -le $Width) { return $Text }
@@ -371,16 +365,30 @@ function Limit-Width([string]$Text, [int]$Width) {
     return $result + '…'
 }
 
-# 見出しと行（文字列の配列）から、列をそろえた表の行を作る
+# 見出しと行（文字列の配列）から、列をそろえた表の行を作る。
+# summary.txt にはすべての行を書くので、件数が多くても遅くならないよう、値ごとの幅は 1 回だけ数え、関数を呼ぶ回数を減らす
 function Format-TextTable([string[]]$Head, [bool[]]$Right, $Rows) {
-    $widths = @(foreach ($i in 0..($Head.Count - 1)) {
-        $w = Get-DisplayWidth $Head[$i]
-        foreach ($row in $Rows) { $w = [math]::Max($w, (Get-DisplayWidth $row[$i])) }
-        $w
-    })
-    $lines = New-Object 'System.Collections.Generic.List[string]'
-    foreach ($row in @(, $Head) + @($Rows)) {
-        $cells = @(foreach ($i in 0..($Head.Count - 1)) { Format-Cell $row[$i] $widths[$i] $Right[$i] })
+    $all = @(, $Head) + @($Rows)
+    $columns = $Head.Count
+    $widths = [int[]]::new($columns)
+    $cellWidths = [object[]]::new($all.Count)
+    for ($r = 0; $r -lt $all.Count; $r++) {
+        $rowWidths = [int[]]::new($columns)
+        for ($i = 0; $i -lt $columns; $i++) {
+            $text = [string]$all[$r][$i]
+            $w = if ($wideChar.IsMatch($text)) { Get-DisplayWidth $text } else { $text.Length }
+            $rowWidths[$i] = $w
+            if ($w -gt $widths[$i]) { $widths[$i] = $w }
+        }
+        $cellWidths[$r] = $rowWidths
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $cells = [string[]]::new($columns)
+    for ($r = 0; $r -lt $all.Count; $r++) {
+        for ($i = 0; $i -lt $columns; $i++) {
+            $pad = ' ' * ($widths[$i] - $cellWidths[$r][$i])
+            $cells[$i] = if ($Right[$i]) { $pad + [string]$all[$r][$i] } else { [string]$all[$r][$i] + $pad }
+        }
         $lines.Add((' ' + ($cells -join '  ')).TrimEnd())
     }
     return , $lines.ToArray()
@@ -426,7 +434,7 @@ function Resolve-StartPath([string]$Text) {
 
 # -File で起動すると配列を渡せないため、カンマ区切りの文字列で受ける。各要素の前後の ' と空白も外す
 function Split-List([string]$Text) {
-    $list = New-Object 'System.Collections.Generic.List[string]'
+    $list = [System.Collections.Generic.List[string]]::new()
     foreach ($part in ($Text -split ',')) {
         $item = (Remove-Quote $part).Trim("'").Trim()
         if ($item) { $list.Add($item) }
@@ -664,7 +672,7 @@ if ($sinceInfo.Time -ge $endTime) {
 # ログオンの種類
 $typeNames = @{}
 foreach ($key in $TypeGroups.Keys) { $typeNames[$key.ToLowerInvariant()] = $key; $typeNames[$TypeGroups[$key].Label] = $key }
-$selectedGroups = New-Object 'System.Collections.Generic.List[string]'
+$selectedGroups = [System.Collections.Generic.List[string]]::new()
 $allTypes = $false
 foreach ($item in (Split-List $LogonType)) {
     $lower = $item.ToLowerInvariant()
@@ -696,7 +704,7 @@ $typeLabelText = if ($allTypes) { 'すべて' } else { (@($selectedGroups | ForE
 
 # ユーザー
 $userItems = Split-List $User
-$userPatterns = New-Object 'System.Collections.Generic.List[object]'
+$userPatterns = [System.Collections.Generic.List[object]]::new()
 foreach ($item in $userItems) { $userPatterns.Add((New-UserPattern $item)) }
 
 $outText = $null
@@ -707,7 +715,7 @@ if ($OutputFolder) {
     $outText = Resolve-StartPath $outText
 }
 
-$skipped   = New-Object 'System.Collections.Generic.List[object]'
+$skipped   = [System.Collections.Generic.List[object]]::new()
 $skipKinds = [ordered]@{ '権限なし' = 0; 'ログがない' = 0; 'ファイルを読めない' = 0; '対象外のログ' = 0; 'リンク' = 0; 'その他のエラー' = 0 }
 function Add-Skip([string]$Reason, [string]$Target, [string]$Detail) {
     $skipped.Add([object[]]@($Reason, $Target, $Detail))
@@ -715,10 +723,10 @@ function Add-Skip([string]$Reason, [string]$Target, [string]$Detail) {
 }
 
 # 読む対象。Kind は Security かセッションのログ（Lsm）。Oldest はログに残っているいちばん古い記録の日時
-$sources = New-Object 'System.Collections.Generic.List[object]'
+$sources = [System.Collections.Generic.List[object]]::new()
 $useFiles = [bool]$Path
 if ($useFiles) {
-    $files = New-Object 'System.Collections.Generic.List[string]'
+    $files = [System.Collections.Generic.List[string]]::new()
     foreach ($item in (Split-List $Path)) {
         if ($item.Contains('"')) { Stop-WithQuoteError '-Path' $item }
         $full = ConvertTo-DisplayPath (Resolve-StartPath $item)
@@ -744,7 +752,7 @@ if ($useFiles) {
                     continue
                 }
                 # ファイルは名前の順に加え、サブフォルダは名前の順にたどれるよう、逆の順に積む
-                $subDirs = New-Object 'System.Collections.Generic.List[string]'
+                $subDirs = [System.Collections.Generic.List[string]]::new()
                 foreach ($entry in ($entries | Sort-Object -Property @{ Expression = { ConvertTo-SortKey $_.Name } })) {
                     $linkName = Get-LinkName $entry
                     if ($linkName -and $entry -is [IO.DirectoryInfo]) {
@@ -904,20 +912,20 @@ try {
     $selectClear  = New-Object Diagnostics.Eventing.Reader.EventLogPropertySelector (, [string[]]@('Event/UserData/*/SubjectDomainName', 'Event/UserData/*/SubjectUserName'))
     $selectLsm    = New-Object Diagnostics.Eventing.Reader.EventLogPropertySelector (, [string[]]@('Event/UserData/*/User', 'Event/UserData/*/SessionID', 'Event/UserData/*/Address'))
 
-    $logons   = New-Object 'System.Collections.Generic.List[object]'
+    $logons   = [System.Collections.Generic.List[object]]::new()
     $logoffs  = @{}   # コンピューター|ログオン ID → ログオフの記録（時刻とイベント ID）の一覧
     $boots    = @{}   # コンピューター → OS の起動の時刻の一覧
-    $failures = New-Object 'System.Collections.Generic.List[object]'
-    $clears   = New-Object 'System.Collections.Generic.List[object]'
-    $lsmEvents = New-Object 'System.Collections.Generic.List[object]'
+    $failures = [System.Collections.Generic.List[object]]::new()
+    $clears   = [System.Collections.Generic.List[object]]::new()
+    $lsmEvents = [System.Collections.Generic.List[object]]::new()
     $sidNames = @{}   # コンピューター|SID → 記録に出てきた名前（Microsoft アカウントは、ログオンとログオフで名前が違う）
-    $seen     = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $seen     = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $bootNames = @{}   # コンピューターのキー|OS の起動の時刻 → その記録に書かれたコンピューターの名前（ほかの行と同じく、記録のままを書く）
 
     function Add-SidName([string]$Computer, [string]$Sid, [string]$Name) {
         if (-not $Sid -or -not $Name) { return }
         $key = $Computer + '|' + $Sid
-        if (-not $sidNames.ContainsKey($key)) { $sidNames[$key] = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }
+        if (-not $sidNames.ContainsKey($key)) { $sidNames[$key] = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase) }
         [void]$sidNames[$key].Add($Name)
     }
 
@@ -957,7 +965,7 @@ try {
                 Add-SidName $computer $sid $name
                 $id = ConvertTo-UInt64Value $v[3]
                 $key = $computer + '|' + $id
-                if (-not $logoffs.ContainsKey($key)) { $logoffs[$key] = New-Object 'System.Collections.Generic.List[object]' }
+                if (-not $logoffs.ContainsKey($key)) { $logoffs[$key] = [System.Collections.Generic.List[object]]::new() }
                 # 4647 には種類がない（0 にする）。Used は、ログオンと組にできたかの印（組にできなかったものは、ログオンの記録が残っていない）
                 $type = if ([int]$Record.Id -eq 4634) { [int](ConvertTo-UInt64Value $v[4]) } else { 0 }
                 $logoffs[$key].Add([pscustomobject]@{
@@ -966,7 +974,7 @@ try {
                 })
             }
             4608 {
-                if (-not $boots.ContainsKey($computer)) { $boots[$computer] = New-Object 'System.Collections.Generic.List[datetime]' }
+                if (-not $boots.ContainsKey($computer)) { $boots[$computer] = [System.Collections.Generic.List[datetime]]::new() }
                 $boots[$computer].Add($time)
                 $bootNames[$computer + '|' + $time.Ticks] = $computerText
             }
@@ -1067,7 +1075,7 @@ try {
     }
 
     # 監査ポリシー（管理者として、この PC を調べるときだけ分かる）
-    $auditNotes = New-Object 'System.Collections.Generic.List[string]'
+    $auditNotes = [System.Collections.Generic.List[string]]::new()
     if (-not $useFiles -and $isAdmin) {
         Write-Progress -Activity $ToolTitle -Status '監査ポリシーを確かめています'
         try {
@@ -1095,14 +1103,14 @@ try {
     $byId = @{}
     foreach ($logon in $sortedLogons) {
         $key = $logon.Computer + '|' + $logon.Id
-        if (-not $byId.ContainsKey($key)) { $byId[$key] = New-Object 'System.Collections.Generic.List[object]' }
+        if (-not $byId.ContainsKey($key)) { $byId[$key] = [System.Collections.Generic.List[object]]::new() }
         $byId[$key].Add($logon)
     }
     $used = New-Object 'System.Collections.Generic.HashSet[int]'
-    $units = New-Object 'System.Collections.Generic.List[object]'
+    $units = [System.Collections.Generic.List[object]]::new()
     foreach ($logon in $sortedLogons) {
         if (-not $used.Add($logon.Index)) { continue }
-        $ids = New-Object 'System.Collections.Generic.List[uint64]'
+        $ids = [System.Collections.Generic.List[uint64]]::new()
         $ids.Add($logon.Id)
         $elevated = $logon.Elevated
         if ($logon.Linked -ne 0) {
@@ -1163,11 +1171,11 @@ try {
             if ($entry.Used -or $entry.System) { continue }
             $next = Get-NextBoot $entry.Computer $entry.Time
             $key = '{0}|{1}|{2}' -f $entry.Computer, $entry.Id, $(if ($null -ne $next) { $next.Ticks } else { 0 })
-            if (-not $orphanGroups.ContainsKey($key)) { $orphanGroups[$key] = New-Object 'System.Collections.Generic.List[object]' }
+            if (-not $orphanGroups.ContainsKey($key)) { $orphanGroups[$key] = [System.Collections.Generic.List[object]]::new() }
             $orphanGroups[$key].Add($entry)
         }
     }
-    $orphanItems = New-Object 'System.Collections.Generic.List[object]'
+    $orphanItems = [System.Collections.Generic.List[object]]::new()
     foreach ($group in $orphanGroups.Values) {
         $chosen = $null
         $type = 0
@@ -1178,7 +1186,7 @@ try {
         $orphanItems.Add([pscustomobject]@{ Computer = $chosen.Computer; ComputerText = $chosen.ComputerText; Time = $chosen.Time; EventId = $chosen.EventId; Sid = $chosen.Sid; Name = $chosen.Name; Id = $chosen.Id; Type = $type })
     }
     # UAC の 2 つのログオンは、ログオンの記録がないとお互いが分からないので、同じユーザーの近い（$SignInSeconds 秒以内の）ものを 1 つにまとめる
-    $orphanLogoffs = New-Object 'System.Collections.Generic.List[object]'
+    $orphanLogoffs = [System.Collections.Generic.List[object]]::new()
     $orphan = $null
     foreach ($item in @($orphanItems.ToArray() | Sort-Object -Property Computer, Sid, Time, Id)) {
         if ($orphan -and $orphan.Computer -eq $item.Computer -and $orphan.Sid -eq $item.Sid -and ($item.Time - $orphan.First).TotalSeconds -le $SignInSeconds) {
@@ -1191,7 +1199,7 @@ try {
     }
 
     # ロック解除。1 回のロック解除で、ロック解除のログオンが 2～4 つ同時に記録されるので、同じユーザーの近いものを 1 回にまとめる
-    $unlocks = New-Object 'System.Collections.Generic.List[object]'
+    $unlocks = [System.Collections.Generic.List[object]]::new()
     $current = $null
     foreach ($unit in @($units | Where-Object { $UnlockTypes -contains $_.Type } | Sort-Object -Property Computer, Sid, Time, RecordId)) {
         if ($current -and $current.Computer -eq $unit.Computer -and $current.Sid -eq $unit.Sid -and ($unit.Time - $current.Time).TotalSeconds -le $UnlockGapSeconds) { continue }
@@ -1204,7 +1212,7 @@ try {
     $unlocksByUser = @{}
     foreach ($unlock in $unlocks) {
         $key = $unlock.Computer + '|' + $unlock.Sid
-        if (-not $unlocksByUser.ContainsKey($key)) { $unlocksByUser[$key] = New-Object 'System.Collections.Generic.List[object]' }
+        if (-not $unlocksByUser.ContainsKey($key)) { $unlocksByUser[$key] = [System.Collections.Generic.List[object]]::new() }
         $unlocksByUser[$key].Add($unlock)
     }
 
@@ -1227,7 +1235,7 @@ try {
     foreach ($unit in $units) {
         if ($unit.Kind -ne 'Session' -or $SessionTypes -notcontains $unit.Type) { continue }
         $key = $unit.Computer + '|' + $unit.Sid
-        if (-not $sessionsByUser.ContainsKey($key)) { $sessionsByUser[$key] = New-Object 'System.Collections.Generic.List[object]' }
+        if (-not $sessionsByUser.ContainsKey($key)) { $sessionsByUser[$key] = [System.Collections.Generic.List[object]]::new() }
         $sessionsByUser[$key].Add($unit)
     }
     # その時刻に続いているログオン（ログオンが後のものを優先）
@@ -1259,9 +1267,9 @@ try {
 
     # セッションのログを、セッション ID ごとに、ログオン（21）からログオフ（23）までにまとめる。
     # ログオフの後にも切断（24）が記録されるので、それは数えない
-    $lsmSessions = New-Object 'System.Collections.Generic.List[object]'
-    $lsmOrphans = New-Object 'System.Collections.Generic.List[object]'   # ログオン（21）が、古い記録から消えて残っていないセッション
-    $lsmRows = New-Object 'System.Collections.Generic.List[object]'
+    $lsmSessions = [System.Collections.Generic.List[object]]::new()
+    $lsmOrphans = [System.Collections.Generic.List[object]]::new()   # ログオン（21）が、古い記録から消えて残っていないセッション
+    $lsmRows = [System.Collections.Generic.List[object]]::new()
     $lsmState = @{}
     foreach ($evt in @($lsmEvents.ToArray() | Sort-Object -Property Time, Computer, RecordId)) {
         $key = $evt.Computer + '|' + $evt.SessionId
@@ -1269,7 +1277,7 @@ try {
         $state = $lsmState[$key]
         switch ($evt.Id) {
             21 {
-                $session = [pscustomobject]@{ Computer = $evt.Computer; SessionId = $evt.SessionId; User = $evt.User; Ip = $evt.Ip; Start = $evt.Time; End = $null; Events = (New-Object 'System.Collections.Generic.List[object]'); Match = $null }
+                $session = [pscustomobject]@{ Computer = $evt.Computer; SessionId = $evt.SessionId; User = $evt.User; Ip = $evt.Ip; Start = $evt.Time; End = $null; Events = ([System.Collections.Generic.List[object]]::new()); Match = $null }
                 $lsmSessions.Add($session)
                 $state.Current = $session
                 $state.Closed = $false
@@ -1284,7 +1292,7 @@ try {
                 if (-not $state.Closed) {
                     # ログオン（21）より前に切断・再接続があるのは、21 が古い記録から消えたセッション。後で、続いているログオンと組にする
                     if ($null -eq $state.Current) {
-                        $state.Current = [pscustomobject]@{ Computer = $evt.Computer; SessionId = $evt.SessionId; User = $evt.User; Ip = $evt.Ip; Start = $null; End = $null; Events = (New-Object 'System.Collections.Generic.List[object]'); Match = $null }
+                        $state.Current = [pscustomobject]@{ Computer = $evt.Computer; SessionId = $evt.SessionId; User = $evt.User; Ip = $evt.Ip; Start = $null; End = $null; Events = ([System.Collections.Generic.List[object]]::new()); Match = $null }
                         $lsmOrphans.Add($state.Current)
                     }
                     $lsmRows.Add([pscustomobject]@{ Event = $evt; Session = $state.Current })
@@ -1300,7 +1308,7 @@ try {
     $candidatesByComputer = @{}
     foreach ($unit in $units) {
         if ($unit.Kind -ne 'Session' -or $SessionTypes -notcontains $unit.Type) { continue }
-        if (-not $candidatesByComputer.ContainsKey($unit.Computer)) { $candidatesByComputer[$unit.Computer] = New-Object 'System.Collections.Generic.List[object]' }
+        if (-not $candidatesByComputer.ContainsKey($unit.Computer)) { $candidatesByComputer[$unit.Computer] = [System.Collections.Generic.List[object]]::new() }
         $candidatesByComputer[$unit.Computer].Add($unit)
     }
     $firstIndex = @{}
@@ -1365,7 +1373,7 @@ try {
     $reconnectTimes = @{}
     foreach ($evt in $lsmEvents) {
         if ($evt.Id -ne 25) { continue }
-        if (-not $reconnectTimes.ContainsKey($evt.Computer)) { $reconnectTimes[$evt.Computer] = New-Object 'System.Collections.Generic.List[datetime]' }
+        if (-not $reconnectTimes.ContainsKey($evt.Computer)) { $reconnectTimes[$evt.Computer] = [System.Collections.Generic.List[datetime]]::new() }
         $reconnectTimes[$evt.Computer].Add($evt.Time)
     }
     foreach ($computer in @($reconnectTimes.Keys)) { $reconnectTimes[$computer].Sort() }
@@ -1379,7 +1387,7 @@ try {
         }
         return $false
     }
-    $secReconnects = New-Object 'System.Collections.Generic.List[object]'
+    $secReconnects = [System.Collections.Generic.List[object]]::new()
     foreach ($unit in @($units | Where-Object { $_.Kind -eq 'Reconnect' })) {
         if (Test-NearReconnect $unit.Computer $unit.Time) { continue }
         $unit | Add-Member -NotePropertyName ActiveSession -NotePropertyValue (Find-ActiveSession $unit.Computer $unit.Sid $unit.Time)
@@ -1404,7 +1412,7 @@ try {
     #region 一覧にする
 
     function Get-UnitNames($Unit) {
-        $names = New-Object 'System.Collections.Generic.List[string]'
+        $names = [System.Collections.Generic.List[string]]::new()
         $names.Add($Unit.Name)
         $key = $Unit.Computer + '|' + $Unit.Sid
         if ($sidNames.ContainsKey($key)) { foreach ($name in $sidNames[$key]) { $names.Add($name) } }
@@ -1430,7 +1438,7 @@ try {
 
     # -User があるか（名前の一覧を作るのは、絞り込むときだけにする。件数が多いときに遅くならないように）
     $userFilter = $userPatterns.Count -gt 0
-    $periodUnits = New-Object 'System.Collections.Generic.List[object]'
+    $periodUnits = [System.Collections.Generic.List[object]]::new()
     foreach ($unit in $units) {
         if ($unit.Kind -ne 'Session' -or -not $selectedTypes.Contains($unit.Type) -or -not (Test-InPeriod $unit)) { continue }
         if ($userFilter -and -not (Test-UserMatch (Get-UnitNames $unit))) { continue }
@@ -1438,7 +1446,7 @@ try {
     }
     $sessions = @($periodUnits.ToArray() | Sort-Object -Property @{ Expression = 'Time'; Descending = $true }, @{ Expression = 'Computer'; Descending = $false }, @{ Expression = 'RecordId'; Descending = $false })
     # events.csv には、期間の中の記録だけを書く。並びを 5.1 と 7 でそろえるため、足した順の番号も持つ
-    $events = New-Object 'System.Collections.Generic.List[object]'
+    $events = [System.Collections.Generic.List[object]]::new()
     function Add-EventRow($Time, [string]$Operation, [string]$Name, [string]$Type, [string]$Ip, [string]$Workstation, [string]$Detail, [string]$LogonId, [string]$SessionId, [int]$EventId, [string]$Computer) {
         $events.Add([pscustomobject]@{ Time = $Time; Seq = $events.Count; Operation = $Operation; Name = $Name; Type = $Type; Ip = $Ip; Workstation = $Workstation; Detail = $Detail; LogonId = $LogonId; SessionId = $SessionId; EventId = $EventId; Computer = $Computer })
     }
@@ -1474,7 +1482,7 @@ try {
             $label = ''
         }
         if ($userFilter) {
-            $names = New-Object 'System.Collections.Generic.List[string]'
+            $names = [System.Collections.Generic.List[string]]::new()
             $names.Add($orphan.Name)
             if ($sidNames.ContainsKey($orphan.Computer + '|' + $orphan.Sid)) { foreach ($name in $sidNames[$orphan.Computer + '|' + $orphan.Sid]) { $names.Add($name) } }
             if (-not (Test-UserMatch $names)) { continue }
@@ -1487,7 +1495,7 @@ try {
     if ($unlockSelected) {
         foreach ($unlock in $unlocks) {
             if (-not $unlock.Real -or -not (Test-InWindow $unlock.Time)) { continue }
-            $names = New-Object 'System.Collections.Generic.List[string]'
+            $names = [System.Collections.Generic.List[string]]::new()
             $names.Add($unlock.Name)
             if ($sidNames.ContainsKey($unlock.Computer + '|' + $unlock.Sid)) { foreach ($name in $sidNames[$unlock.Computer + '|' + $unlock.Sid]) { $names.Add($name) } }
             if (-not (Test-UserMatch $names)) { continue }
@@ -1513,7 +1521,7 @@ try {
                 # 組にできなかったものは、接続元の IP アドレスの有無で種類を決め、その種類を選んでいるときだけ出す
                 $group = if ($evt.Ip) { 'RemoteDesktop' } else { 'Interactive' }
                 if (-not $selectedGroups.Contains($group)) { continue }
-                $names = New-Object 'System.Collections.Generic.List[string]'
+                $names = [System.Collections.Generic.List[string]]::new()
                 $names.Add($evt.User)
                 if (-not (Test-UserMatch $names)) { continue }
                 $name = $evt.User
@@ -1534,10 +1542,10 @@ try {
             if ($unit.ActiveSession) { $unit.ActiveSession.Reconnects++ }
         }
     }
-    $shownFailures = New-Object 'System.Collections.Generic.List[object]'
+    $shownFailures = [System.Collections.Generic.List[object]]::new()
     $sortedFailures = @($failures.ToArray() | Sort-Object -Property @{ Expression = 'Time'; Descending = $true }, @{ Expression = 'Computer'; Descending = $false }, @{ Expression = 'RecordId'; Descending = $false })
     foreach ($failure in $sortedFailures) {
-        $names = New-Object 'System.Collections.Generic.List[string]'
+        $names = [System.Collections.Generic.List[string]]::new()
         $names.Add($failure.Name)
         if (-not (Test-UserMatch $names)) { continue }
         $reason = Get-FailureReason $failure.Status $failure.SubStatus
@@ -1603,7 +1611,7 @@ try {
 
     #region 画面と summary.txt の内容
 
-    $head = New-Object 'System.Collections.Generic.List[string]'
+    $head = [System.Collections.Generic.List[string]]::new()
     $head.Add((Format-Invariant '{0} ({1} {2})' $ToolTitle $ToolName $ScriptVersion))
     $securitySources = @($sources | Where-Object { $_.Kind -eq 'Security' })
     $oldestByComputer = @{}
@@ -1655,7 +1663,7 @@ try {
         , $cells
     })
 
-    $tail = New-Object 'System.Collections.Generic.List[string]'
+    $tail = [System.Collections.Generic.List[string]]::new()
     $total = $sessions.Count + $shownFailures.Count + $unlockCount + $orphanTotal
     # 見出しの最後が空行なので、表があるときだけ、表の後に空行を入れる
     if ($total -gt 0) { $tail.Add('') }
@@ -1721,7 +1729,7 @@ try {
 
     # 表（Limit が 0 なら、すべての行）
     function Get-Section([string]$Title, [string[]]$Head, [bool[]]$Right, $Rows, [int]$Limit, [string]$MoreFile) {
-        $lines = New-Object 'System.Collections.Generic.List[string]'
+        $lines = [System.Collections.Generic.List[string]]::new()
         $shown = @($Rows)
         $titleText = $Title
         if ($Limit -gt 0 -and $shown.Count -gt $Limit) { $shown = @($shown[0..($Limit - 1)]) }
@@ -1734,7 +1742,7 @@ try {
         return , $lines
     }
     function Get-Body([int]$Limit) {
-        $body = New-Object 'System.Collections.Generic.List[string]'
+        $body = [System.Collections.Generic.List[string]]::new()
         $body.AddRange((Get-Section '■ ユーザーごと（ログオンの多い順{0}）' $userHead $userRight $userRows $Limit 'users.csv'))
         $body.Add('')
         $body.AddRange((Get-Section '■ ログオン（新しい順{0}）' $sessionHead $sessionRight $sessionRows $Limit 'sessions.csv'))
@@ -1750,19 +1758,19 @@ try {
     if ($runDir) {
         Write-Progress -Activity $ToolTitle -Status '結果を保存しています'
         try {
-            $summary = New-Object 'System.Collections.Generic.List[string]'
+            $summary = [System.Collections.Generic.List[string]]::new()
             $summary.AddRange([string[]]$head.ToArray())
             if ($total -gt 0) { $summary.AddRange([string[]](Get-Body 0).ToArray()) }
             $summary.AddRange([string[]]$tail.ToArray())
             $summary.Add(('保存先: {0}' -f $runDir))
             [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$summary, $Utf8Bom)
 
-            $rows = New-Object 'System.Collections.Generic.List[object]'
+            $rows = [System.Collections.Generic.List[object]]::new()
             foreach ($session in $sessions) {
                 $spanText = if ($null -ne $session.Logoff) { Format-Span ($session.Logoff - $session.Time) } else { '' }
                 $sessionId = if ($session.Lsm) { $session.Lsm.SessionId } else { '' }
                 # ログオン ID（1 つか 2 つ）。行ごとにパイプラインを使うと、件数が多いときに遅い
-                $idTexts = New-Object 'string[]' $session.Ids.Count
+                $idTexts = [string[]]::new($session.Ids.Count)
                 for ($k = 0; $k -lt $idTexts.Count; $k++) { $idTexts[$k] = Format-LogonId $session.Ids[$k] }
                 $rows.Add([object[]]@((Format-Time $session.Time), (Format-Time $session.Logoff), (Protect-ExcelText $spanText), (Protect-ExcelText $session.Name), (Get-TypeLabel $session.Type $session.Process),
                     (Protect-ExcelText $session.Ip), (Protect-ExcelText $session.Workstation), (Get-AdminText $session.Elevated), $session.Status,
@@ -1771,14 +1779,14 @@ try {
             }
             Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'sessions.csv')) $SessionColumns $rows
 
-            $rows = New-Object 'System.Collections.Generic.List[object]'
+            $rows = [System.Collections.Generic.List[object]]::new()
             foreach ($evt in $sortedEvents) {
                 $rows.Add([object[]]@((Format-Time $evt.Time), $evt.Operation, (Protect-ExcelText $evt.Name), $evt.Type, (Protect-ExcelText $evt.Ip), (Protect-ExcelText $evt.Workstation),
                     (Protect-ExcelText $evt.Detail), $evt.LogonId, $evt.SessionId, $evt.EventId, (Protect-ExcelText $evt.Computer)))
             }
             Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'events.csv')) $EventColumns $rows
 
-            $rows = New-Object 'System.Collections.Generic.List[object]'
+            $rows = [System.Collections.Generic.List[object]]::new()
             foreach ($entry in $userList) {
                 # ログオフの記録があるログオンだけを足す。1 つもなければ空欄
                 $totalText = if ($entry.Completed -gt 0) { Format-Span $entry.Total } else { '' }
@@ -1787,7 +1795,7 @@ try {
             }
             Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'users.csv')) $UserColumns $rows
 
-            $rows = New-Object 'System.Collections.Generic.List[object]'
+            $rows = [System.Collections.Generic.List[object]]::new()
             foreach ($skip in $skipped) { $rows.Add([object[]]@($skip[0], (Protect-ExcelText $skip[1]), (Protect-ExcelText $skip[2]))) }
             Save-Csv (ConvertTo-LongPath (Join-Path $runDir 'skipped.csv')) $SkipColumns $rows
         } catch {
