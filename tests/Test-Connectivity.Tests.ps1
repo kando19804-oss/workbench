@@ -280,7 +280,7 @@ try {
     Assert-Equal '名前解決失敗: 詳細に理由' ((Get-Row $x 4).'詳細'.StartsWith('名前解決: ')) 'True'
     Assert-Equal 'ホストは ="..." の形' ('{0}|{1}' -f (Get-Row $x 1).'ホスト', (Get-Row $x 4).'ホスト') '="localhost"|="wbtest-no-such-host.invalid"'
     Assert-Equal '確認日時の形' ((Get-Row $x 1).'確認日時' -match '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$') 'True'
-    Assert-Equal 'summary の 1 行目' $x.Lines[0] '疎通一括確認 (Test-Connectivity 1.0.0)'
+    Assert-Equal 'summary の 1 行目' $x.Lines[0] '疎通一括確認 (Test-Connectivity 1.0.1)'
     Assert-Equal 'summary の 2 行目（実行元）' $x.Lines[1].StartsWith(('実行元: {0}（' -f [Environment]::MachineName)) 'True'
     Assert-Equal '対象の行' (Get-TargetText $run.Log) '-Target（4 件）   タイムアウト 2 秒'
     Assert-Equal '結果の行' (Get-CountText $run.Log) '結果: OK 2 件  NG 2 件'
@@ -517,6 +517,14 @@ try {
     Assert-Equal '保存先を作れないときの警告' ('{0}/{1}' -f $result['COUNT'], $result['BROKEN']) '2/0'
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $cmdOut  = Join-Path $workRoot 'out\cmd'
     $run = Invoke-ViaCmd ('{0} -Target "127.0.0.1:{1},localhost" -Timeout 1 -OutputFolder "{2}\"' -f $cmdBase, $port4, $cmdOut)

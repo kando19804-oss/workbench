@@ -293,7 +293,7 @@ try {
     Assert-Equal 'items.csv の権限なし' ('{0}/{1}' -f $deniedRow.'状態', $deniedRow.'サイズ(バイト)') '権限なし/'
     Assert-Equal 'items.csv のリンク' (Get-ItemRow $x "$tree\jloop").'状態' 'リンク'
     Assert-Equal '\\?\ が残っていない' ($x.Tree + $x.Summary + (($x.Items + $x.Skipped | ForEach-Object { $_.'パス' }) -join '|')).Contains('\\?\') 'False'
-    Assert-Equal 'summary.txt にヘッダーとツリー' ('{0}/{1}' -f $x.Summary.StartsWith('フォルダツリー出力 (Get-FolderTree 1.0.0)'), $x.Summary.Contains($x.Tree.Split("`n")[1])) 'True/True'
+    Assert-Equal 'summary.txt にヘッダーとツリー' ('{0}/{1}' -f $x.Summary.StartsWith('フォルダツリー出力 (Get-FolderTree 1.0.1)'), $x.Summary.Contains($x.Tree.Split("`n")[1])) 'True/True'
 
     Write-Section '-Files・-Detail・-Hidden'
     $run = Invoke-Tool 'files' @('-Path', $tree, '-Files')
@@ -353,6 +353,14 @@ try {
     Assert-Equal '空のフォルダを起点にする' ('{0}/{1}' -f $run.Code, (Read-Result $run.Dir).Tree.TrimEnd("`n")) "0/$tree\empty  (0 B・0 ファイル)"
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $run = Invoke-ViaCmd ('{0} -NoSave -Exclude "*\node_modules,*\jloop" -Path "{1}\"' -f $cmdBase, $tree)
     Assert-Equal '最後の引数が "パス\" でも読める・-Exclude のカンマ区切り' ('{0}/{1}' -f $run.Code, $run.Log.Contains('除外したフォルダ 4 件')) '0/True'

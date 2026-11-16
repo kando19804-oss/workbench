@@ -281,7 +281,7 @@ try {
     Assert-Equal '実行ファイル（大文字と小文字は問わない）' ($row.'実行ファイル' -eq $lpath) 'True'
     Assert-Equal '起動日時（yyyy/MM/dd HH:mm:ss）' $row.'起動日時' $lstart.ToString('yyyy/MM/dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture)
     Assert-Equal 'コマンドラインは CSV にだけ書く' ('{0}/{1}/{2}' -f $row.'コマンドライン'.Contains($marker), $x.Summary.Contains($marker), $run.Log.Contains($marker)) 'True/False/False'
-    Assert-Equal 'summary の 1 行目' $x.Lines[0] 'ポート使用プロセス特定 (Get-PortProcess 1.0.0)'
+    Assert-Equal 'summary の 1 行目' $x.Lines[0] 'ポート使用プロセス特定 (Get-PortProcess 1.0.1)'
     Assert-Equal 'summary の 2 行目' ([regex]::IsMatch($x.Lines[1], ('^対象: {0}   \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}   管理者: {1}$' -f [regex]::Escape([Environment]::MachineName), $(if ($isAdmin) { 'はい' } else { 'いいえ' })))) 'True'
     Assert-Equal '条件の行' (Get-ConditionText $run.Log) "ポート $P   TCP は待ち受けのみ"
     Assert-Equal '該当の行' (Get-CountText $run.Log) '該当 3 件（プロセス 1 個）'
@@ -460,6 +460,14 @@ try {
     }
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $cmdOut  = Join-Path $workRoot 'out\cmd'
     $run = Invoke-ViaCmd ('{0} -Port {1},{2} -OutputFolder "{3}\"' -f $cmdBase, $P, $Q, $cmdOut)

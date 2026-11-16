@@ -453,7 +453,7 @@ try {
         Assert-Equal 'tasks.csv の見出し' (Get-FirstLine $run.Dir 'tasks.csv') $taskHead
         Assert-Equal 'skipped.csv の見出し' (Get-FirstLine $run.Dir 'skipped.csv') '"理由","パス","詳細"'
         Assert-Equal 'skipped.csv は見出しだけ' $x.Skipped.Count 0
-        Assert-Equal 'summary の 1 行目' (Get-Line $x.Lines 0) 'タスクスケジューラ出力 (Export-TaskList 1.0.0)'
+        Assert-Equal 'summary の 1 行目' (Get-Line $x.Lines 0) 'タスクスケジューラ出力 (Export-TaskList 1.0.1)'
         $adminText = if ($isAdmin) { 'はい' } else { 'いいえ' }
         Assert-Equal 'summary の対象の行' ([regex]::IsMatch((Get-Line $x.Lines 1), ('^対象: {0}（管理者: {1}）   \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}$' -f [regex]::Escape($env:COMPUTERNAME), $adminText))) 'True'
         Assert-Equal 'summary の範囲の行' (Get-Line $x.Lines 2) "範囲: $testDir の下"
@@ -721,6 +721,14 @@ try {
         }
 
         Write-Section 'コマンドプロンプトから起動'
+        # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+        # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+        $unknownOut = Join-Path $workRoot 'out_unknown'
+        $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+        Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+        # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+        $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+        Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
         $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
         $run = Invoke-ViaCmd ('{0} -NoSave -Path "{1}\"' -f $cmdBase, $testDir)
         Assert-Equal '最後の引数が "パス\" の -Path' ('{0}/{1}' -f $run.Code, (Get-CountText $run.Log)) ('0/' + $exactCount)

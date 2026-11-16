@@ -468,7 +468,7 @@ try {
     Assert-Equal '数字だけの拇印は ="..." で守る' (@($digits.Certs)[0].'拇印') '="1234567890123456789012345678901234567890"'
 
     Write-Section 'ストア: 画面の形'
-    Assert-Equal '1 行目' $run.Summary[0] '証明書期限一覧 (Get-CertificateExpiry 1.0.0)'
+    Assert-Equal '1 行目' $run.Summary[0] '証明書期限一覧 (Get-CertificateExpiry 1.0.1)'
     Assert-Equal '2 行目（日時・ホスト名・管理者）' ($run.Summary[1] -replace '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', 'DATE') ('DATE   {0}（管理者: {1}）' -f $env:COMPUTERNAME, $(if ($isAdmin) { 'はい' } else { 'いいえ' }))
     Assert-Equal '対象の行' $run.Summary[2] "対象: $storeText"
     Assert-Equal '基準の行' $run.Summary[3] '期限間近の基準: 残り 60 日以内'
@@ -1318,6 +1318,14 @@ foreach ($client in $held) { $client.Close() }
     Assert-Equal '想定外のエラー: 結果を残さず、中断とは区別する' ('{0}/{1}/{2}/{3}' -f $r.Code, (Test-Contains $r.Log 'エラーで止まりました。結果は保存していません。'), (Test-Contains $r.Log '中断しました'), [bool]$r.Dir) '1/True/False/False'
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdHead = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $r = Invoke-ViaCmd ('{0} -NoSave -Path "{1},{2}"' -f $cmdHead, "$workRoot\m1", "$workRoot\m2")
     Assert-Equal 'カンマ区切りの -Path と終了コード 2' ('{0}/{1}' -f $r.Code, (Test-Contains $r.Log "対象: $workRoot\m1, $workRoot\m2")) '2/True'

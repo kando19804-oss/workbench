@@ -334,7 +334,7 @@ exit $LASTEXITCODE
     Assert-Equal 'フォルダの名前' ((Split-Path -Leaf $run.Dir) -match ('^NameResolution_{0}_\d{{8}}_\d{{6}}$' -f [regex]::Escape($env:COMPUTERNAME))) 'True'
     Assert-Equal '聞いた問い合わせ（A と AAAA を 1 回ずつ、この DNS サーバーだけ）' (($run.Queries | ForEach-Object { ($_ -split ' ')[0..2] -join ' ' }) -join ',') '10.0.0.53 A web.test,10.0.0.53 AAAA web.test'
     Assert-Equal 'hosts とキャッシュを使わない指定' (Get-QueryCount $run '* DnsOnly=True NoHostsFile=True') 2
-    foreach ($part in @('名前解決確認 (Test-NameResolution 1.0.0)', '（管理者: ', '対象 1 件   DNS サーバー: 10.0.0.53（OS の設定）', ('hosts: {0}（有効な行 0 件）' -f $run.HostsFile), '結果: OK 1 件  注意 0 件  引けない 0 件  所要 ', ('保存先: {0}' -f $run.Dir))) {
+    foreach ($part in @('名前解決確認 (Test-NameResolution 1.0.1)', '（管理者: ', '対象 1 件   DNS サーバー: 10.0.0.53（OS の設定）', ('hosts: {0}（有効な行 0 件）' -f $run.HostsFile), '結果: OK 1 件  注意 0 件  引けない 0 件  所要 ', ('保存先: {0}' -f $run.Dir))) {
         Assert-Equal "画面の表示: $part" (Test-Contains $run.Log $part) 'True'
     }
     $summary = ConvertTo-FlatText ([IO.File]::ReadAllText((Join-Path $run.Dir 'summary.txt')))
@@ -947,12 +947,21 @@ exit $LASTEXITCODE
     Assert-Equal '所要の小数点は . のまま' ($culture.Log -match '所要 \d+\.\d秒') 'True'
 
     Write-Section '起動のしかた'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $closed = @('-Server', $closedDns)
     $viaFile = Invoke-Real (@('-Target', 'localhost,127.0.0.1', '-NoSave') + $closed)
     Assert-Equal '-File で -Target にカンマ区切りを渡す' (Test-Contains $viaFile.Log '対象 2 件') 'True'
     $viaServers = Invoke-Real @('-Target', 'localhost', '-Server', "$closedDns,$dnsNet.58", '-NoSave')
     Assert-Equal '-File で -Server にカンマ区切りを渡す' (Test-Contains $viaServers.Log "DNS サーバー: $closedDns, $dnsNet.58（指定）") 'True'
-    Assert-Equal '位置で渡す引数は受け付けない' (Invoke-Real @('localhost')).Code 1
+    $viaPosition = Invoke-Real @('localhost')
+    Assert-Equal '位置で渡す引数は受け付けない（日本語の案内を出して止める）' ('{0}/{1}' -f $viaPosition.Code, (Test-Contains $viaPosition.Log 'どのパラメーターにも当たらない引数があります: localhost')) '1/True'
     $viaNone = Invoke-Real @()
     Assert-Equal '引数なしは止まる' ('{0}/{1}' -f $viaNone.Code, (Test-Contains $viaNone.Log '調べる名前を指定してください')) '1/True'
 

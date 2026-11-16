@@ -349,7 +349,7 @@ try {
     $s = Read-Result $snapDir
     $info = @{}
     foreach ($row in @($s.Snapshot | Where-Object { $_.'種類' -eq '情報' })) { $info[$row.'相対パス'] = $row.'状態' }
-    Assert-Equal '保存: 情報の行' ('{0}/{1}/{2}/{3}' -f $info['ツール'], $info['フォルダ'], $info['ハッシュ'], $info['除外']) "Compare-Folder 1.0.0/$work/SHA-256/*.tmp"
+    Assert-Equal '保存: 情報の行' ('{0}/{1}/{2}/{3}' -f $info['ツール'], $info['フォルダ'], $info['ハッシュ'], $info['除外']) "Compare-Folder 1.0.1/$work/SHA-256/*.tmp"
     Assert-Equal '保存: 時間帯' $info['時間帯'] ([TimeZoneInfo]::Local.Id)
     Assert-Equal '保存: 除外したファイルは載せない' (@($s.Snapshot | Where-Object { $_.'相対パス' -eq 'old.tmp' }).Count) 0
     Assert-Equal '保存: ハッシュ' (@($s.Snapshot | Where-Object { $_.'相対パス' -eq 'sub\c.txt' }) | ForEach-Object { $_.'ハッシュ' }) (Get-FileHash -LiteralPath "$work\sub\c.txt").Hash
@@ -481,6 +481,14 @@ try {
     }
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     # 名前を省略した 2 つのパス、カンマ区切りの -Exclude、最後の引数が "パス\"
     $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSave -Exclude "*.log,\kind" "{2}" "{3}\"' -f $Exe, $tool, $ref, $dif)
     Assert-Equal '終了コード' $run.Code 2

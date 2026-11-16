@@ -397,7 +397,7 @@ try {
     Assert-Equal '読めないショートカットの詳細' ('{0}|{1}|{2}|{3}|{4}' -f $details['z-corrupt.lnk'], $details['zero.lnk'], $details['big.lnk'], $details['long-comment.lnk'], $details['long-wd.lnk']) 'ショートカットの形式ではありません|ショートカットの形式ではありません|1 MB を超えるため、ショートカットとして読んでいません|コメントが 260 文字を超えるため、Windows の部品（WScript.Shell）で正しく読めません|作業フォルダが 260 文字を超えるため、Windows の部品（WScript.Shell）で正しく読めません'
     Assert-Equal '除外とリンクの詳細' ('{0}|{1}|{2}' -f $details['ShortcutTarget_PC01_20260101_000000'], $details['$RECYCLE.BIN'], $details['jloop']) 'このツールの結果のフォルダ|ごみ箱・システムの管理用のフォルダ|ジャンクション'
     $summary = $x.Lines -join "`n"
-    Assert-Equal 'summary の 1 行目' (@($x.Lines) + '')[0] 'ショートカットのリンク先置き換え (Update-ShortcutTarget 1.0.0)'
+    Assert-Equal 'summary の 1 行目' (@($x.Lines) + '')[0] 'ショートカットのリンク先置き換え (Update-ShortcutTarget 1.0.1)'
     Assert-Equal 'summary の対象と日時の行' ('{0}|{1}' -f (@($x.Lines) + '' + '')[1], [regex]::IsMatch((@($x.Lines) + '' + '' + '')[2], ('^\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}   {0}（管理者: (はい|いいえ)）$' -f [regex]::Escape($env:COMPUTERNAME)))) "対象: $main|True"
     Assert-Equal '件数の行' ([regex]::IsMatch($summary, '\nショートカット 19 件  共有フォルダを指すもの 18 件  所要 \d+\.\d秒\nスキップ 6 件（権限なし 1・読めないショートカット 5）  たどらなかったリンク 1 件  除外 2 件\n')) 'True'
     Assert-Equal 'サーバーごとの件数（件数の多い順）' ([regex]::IsMatch($summary, '■ サーバーごとの件数\n サーバー\s+件数\n 127\.0\.0\.1\s+16\n 127\.0\.0\.10\s+2\n 127\.0\.0\.1x\s+1\n')) 'True'
@@ -752,6 +752,14 @@ try {
     }
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $run = Invoke-ViaCmd ('{0} -NoSave -From 127.0.0.1 -Path "{1}\"' -f $cmdBase, $main)
     Assert-Equal '最後の引数が "パス\"' ('{0}/{1}' -f $run.Code, $run.Log.Contains('127.0.0.1 を指すもの 16 件')) '0/True'
@@ -807,7 +815,7 @@ try {
     $clmCode = $LASTEXITCODE
     Assert-Equal '制約付き言語モード: 止まる' ('{0}/{1}/{2}' -f $clmCode, $clm.Contains('制約付き言語モードでは使えません（AppLocker や WDAC でスクリプトの実行が制限されている環境です）'), (Test-Path -LiteralPath "$workRoot\clm")) '1/True/False'
     $help = (@(& $Exe -NoProfile -ExecutionPolicy Bypass -Command ("Get-Help '{0}' -Full | Out-String -Width 300" -f $tool) 2>&1) | ForEach-Object { "$_" }) -join "`n"
-    Assert-Equal 'ヘルプ（概要・ツール名と版・著作権）' ('{0}/{1}/{2}' -f $help.Contains('ショートカット（.lnk）のリンク先にある共有フォルダのサーバーを'), $help.Contains('Update-ShortcutTarget 1.0.0'), $help.Contains('Copyright (c) 2026 結進舎')) 'True/True/True'
+    Assert-Equal 'ヘルプ（概要・ツール名と版・著作権）' ('{0}/{1}/{2}' -f $help.Contains('ショートカット（.lnk）のリンク先にある共有フォルダのサーバーを'), $help.Contains('Update-ShortcutTarget 1.0.1'), $help.Contains('Copyright (c) 2026 結進舎')) 'True/True/True'
 
     Write-Section '地域設定'
     # 日付と数値の書式が、OS の地域設定によって変わらないこと

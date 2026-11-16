@@ -262,7 +262,7 @@ try {
     $row = $x.Matches | Select-Object -First 1
     Assert-Equal 'matches.csv の 1 行' ('{0}|{1}|{2}|{3}' -f $row.'一致した語', $row.'一致した行', $row.'文字コード', ($row.'最終更新日時' -match '^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}$')) 'hit|line 05 hit|UTF-8|True'
     Assert-Equal '結果の行' (Get-ResultText $run.Log) '結果: 一致 4 行（1 ファイル）   調べたファイル 1 件'
-    Assert-Equal 'summary の 1 行目' $x.Lines[0] 'ログ横断検索 (Search-Log 1.0.0)'
+    Assert-Equal 'summary の 1 行目' $x.Lines[0] 'ログ横断検索 (Search-Log 1.0.1)'
     Assert-Equal 'summary の対象の行' ([regex]::IsMatch($x.Lines[1], ('^対象: {0}（\*\.log, \*\.txt）   \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}   {1}$' -f [regex]::Escape($ctxDir), [regex]::Escape([Environment]::MachineName)))) 'True'
     Assert-Equal 'summary の検索の行' $x.Lines[2] '検索: hit（大文字と小文字を区別しない）   前 2 行・後ろ 2 行'
     Assert-Equal 'summary のファイルごとの件数' ($x.Lines[-1]) ('         4 行  UTF-8      {0}' -f $ctxFile)
@@ -511,6 +511,14 @@ try {
     }
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $cmdOut  = Join-Path $workRoot 'out\cmd'
     $run = Invoke-ViaCmd ('{0} -Path "{1}" -Pattern "timeout|refused" -Context "1,0" -OutputFolder "{2}\"' -f $cmdBase, $patDir, $cmdOut)

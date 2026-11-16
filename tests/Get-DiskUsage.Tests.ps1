@@ -262,6 +262,14 @@ try {
     Assert-Equal 'summary の除外行' ([regex]::IsMatch($x.Summary, '除外したフォルダ 3 件')) 'True'
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     # -Exclude のカンマ区切りと、最後の引数が "パス\"（\" が引用符のまま届く）の場合
     $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoCsv -Exclude "*\node_modules,*\lvl2" -Path "{2}\"' -f $Exe, $tool, $tree)
     Assert-Equal '終了コード' $run.Code 0
@@ -271,6 +279,24 @@ try {
     $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Path "{2}\" -NoCsv' -f $Exe, $tool, $tree)
     Assert-Equal '"パス\" の後ろに引数: 終了コード' $run.Code 1
     Assert-Equal '"パス\" の後ろに引数: ヒント' ([regex]::IsMatch($run.Log, '最後に \\ を付けないでください')) 'True'
+    # 位置で受ける -Path に、余った値が入る場合（名前を付けて渡した値の \" の後ろ）も、引用符のヒントを先に出す
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Exclude "*\a\" -NoCsv -OutputFolder "{2}"' -f $Exe, $tool, "$workRoot\out unknown")
+    Assert-Equal '位置で受ける -Path に余りが入る（-Exclude のヒント）' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains('-Exclude の値に引用符（"）が残っています'), (Test-Path -LiteralPath "$workRoot\out unknown")) '1/True/False'
+    # -Path を名前付きで渡すと、余った値（"*\a b" の b）はどのパラメーターにも当たらない。そのときも、余りの案内より引用符のヒントを先に出す
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Path "{2}\" -Exclude "*\a b" -NoCsv' -f $Exe, $tool, $tree)
+    Assert-Equal '余りがどのパラメーターにも当たらない（-Path のヒントを先に出す）' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains('-Path の値に引用符（"）が残っています'), $run.Log.Contains('どのパラメーターにも当たらない')) '1/True/False'
+    # 余った引数は、空白を含むものを引用符で囲んで、渡した順に示す
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -Path "{2}" -NoCsv extra "a b"' -f $Exe, $tool, $tree)
+    Assert-Equal '余った引数の示し方' ('{0}/{1}' -f $run.Code, $run.Log.Contains('どのパラメーターにも当たらない引数があります: extra "a b"')) '1/True'
+    # 引用符の確認は、カンマ区切りの要素ごとに前後の引用符を外してから行う（1.0.0 と同じ）。要素ごとに "..." で囲んだ値は止めない。
+    # 5.1 から外部コマンドに " を渡すと落ちるので、PowerShell の中から呼ぶ補助スクリプトで渡す
+    $quotedParts = Join-Path $workRoot 'quoted-parts.ps1'
+    [IO.File]::WriteAllText($quotedParts, ("& '{0}' -Path '{1}' -NoCsv -Exclude '`"*\node_modules`",`"*\lvl2`"'`r`nexit `$LASTEXITCODE" -f $tool.Replace("'", "''"), $tree.Replace("'", "''")), (New-Object Text.UTF8Encoding $true))
+    $quotedLog = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $quotedParts 2>&1 | Out-String)
+    Assert-Equal '要素ごとに "..." で囲んだ -Exclude は止めない' ('{0}/{1}' -f $LASTEXITCODE, ([regex]::Match($quotedLog, 'ファイル \S+ 件').Value)) '0/ファイル 6 件'
+    # -Path の名前を省略しても、今までどおり動く
+    $run = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" "{2}" -NoCsv' -f $Exe, $tool, $tree)
+    Assert-Equal '-Path の名前を省略' ('{0}/{1}' -f $run.Code, ([regex]::Match($run.Log, 'ファイル \S+ 件').Value)) '0/ファイル 9 件'
 
     Write-Section '異常系'
     $log = ConvertTo-FlatText (& $Exe -NoProfile -ExecutionPolicy Bypass -File $tool -Path (Join-Path $workRoot 'no\such\folder') 2>&1 | Out-String)

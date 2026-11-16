@@ -363,7 +363,7 @@ try {
     Assert-Equal 'files.csv の並び（判定できないもの）' (($order | Where-Object { @('utf8bom-bad.txt', 'utf16-bad.txt', 'unknown.txt', 'nec.txt') -contains $_ }) -join ',') 'nec.txt,unknown.txt,utf16-bad.txt,utf8bom-bad.txt'
     Assert-Equal 'files.csv の並び（同じ文字コードと改行の中はパスの順）' (($order | Where-Object { @('ascii.csv', 'noline.txt', 'empty.txt', 'nul-late.txt', 'mixed.txt', 'cr.txt', 'big.log', '[a]\f[1].txt') -contains $_ }) -join ',') 'cr.txt,ascii.csv,[a]\f[1].txt,big.log,empty.txt,noline.txt,nul-late.txt,mixed.txt'
     $summaryText = $x.Lines -join "`n"
-    Assert-Equal 'summary の 1 行目' (@($x.Lines) + '')[0] '文字コード判定・変換 (Convert-TextEncoding 1.0.0)'
+    Assert-Equal 'summary の 1 行目' (@($x.Lines) + '')[0] '文字コード判定・変換 (Convert-TextEncoding 1.0.1)'
     Assert-Equal 'summary の対象の行' ([regex]::IsMatch((@($x.Lines) + '' + '')[1], ('^対象: {0}（既定の拡張子）   \d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}:\d{{2}}   {1}$' -f [regex]::Escape($det), [regex]::Escape($env:COMPUTERNAME)))) 'True'
     Assert-Equal '内訳は件数の多い順' ([regex]::IsMatch($summaryText, '■ 文字コードと改行の内訳\n 文字コード\s+改行\s+件数\n UTF-8（BOM なし）\s+LF\s+5\n')) 'True'
     Assert-Equal 'summary の件数の行' ([regex]::IsMatch($summaryText, ('\nファイル {0} 件  所要 \d+\.\d秒\nスキップ 2 件（権限なし）  たどらなかったリンク 1 件\n保存先: ' -f ($detFiles.Count + 2)))) 'True'
@@ -616,6 +616,14 @@ try {
     }
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $run = Invoke-ViaCmd ('{0} -NoSave -Filter "*.csv,*.bat" -Path "{1}\"' -f $cmdBase, $det)
     Assert-Equal '最後の引数が "パス\"・カンマ区切りの -Filter' ('{0}/{1}' -f $run.Code, [regex]::Match($run.Log, 'ファイル \S+ 件').Value) '0/ファイル 2 件'

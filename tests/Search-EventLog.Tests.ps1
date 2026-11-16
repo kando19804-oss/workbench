@@ -472,7 +472,7 @@ try {
         Assert-Equal ('{0} は BOM 付き UTF-8' -f $name) ($head -join ',') '239,187,191'
     }
     $summaryText = $x.Lines -join "`n"
-    Assert-Equal 'summary.txt の先頭' $x.Lines[0] 'イベントログ抽出 (Search-EventLog 1.0.0)'
+    Assert-Equal 'summary.txt の先頭' $x.Lines[0] 'イベントログ抽出 (Search-EventLog 1.0.1)'
     Assert-Equal 'summary.txt の集計' $summaryText.Contains('■ 集計（件数の多い順）') 'True'
     Assert-Equal 'summary.txt の件数の行' $summaryText.Contains('イベント 8 件（重大 1・エラー 7）') 'True'
     Assert-Equal 'summary.txt の保存先' $x.Lines[-1] ('保存先: {0}' -f $run.Dir)
@@ -1050,7 +1050,7 @@ try {
         Assert-Equal $case[0] ('{0}/{1}' -f $run.Code, $run.Log.Contains($case[2])) '1/True'
     }
     $run = Invoke-Plain @('positional-value')
-    Assert-Equal '名前のない引数は受け付けない' $run.Code 1
+    Assert-Equal '名前のない引数は受け付けない（日本語の案内を出して止める）' ('{0}/{1}' -f $run.Code, $run.Log.Contains('どのパラメーターにも当たらない引数があります: positional-value')) '1/True'
 
     Write-Section '保存'
     $run = Invoke-Plain ($mainArgs + @('-NoSave', '-OutputFolder', "$workRoot\out\nosave"))
@@ -1091,6 +1091,14 @@ try {
     Assert-Equal '想定外のエラー: 結果を残さず、中断とは区別する' ('{0}/{1}/{2}/{3}' -f $run.Code, $run.Log.Contains('エラーで止まりました。結果は保存していません。'), $run.Log.Contains('中断しました'), [bool]$run.Dir) '1/True/False/False'
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdHead = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $rangeText = '-Since "2026-06-15 09:00" -Until "2026-06-15 11:00"'
     $run = Invoke-ViaCmd ('{0} -NoSave {1} -Level "Critical,Error" -Path "{2}\"' -f $cmdHead, $rangeText, $treeDir)

@@ -601,7 +601,7 @@ public static class WorkbenchTestFileTime {
     New-TextFile "$view\memo (1).txt" 'memo2'
     New-TextFile "$view\孤児 - コピー.txt" 'x'
     $vr = Invoke-Tool 'view' @('-Path', $view, '-MinSize', '1KB')
-    Assert-Equal '先頭の行' $vr.Log.StartsWith('重複ファイル検出 (Find-DuplicateFile 1.0.0)') 'True'
+    Assert-Equal '先頭の行' $vr.Log.StartsWith('重複ファイル検出 (Find-DuplicateFile 1.0.1)') 'True'
     Assert-Equal '対象の行' (Test-Contains $vr.Log "対象: $view") 'True'
     Assert-Equal '条件の行（1 KB）' (Test-Contains $vr.Log '条件: 内容を比べるのは 1 KB 以上のファイル') 'True'
     Assert-Equal '調べたファイルの行' ([regex]::IsMatch($vr.Log, '調べたファイル 10 件（15\.2 KB）  フォルダ 1 件  所要 \d+\.\d秒')) 'True'
@@ -634,7 +634,7 @@ public static class WorkbenchTestFileTime {
     $row = @(Get-CopyRowIn $vr "$view\孤児 - コピー.txt")[0]
     Assert-Equal '元が見つからない行は元の列が空' ('{0}/{1}/{2}' -f $row.'元と思われるファイル', $row.'元のサイズ(バイト)', $row.'元の最終更新日時') '//'
     $summary = @([IO.File]::ReadAllLines((Join-Path $vr.Dir 'summary.txt')))
-    Assert-Equal 'summary.txt の先頭' $summary[0] '重複ファイル検出 (Find-DuplicateFile 1.0.0)'
+    Assert-Equal 'summary.txt の先頭' $summary[0] '重複ファイル検出 (Find-DuplicateFile 1.0.1)'
     Assert-Equal 'summary.txt の最後は保存先' $summary[-1] "保存先: $($vr.Dir)"
     Assert-Equal 'summary.txt の見出しに上位と書かない' (@($summary | Where-Object { $_ -like '■*上位*' }).Count) 0
     Assert-Equal 'スキップがなければスキップの行を出さない' (Test-Contains $vr.Log 'スキップ') 'False'
@@ -999,6 +999,14 @@ public static class WorkbenchTestFileTime {
     Assert-Equal '想定外のエラー: 結果を残さず、中断とは区別する' ('{0}/{1}/{2}/{3}' -f $r.Code, (Test-Contains $r.Log 'エラーで止まりました。結果は保存していません。'), (Test-Contains $r.Log '中断しました'), [bool]$r.Dir) '1/True/False/False'
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdHead = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $r = Invoke-ViaCmd ('{0} -NoSave -MinSize 1KB -Path "{1},{2}"' -f $cmdHead, "$workRoot\m1", "$workRoot\m2")
     Assert-Equal 'カンマ区切りの -Path と終了コード 2' ('{0}/{1}' -f $r.Code, (Test-Contains $r.Log '重複 1 グループ')) '2/True'

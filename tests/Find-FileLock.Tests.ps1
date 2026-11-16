@@ -518,6 +518,15 @@ exit $LASTEXITCODE
     $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
     Assert-Equal '\" で引数を巻き込む: 終了コード' $LASTEXITCODE '1'
     Assert-Equal '\" で引数を巻き込む: ヒント' (Test-Contains $quote '-Path の値に引用符（"）が残っています') 'True'
+    # 1.0.1: 後ろに空白を含む引用符付きの値が続くと、その残りが位置で受ける -Path に入る（1.0.0 は「見つかりません」で止まっていた）。
+    # 引用符のヒントを先に出す
+    Write-Text $cmdFile ("@echo off`r`nchcp 65001 > nul`r`n{0} -NoProfile -ExecutionPolicy Bypass -File ""{1}"" -OutputFolder ""{2}\out_q\"" -NoSave ""a b""`r`nexit /b %ERRORLEVEL%`r`n" -f $Exe, $tool, $workRoot)
+    $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
+    Assert-Equal '\" の後ろに空白を含む値: ヒント' ('{0}/{1}/{2}' -f $LASTEXITCODE, (Test-Contains $quote '-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath "$workRoot\out_q")) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    Write-Text $cmdFile ("@echo off`r`nchcp 65001 > nul`r`n{0} -NoProfile -ExecutionPolicy Bypass -File ""{1}"" -Path ""{2}"" -NoSafe`r`nexit /b %ERRORLEVEL%`r`n" -f $Exe, $tool, $data)
+    $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
+    Assert-Equal 'どのパラメーターにも当たらない引数' ('{0}/{1}' -f $LASTEXITCODE, (Test-Contains $quote 'どのパラメーターにも当たらない引数があります: -NoSafe')) '1/True'
 
     # コマンドプロンプトでは ' がそのまま届く
     $singleFile = "$workRoot\single.cmd"
