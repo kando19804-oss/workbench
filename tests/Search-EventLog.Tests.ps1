@@ -588,6 +588,10 @@ try {
     Assert-Equal 'summary.txt の集計は（該当なし）' ($x.Lines -join "`n").Contains('    （該当なし）') 'True'
     $run = Invoke-Plain @('-Path', $main, '-Since', '2000-01-01', '-Until', '2000-01-02', '-NoSave')
     Assert-Equal '-NoSave でも終了コードは 2' ('{0}/{1}' -f $run.Code, $run.Log.Contains('該当するイベントはありません')) '2/True'
+    # 1.0.1: 余った引数を受け取る隠しパラメーター（-_UnknownArgument）を足しても、1.0.0 で通っていた名前の省略形は今までどおり通る
+    # （-UnknownArgument だと、-U が -Until と区別できず英語のエラーになっていた）
+    $run = Invoke-Plain @('-Path', $main, '-Since', '2000-01-01', '-U', '2000-01-02', '-NoSave')
+    Assert-Equal '名前の省略形 -U は -Until' ('{0}/{1}' -f $run.Code, $run.Log.Contains('該当するイベントはありません')) '2/True'
 
     Write-Section 'イベント ID'
     $manyIds = (@(1) + (2001..2015)) -join ','
