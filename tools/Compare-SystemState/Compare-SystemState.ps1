@@ -37,6 +37,10 @@
 .PARAMETER NoSave
     結果を保存せず、画面表示だけにします。-Snapshot と一緒には使えません。
 
+.PARAMETER _UnknownArgument
+    指定しません。どのパラメーターにも当たらない引数（パラメーターの名前の書き間違いなど）を受け取り、
+    案内を出して止まるためのものです。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Compare-SystemState.ps1 -Snapshot
 
@@ -48,7 +52,7 @@
     作業の後に、保存しておいた状態と今の状態を比べます。
 
 .NOTES
-    Compare-SystemState 1.0.0
+    Compare-SystemState 1.0.1
     Copyright (c) 2026 結進舎
     Released under the MIT License.
     https://github.com/kando19804-oss/workbench/blob/main/LICENSE
@@ -71,7 +75,11 @@ param(
 
     [string]$OutputFolder,
 
-    [switch]$NoSave
+    [switch]$NoSave,
+
+    # どのパラメーターにも当たらない引数を受け取る（案内を出して止めるため。指定しない）
+    [Parameter(ValueFromRemainingArguments = $true, DontShow = $true)]
+    [string[]]$_UnknownArgument
 )
 
 # 制約付き言語モード（AppLocker や WDAC の環境）では、このツールが使う .NET の型や COM を使えないので、最初に止める
@@ -83,11 +91,13 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.1'
 $ToolName      = 'Compare-SystemState'
 $ToolTitle     = '作業前後スナップショット比較'
 $ScreenRows    = 200      # 画面に表示する違いの件数（保存するときだけ。超えた分はファイルを見てもらう）
 $DynamicPort   = 49152    # Windows が動的に割り当てるポートの範囲の始まり
+$UnreadableMode    = '不明'   # 設定を読めないサービスのスタートアップ
+$ServiceConfigNote = 'サービスの設定を読む権限がありません'
 $DiffColumns   = '結果', '項目', '対象', '属性', '基準の値', '比較の値', '備考'
 $SkipColumns   = '理由', '項目', '詳細'
 $TimeFormat    = 'yyyy/MM/dd HH:mm:ss'
@@ -280,6 +290,26 @@ function Stop-WithQuoteError([string]$Name, [string]$Value) {
     Stop-WithError (('{0} の値に引用符（"）が残っています: {1}' -f $Name, $Value) + "`r`n" +
         'パスを引用符で囲むときは、最後に \ を付けないでください（例: {0} "C:\tools\結果"）。' -f $Name + '最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
 }
+
+# 引数の値に引用符（"）が残っていないかを、ほかの確認より先にまとめて確かめ、そのあと、どのパラメーターにも当たらない引数
+# （-_UnknownArgument に集まる）があれば止める。コマンドプロンプトで "C:\data\" のように最後を \" にすると、引用符が閉じずに
+# 後ろの引数までその値に入り、空白を含む値の残りが余るか（-Path "C:\data\" -Since "2026-11-12 09:00" なら 09:00）、位置で受ける
+# パラメーターに入る。どちらでも、引用符の書き方を先に案内する。カンマ区切りの値は、要素ごとに前後の引用符を外してから確かめる
+function Assert-CommandArgument($Bound, [string[]]$QuoteNames) {
+    foreach ($name in $QuoteNames) {
+        if (-not $Bound.ContainsKey($name)) { continue }
+        foreach ($value in @($Bound[$name])) {
+            foreach ($part in ([string]$value -split ',')) {
+                if ((Remove-Quote $part).Trim("'").Contains('"')) { Stop-WithQuoteError ('-' + $name) (Remove-Quote ([string]$value)) }
+            }
+        }
+    }
+    if (-not $Bound.ContainsKey('_UnknownArgument')) { return }
+    $shown = @(foreach ($arg in @($Bound['_UnknownArgument'])) { if ([string]$arg -match '^$|\s') { '"{0}"' -f $arg } else { [string]$arg } }) -join ' '
+    Stop-WithError (('どのパラメーターにも当たらない引数があります: {0}' -f $shown) + "`r`n" +
+        'パラメーターの名前の書き間違いや、空白を含む値の引用符（"）の付け忘れがないかを確かめてください。コマンドプロンプトで値の最後を \" にしたとき（"C:\data\" など）も、後ろの引数がずれてこうなります。')
+}
+Assert-CommandArgument $PSBoundParameters @('Reference', 'Difference', 'OutputFolder')
 
 # .NET の IsPathRooted は | などの文字で例外を出すため、先頭の形で判定する
 function Test-RootedPath([string]$Text) {
@@ -509,9 +539,11 @@ function Open-MachineKey([string]$SubKey, [string]$View) {
 
 # サービスのレジストリから、種類（Type）とトリガーの有無を調べる。
 # Type の SERVICE_USER_SERVICE（0x40）はユーザーごとのサービス、SERVICE_USERSERVICE_INSTANCE（0x80）はログオンごとの実体（末尾が変わる）。
-# TriggerInfo があるサービスは、Windows が必要なときに開始する（services.msc の「トリガー開始」）
+# TriggerInfo があるサービスは、Windows が必要なときに開始する（services.msc の「トリガー開始」）。
+# Start・DelayedAutoStart・ObjectName・ImagePath は、Win32_Service が設定を読めないサービスを補うために読む（管理者でなくても読める）。
+# Start がないか読めないときは -1
 function Get-ServiceKeyInfo([string]$Name) {
-    $info = [pscustomobject]@{ Bits = 0; Trigger = $false }
+    $info = [pscustomobject]@{ Bits = 0; Trigger = $false; Start = -1; Delayed = $false; User = ''; Image = '' }
     try {
         $key = Open-MachineKey ('SYSTEM\CurrentControlSet\Services\' + $Name) 'Default'
         if ($key) {
@@ -519,6 +551,10 @@ function Get-ServiceKeyInfo([string]$Name) {
                 $info.Bits = [int]$key.GetValue('Type', 0)
                 $triggerKey = $key.OpenSubKey('TriggerInfo')
                 if ($triggerKey) { $info.Trigger = $true; $triggerKey.Dispose() }
+                $info.Delayed = [int]$key.GetValue('DelayedAutoStart', 0) -eq 1
+                $info.User    = [string]$key.GetValue('ObjectName', '')
+                $info.Image   = [string]$key.GetValue('ImagePath', '')
+                $info.Start   = [int]$key.GetValue('Start', -1)
             } finally {
                 $key.Dispose()
             }
@@ -527,22 +563,61 @@ function Get-ServiceKeyInfo([string]$Name) {
     return $info
 }
 
+# サービスの表示名。Get-Service は、サービスの一覧（設定を読む権限は要らない）から表示名を返すので、
+# Win32_Service が設定を読めないサービス（表示名の代わりにサービス名を返す）を補える。最初に呼ばれたときに一覧を作る
+$serviceDisplayNames = $null
+function Get-ServiceDisplayName([string]$Name) {
+    if ($null -eq $script:serviceDisplayNames) {
+        $script:serviceDisplayNames = @{}
+        try {
+            foreach ($service in @(Get-Service -ErrorAction SilentlyContinue)) { $script:serviceDisplayNames[[string]$service.Name] = [string]$service.DisplayName }
+        } catch { }
+    }
+    if ($script:serviceDisplayNames.ContainsKey($Name)) { return [string]$script:serviceDisplayNames[$Name] }
+    return ''
+}
+
 function Read-ItemService($Rows) {
     $stateNames = @{ 'Running' = '実行中'; 'Stopped' = '停止'; 'Paused' = '一時停止'; 'Start Pending' = '開始中'; 'Stop Pending' = '停止中'; 'Pause Pending' = '一時停止中'; 'Continue Pending' = '再開中' }
     $modeNames  = @{ 'Auto' = '自動'; 'Manual' = '手動'; 'Disabled' = '無効'; 'Boot' = 'ブート'; 'System' = 'システム' }
+    $startModes = @{ 0 = 'Boot'; 1 = 'System'; 2 = 'Auto'; 3 = 'Manual'; 4 = 'Disabled' }   # レジストリの Start の値
+    $unreadable = New-Object 'System.Collections.Generic.List[string]'
     foreach ($s in @(Get-CimInstance -ClassName Win32_Service -ErrorAction Stop)) {
         $name  = [string]$s.Name
         $state = [string]$s.State
         if ($stateNames.ContainsKey($state)) { $state = $stateNames[$state] }
         $mode = [string]$s.StartMode
-        if ($modeNames.ContainsKey($mode)) { $mode = $modeNames[$mode] }
+        $displayName = [string]$s.DisplayName
+        $user = [string]$s.StartName
+        $pathName = [string]$s.PathName
+        $delayed = [bool](Get-OptionalValue $s 'DelayedAutoStart')
         $keyInfo = Get-ServiceKeyInfo $name
+        # Windows は、設定を読む権限のないサービス（管理者でないときの LSM など）を、スタートアップ Unknown・表示名はサービス名・
+        # 実行ユーザーと実行ファイルは空で返す。サービスのレジストリは管理者でなくても読めて、読めるサービスでは Win32_Service と
+        # 同じ値なので、そこから補う。表示名は Get-Service で補う。レジストリも読めないときは、スタートアップを「不明」、
+        # 実行ユーザーと実行ファイルを空にして、skipped.csv に残す
+        $isUnreadable = $false
+        if ($mode -eq 'Unknown' -or -not $mode) {
+            $displayName = Get-ServiceDisplayName $name
+            if ($startModes.ContainsKey($keyInfo.Start)) {
+                $mode     = $startModes[$keyInfo.Start]
+                $delayed  = $keyInfo.Delayed
+                $user     = $keyInfo.User
+                $pathName = $keyInfo.Image
+            } else {
+                $isUnreadable = $true
+                $mode     = $UnreadableMode
+                $delayed  = $false
+                $user     = ''
+                $pathName = ''
+            }
+        }
+        if ($modeNames.ContainsKey($mode)) { $mode = $modeNames[$mode] }
         # services.msc と同じく、遅延開始とトリガー開始を書き添える（「自動（遅延・トリガー）」「手動（トリガー）」）
         $marks = @()
-        if ($mode -eq '自動' -and (Get-OptionalValue $s 'DelayedAutoStart')) { $marks += '遅延' }
+        if ($mode -eq '自動' -and $delayed) { $marks += '遅延' }
         if ($keyInfo.Trigger -and ($mode -eq '自動' -or $mode -eq '手動')) { $marks += 'トリガー' }
         if ($marks.Count -gt 0) { $mode = '{0}（{1}）' -f $mode, ($marks -join '・') }
-        $user = [string]$s.StartName
         # ユーザーごとのサービスは、ログオンのたびに名前の末尾と状態が変わるので、末尾を除いた名前にまとめ、状態と実行ユーザーは比べない
         $bits = $keyInfo.Bits
         if (($bits -band 0x40) -ne 0) {
@@ -550,8 +625,20 @@ function Read-ItemService($Rows) {
             $state = ''
             $user  = ''
         }
-        Add-Row $Rows $name $s.DisplayName $state $mode $user $s.PathName
+        Add-Row $Rows $name $displayName $state $mode $user $pathName
+        if ($isUnreadable -and -not $unreadable.Contains($name)) { $unreadable.Add($name) }
     }
+    $names = $unreadable.ToArray()
+    [Array]::Sort($names, [StringComparer]::OrdinalIgnoreCase)
+    foreach ($name in $names) {
+        Add-PartialSkip $name (New-Object UnauthorizedAccessException ('スタートアップ・実行ユーザー・実行ファイルを読めません（{0}）' -f $ServiceConfigNote))
+    }
+}
+
+# 設定を読めなかったサービス（上の Read-ItemService が skipped.csv に残すもの）か。設定を読めなかっただけで、サービスが
+# あることは分かっているので、この理由では、サービスの「追加」「削除」を確かでないものにしない
+function Test-ServiceConfigSkip($Skip) {
+    return $Skip[0] -eq '権限なし' -and $Skip[1] -eq 'Service' -and ([string]$Skip[2]).EndsWith(('（{0}）' -f $ServiceConfigNote), [StringComparison]::Ordinal)
 }
 
 function Read-ItemPort($Rows) {
@@ -1058,6 +1145,12 @@ function Compare-Item([string]$Name, $RefTable, $DifTable, $Results, [bool]$RefP
         foreach ($column in $def.Compare) {
             $index = $def.Index[$column]
             if ([string]::Equals($refRow[$index], $difRow[$index], [StringComparison]::Ordinal)) { continue }
+            # 設定を読めなかったサービス（スタートアップが「不明」。1.0.0 で保存したものは「Unknown」）は、どちらか一方でも、
+            # スタートアップ・実行ユーザー・実行ファイルを比べない（読めなかったことは skipped.csv に残している）。状態は読めるので比べる
+            if ($Name -eq 'Service' -and $column -ne '状態') {
+                $modeIndex = $def.Index['スタートアップ']
+                if (@($UnreadableMode, 'Unknown') -contains $refRow[$modeIndex] -or @($UnreadableMode, 'Unknown') -contains $difRow[$modeIndex]) { continue }
+            }
             $isMinor = $isDynamic
             $rowNote = $note
             # 手動開始のサービスと、遅延開始でトリガーも持つサービスは、Windows が必要なときに起動して止めるので、状態の変化だけなら通常の動き
@@ -1276,8 +1369,8 @@ try {
                 $notCompared.Add($name)
                 continue
             }
-            $refPartial = @($refState.Skips | Where-Object { $_[1] -eq $name }).Count -gt 0
-            $difPartial = @($difState.Skips | Where-Object { $_[1] -eq $name }).Count -gt 0
+            $refPartial = @($refState.Skips | Where-Object { $_[1] -eq $name -and -not (Test-ServiceConfigSkip $_) }).Count -gt 0
+            $difPartial = @($difState.Skips | Where-Object { $_[1] -eq $name -and -not (Test-ServiceConfigSkip $_) }).Count -gt 0
             $itemCount[$name] = Compare-Item $name $refItem.Table $difItem.Table $results $refPartial $difPartial
         }
 
