@@ -54,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File .\Find-NetworkDevice.ps1 -NoSave
 ## 画面の表示例
 
 ```
-ネットワークの機器一覧 (Find-NetworkDevice 1.0.0)
+ネットワークの機器一覧 (Find-NetworkDevice 1.0.1)
 対象: 192.168.1.0/24（192.168.1.1 ～ 192.168.1.254・254 件）   イーサネット
 2026-11-01 16:00:00   PC01（192.168.1.23）
 

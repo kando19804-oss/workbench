@@ -93,7 +93,7 @@ NoSave = false
 ## 画面の表示例
 
 ```
-重複ファイル検出 (Find-DuplicateFile 1.0.0)
+重複ファイル検出 (Find-DuplicateFile 1.0.1)
 対象: D:\share, E:\archive
 2026-11-02 21:10:05   SERVER01（管理者: はい）
 条件: 内容を比べるのは 1 MB 以上のファイル

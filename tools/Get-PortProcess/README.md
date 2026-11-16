@@ -47,7 +47,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-PortProcess.ps1 -Port 8080 -NoSav
 ## 画面の表示例
 
 ```
-ポート使用プロセス特定 (Get-PortProcess 1.0.0)
+ポート使用プロセス特定 (Get-PortProcess 1.0.1)
 対象: SERVER01   2026-10-31 15:10:00   管理者: はい
 条件: ポート 443, 8080   TCP は待ち受けのみ
 該当 3 件（プロセス 2 個）

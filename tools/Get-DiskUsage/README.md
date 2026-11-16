@@ -146,7 +146,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-DiskUsage.ps1 -ConfigFile .\month
 ## 画面の表示例
 
 ```
-容量検索 (Get-DiskUsage 1.0.0)
+容量検索 (Get-DiskUsage 1.0.1)
 対象: C:\   2026-10-29 21:30:12   SERVER01（管理者: はい）
 ドライブ C:  使用 182.4 GB / 全体 237.9 GB（空き 55.5 GB）
 集計 168.2 GB  ファイル 412,385 件  フォルダ 98,214 件  所要 2分14秒

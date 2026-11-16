@@ -40,6 +40,10 @@
 .PARAMETER NoSave
     結果を保存せず、画面表示だけにします。-OutputFolder と一緒には使えません。
 
+.PARAMETER _UnknownArgument
+    指定しません。どのパラメーターにも当たらない引数（パラメーターの名前の書き間違いなど）を受け取り、
+    案内を出して止まるためのものです。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Get-LogonHistory.ps1
 
@@ -56,7 +60,7 @@
     ほかのサーバーから集めた .evtx ファイルを読みます。
 
 .NOTES
-    Get-LogonHistory 1.0.0
+    Get-LogonHistory 1.0.1
     Copyright (c) 2026 結進舎
     Released under the MIT License.
     https://github.com/kando19804-oss/workbench/blob/main/LICENSE
@@ -79,7 +83,11 @@ param(
 
     [string]$OutputFolder,
 
-    [switch]$NoSave
+    [switch]$NoSave,
+
+    # どのパラメーターにも当たらない引数を受け取る（案内を出して止めるため。指定しない）
+    [Parameter(ValueFromRemainingArguments = $true, DontShow = $true)]
+    [string[]]$_UnknownArgument
 )
 
 # 制約付き言語モード（AppLocker や WDAC の環境）では、このツールが使う .NET の型を使えないので、最初に止める
@@ -91,7 +99,7 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion    = '1.0.0'
+$ScriptVersion    = '1.0.1'
 $ToolName         = 'Get-LogonHistory'
 $ToolTitle        = 'ログオンの履歴'
 $ScreenRows       = 20       # 画面に表示する各表の行数（保存するときだけ）
@@ -405,6 +413,26 @@ function Stop-WithQuoteError([string]$Name, [string]$Value, [string]$Example = '
     Stop-WithError (('{0} の値に引用符（"）が残っています: {1}' -f $Name, $Value) + "`r`n" +
         ('値を引用符で囲むときは、最後に \ を付けないでください（例: {0} "{1}"）。' -f $Name, $Example) + '最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
 }
+
+# 引数の値に引用符（"）が残っていないかを、ほかの確認より先にまとめて確かめ、そのあと、どのパラメーターにも当たらない引数
+# （-_UnknownArgument に集まる）があれば止める。コマンドプロンプトで "CORP\" のように最後を \" にすると、引用符が閉じずに
+# 後ろの引数までその値に入り、空白を含む値の残りが余る（-User "CORP\" -Since "2026-11-12 09:00" なら 09:00）。
+# その前に、引用符の書き方を案内する。QuoteExamples は、パラメーターの名前 → 正しい書き方の例
+function Assert-CommandArgument($Bound, $QuoteExamples) {
+    foreach ($name in @($QuoteExamples.Keys)) {
+        if (-not $Bound.ContainsKey($name)) { continue }
+        foreach ($value in @($Bound[$name])) {
+            foreach ($part in ([string]$value -split ',')) {
+                if ((Remove-Quote $part).Trim("'").Contains('"')) { Stop-WithQuoteError ('-' + $name) (Remove-Quote ([string]$value)) $QuoteExamples[$name] }
+            }
+        }
+    }
+    if (-not $Bound.ContainsKey('_UnknownArgument')) { return }
+    $shown = @(foreach ($arg in @($Bound['_UnknownArgument'])) { if ([string]$arg -match '^$|\s') { '"{0}"' -f $arg } else { [string]$arg } }) -join ' '
+    Stop-WithError (('どのパラメーターにも当たらない引数があります: {0}' -f $shown) + "`r`n" +
+        'パラメーターの名前の書き間違いや、空白を含む値の引用符（"）の付け忘れがないかを確かめてください。コマンドプロンプトで値の最後を \" にしたとき（"C:\data\" など）も、後ろの引数がずれてこうなります。')
+}
+Assert-CommandArgument $PSBoundParameters ([ordered]@{ Since = '2026-11-10 09:00'; Until = '2026-11-10 18:00'; User = 'CORP\yamada'; LogonType = 'Interactive'; Path = 'D:\collected'; OutputFolder = 'D:\collected' })
 
 # .NET の IsPathRooted は | などの文字で例外を出すため、先頭の形で判定する
 function Test-RootedPath([string]$Text) {

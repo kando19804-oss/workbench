@@ -65,7 +65,7 @@ powershell -ExecutionPolicy Bypass -File .\Search-Log.ps1 -Path "\\ap01\logs,\\a
 ## 画面の表示例
 
 ```
-ログ横断検索 (Search-Log 1.0.0)
+ログ横断検索 (Search-Log 1.0.1)
 対象: D:\logs（*.log, *.txt）   2026-10-31 15:30:00   SERVER01
 検索: timeout | refused（大文字と小文字を区別しない）   前 2 行・後ろ 2 行
 

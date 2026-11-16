@@ -112,7 +112,7 @@ NoSave = false
 ## 画面の表示例
 
 ```
-フォルダ差分 (Compare-Folder 1.0.0)
+フォルダ差分 (Compare-Folder 1.0.1)
 基準: \\old-fs\share\経理
 比較: \\new-fs\share\経理
 2026-11-01 10:00:00   SERVER01（管理者: はい）
@@ -144,7 +144,7 @@ NoSave = false
 `-Snapshot` で保存したときは、次のように表示します。
 
 ```
-フォルダ差分 (Compare-Folder 1.0.0)
+フォルダ差分 (Compare-Folder 1.0.1)
 スナップショットを保存します: D:\app
 2026-10-31 22:00:00   SERVER01（管理者: はい）
 保存する内容: サイズと更新日時とハッシュ（SHA-256）

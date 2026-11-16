@@ -67,7 +67,7 @@ powershell -ExecutionPolicy Bypass -File .\Convert-TextEncoding.ps1 -Path D:\inb
 判定だけのとき：
 
 ```
-文字コード判定・変換 (Convert-TextEncoding 1.0.0)
+文字コード判定・変換 (Convert-TextEncoding 1.0.1)
 対象: D:\scripts（既定の拡張子）   2026-11-01 15:00:00   PC01
 
 ■ 文字コードと改行の内訳

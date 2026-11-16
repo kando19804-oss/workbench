@@ -63,7 +63,7 @@ powershell -ExecutionPolicy Bypass -File .\Search-EventLog.ps1 -Path D:\collecte
 ## 画面の表示例
 
 ```
-イベントログ抽出 (Search-EventLog 1.0.0)
+イベントログ抽出 (Search-EventLog 1.0.1)
 対象: SERVER01（管理者: はい）   ログ: System, Application
 期間: 2026-10-31 15:00 ～ 2026-11-01 15:00（24 時間）   レベル: 重大, エラー
 

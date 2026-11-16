@@ -50,6 +50,10 @@
 .PARAMETER NoSave
     結果を保存せず、画面表示だけにします。
 
+.PARAMETER _UnknownArgument
+    指定しません。どのパラメーターにも当たらない引数（パラメーターの名前の書き間違いなど）を受け取り、
+    案内を出して止まるためのものです。
+
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File .\Search-EventLog.ps1
 
@@ -66,7 +70,7 @@
     D:\collected の下の .evtx ファイルから、直近 3 日の重大・エラーを取り出します。
 
 .NOTES
-    Search-EventLog 1.0.0
+    Search-EventLog 1.0.1
     Copyright (c) 2026 結進舎
     Released under the MIT License.
     https://github.com/kando19804-oss/workbench/blob/main/LICENSE
@@ -97,13 +101,17 @@ param(
 
     [string]$OutputFolder,
 
-    [switch]$NoSave
+    [switch]$NoSave,
+
+    # どのパラメーターにも当たらない引数を受け取る（案内を出して止めるため。指定しない）
+    [Parameter(ValueFromRemainingArguments = $true, DontShow = $true)]
+    [string[]]$_UnknownArgument
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.0'
+$ScriptVersion = '1.0.1'
 $ScreenGroups  = 30       # 画面に表示する集計の件数（保存するときだけ）
 $ScreenEvents  = 20       # 画面に表示する新しい順の件数（保存するときだけ）
 $ScreenMessage = 80       # 画面に表示するメッセージの長さ
@@ -244,6 +252,26 @@ function Stop-WithQuoteError([string]$Name, [string]$Value) {
     Stop-WithError (('{0} の値に引用符（"）が残っています: {1}' -f $Name, $Value) + "`r`n" +
         'パスを引用符で囲むときは、最後に \ を付けないでください（例: -Path "D:\collected"）。最後が \" になっていると、引用符が閉じずに後ろの引数までその値として扱われます。')
 }
+
+# 引数の値に引用符（"）が残っていないかを、ほかの確認より先にまとめて確かめ、そのあと、どのパラメーターにも当たらない引数
+# （-_UnknownArgument に集まる）があれば止める。コマンドプロンプトで "C:\data\" のように最後を \" にすると、引用符が閉じずに
+# 後ろの引数までその値に入り、空白を含む値の残りが余るか（-Path "C:\data\" -Since "2026-11-12 09:00" なら 09:00）、位置で受ける
+# パラメーターに入る。どちらでも、引用符の書き方を先に案内する。カンマ区切りの値は、要素ごとに前後の引用符を外してから確かめる
+function Assert-CommandArgument($Bound, [string[]]$QuoteNames) {
+    foreach ($name in $QuoteNames) {
+        if (-not $Bound.ContainsKey($name)) { continue }
+        foreach ($value in @($Bound[$name])) {
+            foreach ($part in ([string]$value -split ',')) {
+                if ((Remove-Quote $part).Trim("'").Contains('"')) { Stop-WithQuoteError ('-' + $name) (Remove-Quote ([string]$value)) }
+            }
+        }
+    }
+    if (-not $Bound.ContainsKey('_UnknownArgument')) { return }
+    $shown = @(foreach ($arg in @($Bound['_UnknownArgument'])) { if ([string]$arg -match '^$|\s') { '"{0}"' -f $arg } else { [string]$arg } }) -join ' '
+    Stop-WithError (('どのパラメーターにも当たらない引数があります: {0}' -f $shown) + "`r`n" +
+        'パラメーターの名前の書き間違いや、空白を含む値の引用符（"）の付け忘れがないかを確かめてください。コマンドプロンプトで値の最後を \" にしたとき（"C:\data\" など）も、後ろの引数がずれてこうなります。')
+}
+Assert-CommandArgument $PSBoundParameters @('Path', 'OutputFolder')
 
 # .NET の IsPathRooted は | などの文字で例外を出すため、先頭の形で判定する
 function Test-RootedPath([string]$Text) {

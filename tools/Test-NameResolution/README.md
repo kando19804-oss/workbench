@@ -179,7 +179,7 @@ hosts に書かれた名前をすべて対象にします。作業のときに�
 ## 画面の表示例
 
 ```
-名前解決確認 (Test-NameResolution 1.0.0)
+名前解決確認 (Test-NameResolution 1.0.1)
 2026-11-02 22:40:10   PC01（管理者: いいえ）
 対象 4 件   DNS サーバー: 10.0.0.53, 10.0.0.54（OS の設定）
 hosts: C:\Windows\System32\drivers\etc\hosts（有効な行 2 件）

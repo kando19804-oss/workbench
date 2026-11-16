@@ -39,7 +39,7 @@ powershell -ExecutionPolicy Bypass -File .\Find-FileLock.ps1 -Path D:\共有\経
 ## 画面の表示例
 
 ```
-ファイルロック特定 (Find-FileLock 1.0.0)
+ファイルロック特定 (Find-FileLock 1.0.1)
 対象: D:\共有\経理\売上.xlsx
 SERVER01   2026-11-03 10:00:00   管理者: はい
 
