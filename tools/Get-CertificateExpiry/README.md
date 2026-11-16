@@ -108,7 +108,7 @@ NoSave = false
 ## 画面の表示例
 
 ```
-証明書期限一覧 (Get-CertificateExpiry 1.0.0)
+証明書期限一覧 (Get-CertificateExpiry 1.0.1)
 2026-11-02 22:10:05   WEB01（管理者: はい）
 対象: LocalMachine\My, LocalMachine\WebHosting, LocalMachine\Remote Desktop, CurrentUser\My
 期限間近の基準: 残り 60 日以内

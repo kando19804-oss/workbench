@@ -306,7 +306,7 @@ try {
     Assert-Equal '最終更新日時の列' (@($x.Files | Where-Object { $_.'ファイル' -eq "$src\a.txt" }) | ForEach-Object { $_.'最終更新日時' }) '2025/01/02 03:04:05'
     Assert-Equal 'skipped.csv は見出しだけ' ('{0}/{1}' -f (Get-FirstLine $run.Dir 'skipped.csv'), (Get-LineCount $run.Dir 'skipped.csv')) '"理由","パス","詳細"/1'
     $sumLines = @($x.Summary -split '\r?\n')
-    Assert-Equal 'summary の 1 行目' $sumLines[0] 'フォルダのバックアップ (Backup-Folder 1.0.0)'
+    Assert-Equal 'summary の 1 行目' $sumLines[0] 'フォルダのバックアップ (Backup-Folder 1.0.1)'
     Assert-Equal 'summary のコピー元' $sumLines[1] "コピー元: $src"
     Assert-Equal 'summary のコピー先（形式と空き）' ("$($sumLines[2])" -match ('^' + [regex]::Escape("コピー先: $dst（") + '\w+・空き [\d.]+ [KMGTP]?B）$')) 'True'
     Assert-Equal 'summary の日時と管理者' ("$($sumLines[3])" -match '^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}   \S+（管理者: (はい|いいえ)）$') 'True'
@@ -815,6 +815,14 @@ try {
     Assert-Equal '保存先の既定はスクリプトのフォルダ' ('{0}/{1}' -f $run.Code, (Get-ResultFileNames (Get-RunDir $launchDir))) "0/$allFiles"
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdSrc = Join-Path $workRoot 'cmdsrc'
     New-TestFile "$cmdSrc\c.txt" 1
     $cmdBase = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool

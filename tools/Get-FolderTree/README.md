@@ -100,7 +100,7 @@ NoSave = false
 ## 画面の表示例
 
 ```
-フォルダツリー出力 (Get-FolderTree 1.0.0)
+フォルダツリー出力 (Get-FolderTree 1.0.1)
 対象: D:\project   2026-10-31 13:05:12   SERVER01
 条件: 3 階層まで・フォルダのみ
 除外: *\.git

@@ -237,7 +237,7 @@ try {
     Assert-Equal '件数の行' ([regex]::Match($run.Log, '機器 \S+ 台（[^）]*）').Value) '機器 3 台（ping に応答 3・応答なし 0）'
     Assert-Equal '対象の行' $run.Log.Contains('対象: 127.0.0.9-127.0.0.11（127.0.0.9 ～ 127.0.0.11・3 件）') 'True'
     Assert-Equal '対象の行は 1 回だけ' ([regex]::Matches($run.Log, '対象: ').Count) 1
-    Assert-Equal '先頭の行' $run.Log.StartsWith('ネットワークの機器一覧 (Find-NetworkDevice 1.0.0)') 'True'
+    Assert-Equal '先頭の行' $run.Log.StartsWith('ネットワークの機器一覧 (Find-NetworkDevice 1.0.1)') 'True'
     Assert-Equal '保存先の行' $run.Log.Contains(('保存先: {0}' -f $run.Dir)) 'True'
 
     Write-Section 'CSV とテキストの形'
@@ -251,7 +251,7 @@ try {
         Assert-Equal ('{0} は BOM 付き UTF-8' -f $name) ($head -join ',') '239,187,191'
     }
     $summary = @([IO.File]::ReadAllLines((Join-Path $run.Dir 'summary.txt')))
-    Assert-Equal 'summary.txt の先頭' $summary[0] 'ネットワークの機器一覧 (Find-NetworkDevice 1.0.0)'
+    Assert-Equal 'summary.txt の先頭' $summary[0] 'ネットワークの機器一覧 (Find-NetworkDevice 1.0.1)'
     Assert-Equal 'summary.txt に対象の行' (@($summary | Where-Object { $_ -like '対象: *' }).Count) 1
     Assert-Equal 'summary.txt に表の行' (@($summary | Where-Object { $_ -like ' 127.0.0.*' }).Count) 3
     Assert-Equal 'summary.txt の最後は保存先' $summary[-1] ('保存先: {0}' -f $run.Dir)
@@ -317,7 +317,7 @@ try {
         Assert-Equal ('-Timeout {0} は使える' -f $good) ('{0}/{1}' -f $run.Code, $run.Log.Contains('機器 1 台')) '0/True'
     }
     $run = Invoke-Plain @('positional-value')
-    Assert-Equal '名前のない引数は受け付けない' $run.Code 1
+    Assert-Equal '名前のない引数は受け付けない（日本語の案内を出して止める）' ('{0}/{1}' -f $run.Code, $run.Log.Contains('どのパラメーターにも当たらない引数があります: positional-value')) '1/True'
 
     Write-Section 'この PC のネットワークと ARP の表（差し替え）'
     $env:PATH = "$fakeBin;$savedPath"
@@ -677,6 +677,14 @@ foreach ($socket in $sockets.Values) { $socket.Close() }
     }
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdHead = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $run = Invoke-ViaCmd ('{0} -NoSave -Range "127.0.0.1-127.0.0.2,127.0.0.4"' -f $cmdHead)
     Assert-Equal 'カンマ区切りの -Range' ('{0}/{1}' -f $run.Code, ([regex]::Match($run.Log, '機器 \S+ 台').Value)) '0/機器 3 台'

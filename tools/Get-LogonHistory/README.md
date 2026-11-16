@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-LogonHistory.ps1 -Path D:\collect
 ## 画面の表示例
 
 ```
-ログオンの履歴 (Get-LogonHistory 1.0.0)
+ログオンの履歴 (Get-LogonHistory 1.0.1)
 対象: SERVER01（管理者: はい）   Security ログ: 2026-10-28 09:12 から残っています
 期間: 2026-11-05 15:00 ～ 2026-11-12 15:00（7 日）   種類: 対話, リモートデスクトップ, ロック解除
 
@@ -223,7 +223,8 @@ Windows は、ロック解除やリモートデスクトップの再接続のと
 | `-LogonType` に知らない種類を書いた | 「-LogonType に使えない種類があります: Remote」と、使える種類の一覧 |
 | `-Since` や `-Until` の書き方が違う、`-Since` が `-Until` より後 | 「-Since の日時を読めません: 2026-13-01」 |
 | `-NoSave` と `-OutputFolder` を一緒に指定した | 「-NoSave のときは、-OutputFolder は指定できません」 |
-| 値に `"` が残っている（コマンドプロンプトで `"C:\data\"` や `"CORP\"` のように最後を `\"` にした。`-Path`・`-OutputFolder`・`-User`・`-LogonType`・`-Since`・`-Until` のどれでも） | 「-OutputFolder の値に引用符（"）が残っています: …」と、正しい書き方。ただし、後ろに空白を含む値を引用符で囲んだ引数（`-Since "2026-11-12 09:00"` など）が続くと、スクリプトが動く前に PowerShell の英語のエラー（`A positional parameter cannot be found that accepts argument …`）で止まります |
+| 値に `"` が残っている（コマンドプロンプトで `"C:\data\"` や `"CORP\"` のように最後を `\"` にした。`-Path`・`-OutputFolder`・`-User`・`-LogonType`・`-Since`・`-Until` のどれでも。後ろに `-Since "2026-11-12 09:00"` のような空白を含む値が続く場合も） | 「-OutputFolder の値に引用符（"）が残っています: …」と、正しい書き方 |
+| どのパラメーターにも当たらない引数がある（パラメーターの名前の書き間違いなど） | 「どのパラメーターにも当たらない引数があります: -Usr yamada」 |
 | 保存先に書き込めない | 「保存先に書き込めません: \\fileserver\logon（理由）」と、「-NoSave を付けると、画面に表示だけします」 |
 | `-Path` のファイルをすべて読めなかった | 「読める .evtx ファイルがありません」と、ファイルごとの理由（見つからない、権限なし、形式が違うなど） |
 | `-Path` に Security ログの .evtx がない（セッションのログだけを指定したなど） | 「-Path に、Security ログの .evtx がありません」 |

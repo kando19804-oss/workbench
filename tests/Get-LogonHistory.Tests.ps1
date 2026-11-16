@@ -754,7 +754,7 @@ try {
 
     Write-Section '画面と summary.txt'
     $summary = $x.Lines
-    Assert-Equal 'summary.txt の先頭' $summary[0] 'ログオンの履歴 (Get-LogonHistory 1.0.0)'
+    Assert-Equal 'summary.txt の先頭' $summary[0] 'ログオンの履歴 (Get-LogonHistory 1.0.1)'
     Assert-Equal 'summary.txt の最後は保存先' $summary[-1] ('保存先: {0}' -f $run.Dir)
     $table = @(Get-SessionTableLines $summary)
     Assert-Equal 'ログオンの表の見出し' (($table[0] -replace '\s+', ' ').Trim()) 'ログオン ログオフ 時間 ユーザー 種類 接続元 管理者'
@@ -1171,13 +1171,25 @@ try {
     #region 起動
 
     Write-Section 'コマンドプロンプトから起動'
+    # 1.0.1: "パス\" の後ろに空白を含む引用符付きの値が続くと、その残りがどのパラメーターにも当たらずに余る（位置で受けるパラメーターが
+    # あれば、そちらに入る）。PowerShell の英語のエラーではなく、引用符のヒントを出す
+    $unknownOut = Join-Path $workRoot 'out_unknown'
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -OutputFolder "{2}\" -NoSuchName "a b"' -f $Exe, $tool, $unknownOut)
+    Assert-Equal '"パス\" の後ろに空白を含む値（引用符のヒントを出し、保存先を作らない）' ('{0}/{1}/{2}' -f $unknownRun.Code, $unknownRun.Log.Contains('-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath $unknownOut)) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    $unknownRun = Invoke-ViaCmd ('"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}" -NoSuchName' -f $Exe, $tool)
+    Assert-Equal 'どのパラメーターにも当たらない引数（日本語の案内を出して止める）' ('{0}/{1}' -f $unknownRun.Code, $unknownRun.Log.Contains('どのパラメーターにも当たらない引数があります: -NoSuchName')) '1/True'
     $cmdHead = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $Exe, $tool
     $rangeText = '-Since "2026-06-15 09:00" -Until "2026-06-15 18:00"'
     $run = Invoke-ViaCmd ('{0} -NoSave {1} -LogonType "Interactive,RemoteDesktop,Unlock" -Path "{2}\"' -f $cmdHead, $rangeText, $mainDir)
     Assert-Equal 'カンマ区切りの -LogonType と、最後の引数が \"' ('{0}/{1}' -f $run.Code, $run.Log.Contains('ログオン 10 件')) '0/True'
-    # 後ろの引数に、空白を含む引用符付きの値があると、引数の組み立てが崩れて PowerShell のエラーになる（README の「止まるとき」に書いた）ので、引用符のない引数を続ける
     $run = Invoke-ViaCmd ('{0} -Path "{1}\" -NoSave -Since 200d' -f $cmdHead, $mainDir)
     Assert-Equal '-Path の途中で \"（止まってヒントを出す）' ('{0}/{1}' -f $run.Code, $run.Log.Contains('-Path の値に引用符（"）が残っています')) '1/True'
+    # 1.0.0 では、後ろに空白を含む引用符付きの値（-Since "2026-06-15 09:00" の 09:00）が余り、PowerShell の英語のエラーで止まっていた
+    $run = Invoke-ViaCmd ('{0} -Path "{1}\" -NoSave {2}' -f $cmdHead, $mainDir, $rangeText)
+    Assert-Equal '-Path の途中で \" の後ろに空白を含む値（英語のエラーでなく、ヒントを出す）' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains('-Path の値に引用符（"）が残っています'), $run.Log.Contains('positional')) '1/True/False'
+    $run = Invoke-ViaCmd ('{0} -User "CORP\" -Since "2026-06-15 09:00" -Path "{1}" -NoSave' -f $cmdHead, $mainDir)
+    Assert-Equal '-User の途中で \" の後ろに空白を含む値（-User の例で案内する）' ('{0}/{1}' -f $run.Code, $run.Log.Contains('値を引用符で囲むときは、最後に \ を付けないでください（例: -User "CORP\yamada"）')) '1/True'
     $run = Invoke-ViaCmd ('{0} -Path "{1}" -OutputFolder "{2}\" -Since 200d' -f $cmdHead, $mainDir, "$workRoot\out\cmdq")
     Assert-Equal '-OutputFolder の途中で \"（止まって、保存先を作らない）' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains('-OutputFolder の値に引用符'), (Test-Path -LiteralPath "$workRoot\out\cmdq")) '1/True/False'
     $run = Invoke-ViaCmd ('{0} -User "CORP\" -Path "{1}" -NoSave' -f $cmdHead, $mainDir)
@@ -1198,7 +1210,7 @@ try {
     $clmCode = $LASTEXITCODE
     Assert-Equal '制約付き言語モード: 止まる' ('{0}/{1}/{2}' -f $clmCode, $clm.Contains('制約付き言語モードでは使えません（AppLocker や WDAC でスクリプトの実行が制限されている環境です）'), (Test-Path -LiteralPath "$workRoot\clm")) '1/True/False'
     $help = (@(& $Exe -NoProfile -ExecutionPolicy Bypass -Command ("Get-Help '{0}' -Full | Out-String -Width 300" -f $tool) 2>&1) | ForEach-Object { "$_" }) -join "`n"
-    Assert-Equal 'ヘルプの .NOTES' ('{0}/{1}/{2}/{3}' -f $help.Contains('Get-LogonHistory 1.0.0'), $help.Contains('Copyright (c) 2026 結進舎'), $help.Contains('Released under the MIT License.'), $help.Contains('https://github.com/kando19804-oss/workbench/blob/main/LICENSE')) 'True/True/True/True'
+    Assert-Equal 'ヘルプの .NOTES' ('{0}/{1}/{2}/{3}' -f $help.Contains('Get-LogonHistory 1.0.1'), $help.Contains('Copyright (c) 2026 結進舎'), $help.Contains('Released under the MIT License.'), $help.Contains('https://github.com/kando19804-oss/workbench/blob/main/LICENSE')) 'True/True/True/True'
     Assert-Equal 'ヘルプのパラメーター' (@(@('Since', 'Until', 'User', 'LogonType', 'Path', 'OutputFolder', 'NoSave') | Where-Object { -not $help.Contains("-$_") }) -join ',') ''
 
     Write-Section 'Ctrl+C で中断'

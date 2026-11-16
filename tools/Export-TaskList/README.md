@@ -49,7 +49,7 @@ powershell -ExecutionPolicy Bypass -File .\Export-TaskList.ps1 -NoSave
 ## 画面の表示例
 
 ```
-タスクスケジューラ出力 (Export-TaskList 1.0.0)
+タスクスケジューラ出力 (Export-TaskList 1.0.1)
 対象: SERVER01（管理者: はい）   2026-11-01 14:00:00
 範囲: \ の下（\Microsoft\ の下を除く）
 

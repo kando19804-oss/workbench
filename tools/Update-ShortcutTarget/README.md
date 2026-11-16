@@ -77,7 +77,7 @@ powershell -ExecutionPolicy Bypass -File \\fs\scripts\Update-ShortcutTarget.ps1 
 棚卸し（`-From` を指定しないとき）：
 
 ```
-ショートカットのリンク先置き換え (Update-ShortcutTarget 1.0.0)
+ショートカットのリンク先置き換え (Update-ShortcutTarget 1.0.1)
 対象: C:\Users\yamada\Desktop
 2026-11-14 10:00:00   PC01（管理者: いいえ）
 ショートカット 46 件  共有フォルダを指すもの 15 件  所要 0.3秒
@@ -101,7 +101,7 @@ powershell -ExecutionPolicy Bypass -File \\fs\scripts\Update-ShortcutTarget.ps1 
 置き換えるとき（`-From 192.168.1.10 -To 192.168.2.20`）：
 
 ```
-ショートカットのリンク先置き換え (Update-ShortcutTarget 1.0.0)
+ショートカットのリンク先置き換え (Update-ShortcutTarget 1.0.1)
 対象: C:\Users\yamada\Desktop
 2026-11-14 10:05:00   PC01（管理者: いいえ）
 置き換え: \\192.168.1.10 → \\192.168.2.20

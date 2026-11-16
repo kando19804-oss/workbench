@@ -188,7 +188,7 @@ try {
         @("`$file = Join-Path `$env:SystemRoot 'System32\drivers\etc\hosts'", "`$file = Join-Path `$env:FAKE_ROOT 'System32\drivers\etc\hosts'"),
         @("`$root = Open-MachineKey 'SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall' `$view[0]", "`$root = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(`$env:FAKE_REG + '\' + `$view[0])"),
         @("`$key = Open-MachineKey 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment' 'Default'", "`$key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(`$env:FAKE_REG + '\Environment')"),
-        @("        `$key = Open-MachineKey ('SYSTEM\CurrentControlSet\Services\' + `$Name) 'Default'", "        if (`$Name -like 'FakeUserSvc_*') { `$info.Bits = 0xE0; return `$info } elseif (`$Name -eq 'FakeUserSvc') { `$info.Bits = 0x60; return `$info } elseif (`$Name -like 'Trig*') { `$info.Trigger = `$true; return `$info }`r`n        `$key = Open-MachineKey ('SYSTEM\CurrentControlSet\Services\' + `$Name) 'Default'")
+        @("        `$key = Open-MachineKey ('SYSTEM\CurrentControlSet\Services\' + `$Name) 'Default'", "        if (`$Name -like 'FakeUserSvc_*') { `$info.Bits = 0xE0; return `$info } elseif (`$Name -eq 'FakeUserSvc') { `$info.Bits = 0x60; return `$info } elseif (`$Name -like 'Trig*') { `$info.Trigger = `$true; return `$info }`r`n        `$key = if (`$Name -like 'Z*') { [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey(`$env:FAKE_REG_BASE + '\Services\' + `$Name) } else { Open-MachineKey ('SYSTEM\CurrentControlSet\Services\' + `$Name) 'Default' }")
     )
     $fakeTool = New-PatchedTool 'fake' $fakePairs
 
@@ -224,6 +224,29 @@ function global:Get-CimInstance {
             [pscustomobject]@{ Name = 'TrigAutoStart'; DisplayName = 'TS'; State = $(if ($after) { 'Running' } else { 'Stopped' }); StartMode = 'Auto'; DelayedAutoStart = $false; StartName = 'LocalSystem'; PathName = 'C:\ts.exe'; ProcessId = 0 }
             [pscustomobject]@{ Name = 'DelayedOnly'; DisplayName = 'DO'; State = $(if ($after) { 'Stopped' } else { 'Running' }); StartMode = 'Auto'; DelayedAutoStart = $true; StartName = 'LocalSystem'; PathName = 'C:\do.exe'; ProcessId = 0 }
             [pscustomobject]@{ Name = 'TrigDisabled'; DisplayName = 'TX'; State = 'Stopped'; StartMode = 'Disabled'; StartName = 'LocalSystem'; PathName = 'C:\tx.exe'; ProcessId = 0 }
+            # 設定を読む権限のないサービス（管理者でないときの LSM など）。Windows は、スタートアップ Unknown（空のこともある）・
+            # 表示名はサービス名・実行ユーザーと実行ファイルは空で返す。FAKE_UNREAD があるときだけ出し、その値の側（before・after・both）で読めない。
+            # 読めるときの値は、テストのレジストリ（ZLsm・ZTrigMan・ZDelay）と Get-Service の偽物と同じ。ZEmpty はレジストリがない
+            if ($env:FAKE_UNREAD) {
+                $unread = $env:FAKE_UNREAD -eq 'both' -or $env:FAKE_UNREAD -eq $env:FAKE_PHASE
+                $fakeServices = @(
+                    @{ Name = 'ZLsm'; DisplayName = 'Local Session'; State = $(if ($after) { 'Stopped' } else { 'Running' }); StartMode = 'Auto'; DelayedAutoStart = $false; StartName = 'LocalSystem'; PathName = [Environment]::ExpandEnvironmentVariables('%SystemRoot%\lsm.exe') }
+                    @{ Name = 'ZTrigMan'; DisplayName = 'Trig Manual'; State = $(if ($after) { 'Running' } else { 'Stopped' }); StartMode = 'Manual'; DelayedAutoStart = $false; StartName = 'NT SERVICE\ZTrigMan'; PathName = 'C:\tm2.exe' }
+                    @{ Name = 'ZDelay'; DisplayName = 'Delayed'; State = 'Running'; StartMode = 'Auto'; DelayedAutoStart = $true; StartName = 'LocalSystem'; PathName = 'C:\dl.exe' }
+                    @{ Name = 'ZEmpty'; DisplayName = 'Empty Mode'; State = 'Stopped'; StartMode = 'Manual'; DelayedAutoStart = $false; StartName = 'LocalSystem'; PathName = 'C:\e.exe' }
+                )
+                foreach ($fakeService in $fakeServices) {
+                    if ($unread) {
+                        $fakeService.DisplayName = $fakeService.Name
+                        $fakeService.StartMode = $(if ($fakeService.Name -eq 'ZEmpty') { $null } else { 'Unknown' })
+                        $fakeService.DelayedAutoStart = $null
+                        $fakeService.StartName = ''
+                        $fakeService.PathName = ''
+                    }
+                    $fakeService.ProcessId = 0
+                    [pscustomobject]$fakeService
+                }
+            }
             if ($after -and $env:FAKE_MANY) {
                 foreach ($i in 1..[int]$env:FAKE_MANY) { [pscustomobject]@{ Name = ('Many{0:000}' -f $i); DisplayName = 'Many'; State = 'Running'; StartMode = 'Auto'; StartName = 'x'; PathName = 'C:\m.exe'; ProcessId = 0 } }
             }
@@ -242,6 +265,14 @@ function global:Get-CimInstance {
         }
         default { throw "知らないクラス: $ClassName" }
     }
+}
+# サービスの一覧から取る表示名（設定を読めないサービスの表示名を補うのに使う）
+function global:Get-Service {
+    param($Name, $ErrorAction)
+    [pscustomobject]@{ Name = 'ZLsm'; DisplayName = 'Local Session' }
+    [pscustomobject]@{ Name = 'ZTrigMan'; DisplayName = 'Trig Manual' }
+    [pscustomobject]@{ Name = 'ZDelay'; DisplayName = 'Delayed' }
+    [pscustomobject]@{ Name = 'ZEmpty'; DisplayName = 'Empty Mode' }
 }
 function global:Get-NetTCPConnection {
     param($ErrorAction)
@@ -372,6 +403,12 @@ exit $LASTEXITCODE
         if ($after) { $envValues['Added'] = 'pass-ADDEDSECRET' }
         Set-FakeRegistry "$phase\Environment" $envValues
     }
+    # Win32_Service が設定を読めないサービス（FAKE_UNREAD）のレジストリ。管理者でなくても読めるので、ツールはここから補う（前後で同じ）。
+    # ZEmpty はレジストリもないので補えない
+    Set-FakeRegistry 'Services\ZLsm' @{ Start = 2; ObjectName = 'LocalSystem'; ImagePath = '%SystemRoot%\lsm.exe' }
+    Set-FakeRegistry 'Services\ZTrigMan' @{ Start = 3; ObjectName = 'NT SERVICE\ZTrigMan'; ImagePath = 'C:\tm2.exe' }
+    Set-FakeRegistry 'Services\ZTrigMan\TriggerInfo' @{ x = 1 }
+    Set-FakeRegistry 'Services\ZDelay' @{ Start = 2; DelayedAutoStart = 1; ObjectName = 'LocalSystem'; ImagePath = 'C:\dl.exe' }
 
     $hostsBefore = "127.0.0.1 localhost # コメント`r`n# 行のコメント`r`n`r`n10.0.0.9 db db.local`r`n"
     $hostsAfter  = "127.0.0.1 localhost`r`n10.0.0.9 db`r`n10.0.0.10 web`r`n"
@@ -604,6 +641,49 @@ exit $LASTEXITCODE
     $noScheduler = Invoke-Fake @{ Reference = $before.Dir; Item = 'Task,HotFix' } 'before' 'Schedule'
     Assert-Equal 'タスクスケジューラーにつながらない' ('{0}/{1}' -f $noScheduler.Code, (Get-SkipCell $noScheduler '項目')) '1/タスク'
 
+    Write-Section 'サービスの設定を読めないとき（管理者でないときの LSM など。1.0.1）'
+    $unreadNote = 'スタートアップ・実行ユーザー・実行ファイルを読めません（サービスの設定を読む権限がありません）'
+    $zRows = { param($Dir) @(Read-SnapshotCsv $Dir 'services.csv' | Where-Object { $_.'サービス名' -like 'Z*' } | Sort-Object { $_.'サービス名' } | ForEach-Object { @($_.'サービス名', $_.'表示名', $_.'状態', $_.'スタートアップ', $_.'実行ユーザー', $_.'実行ファイル') -join '|' }) }
+    $unreadSnap = Invoke-Fake @{ Snapshot = $true; Item = 'Service' } 'before' '' '' @{ FAKE_UNREAD = 'both' }
+    Assert-Equal '設定を読めない: 止まらない' $unreadSnap.Code '0'
+    $lsmPath = [Environment]::ExpandEnvironmentVariables('%SystemRoot%\lsm.exe')
+    Assert-Equal '設定を読めない: レジストリと Get-Service で補い、補えなければ「不明」' ((& $zRows $unreadSnap.Dir) -join ',') ('ZDelay|Delayed|実行中|自動（遅延）|LocalSystem|C:\dl.exe,ZEmpty|Empty Mode|停止|不明||,ZLsm|Local Session|実行中|自動|LocalSystem|{0},ZTrigMan|Trig Manual|停止|手動（トリガー）|NT SERVICE\ZTrigMan|C:\tm2.exe' -f $lsmPath)
+    Assert-Equal '設定を読めない: Unknown を訳さずに書かない' (Test-Contains ([IO.File]::ReadAllText((Join-Path $unreadSnap.Dir 'services.csv'))) 'Unknown') 'False'
+    Assert-Equal '設定を読めない: 補えなかったものだけ skipped.csv に権限なし' (@(Read-SnapshotCsv $unreadSnap.Dir 'skipped.csv' | ForEach-Object { $_.'理由' + '/' + $_.'項目' + '/' + $_.'詳細' }) -join ',') ('権限なし/サービス/ZEmpty: {0}' -f $unreadNote)
+    Assert-Equal '設定を読めない: 取れなかったものに数える' (Test-Contains $unreadSnap.Log '取れなかったものが 1 件') 'True'
+    # 補った値は、読めるとき（管理者）と同じ
+    $readSnap = Invoke-Fake @{ Snapshot = $true; Item = 'Service' } 'before' '' '' @{ FAKE_UNREAD = 'after' }
+    Assert-Equal '補った値は、読めるときと同じ' ((& $zRows $readSnap.Dir | Where-Object { $_ -notlike 'ZEmpty|*' }) -join ',') ((& $zRows $unreadSnap.Dir | Where-Object { $_ -notlike 'ZEmpty|*' }) -join ',')
+
+    # 基準は読めた（管理者）、比較は読めない（管理者でない）。補ったサービスは、管理者のときと同じに比べる
+    # （手動（トリガー）の ZTrigMan の状態の変化は参考）。補えなかった ZEmpty は、スタートアップ・実行ユーザー・実行ファイルを比べない。
+    # 読めなかったことは、サービスの追加・削除を「確かではない」にしない（サービスがあることは分かっている）
+    $unreadDif = Invoke-Fake @{ Reference = $readSnap.Dir; Item = 'Service' } 'after' '' '' @{ FAKE_UNREAD = 'after' }
+    $zDiff = { param($Run) @(foreach ($n in 'ZDelay', 'ZEmpty', 'ZLsm', 'ZTrigMan') { '{0}={1}:{2}' -f $n, (Get-DiffCell $Run 'サービス' $n '属性'), (Get-DiffCell $Run 'サービス' $n '結果') }) -join ',' }
+    Assert-Equal '比較で読めない: 補ったサービスは管理者と同じに比べる' (& $zDiff $unreadDif) 'ZDelay=（行なし）:（行なし）,ZEmpty=（行なし）:（行なし）,ZLsm=状態:変更,ZTrigMan=状態:参考'
+    Assert-Equal '比較で読めない: 追加と削除は確かなまま' ('{0}/{1}' -f (Get-DiffCell $unreadDif 'サービス' 'Tomcat9' '結果'), (Get-DiffCell $unreadDif 'サービス' 'Gone' '結果')) '追加/削除'
+    Assert-Equal '比較で読めない: skipped.csv' (@($unreadDif.Skips | ForEach-Object { $_.'理由' + '/' + $_.'詳細' }) -join ',') ('権限なし/比較: ZEmpty: {0}' -f $unreadNote)
+    Assert-Equal '比較で読めない: 読めなかった対象に数える' ('{0}/{1}' -f $unreadDif.Code, (Test-Contains $unreadDif.Log '読めなかった対象が 1 件')) '2/True'
+
+    # 基準は読めない、比較は読めた。基準の skipped.csv から読み戻した理由でも、追加・削除を「確かではない」にしない
+    $unreadRef = Invoke-Fake @{ Snapshot = $true; Item = 'Service' } 'before' '' '' @{ FAKE_UNREAD = 'before' }
+    $readDif = Invoke-Fake @{ Reference = $unreadRef.Dir; Item = 'Service' } 'after' '' '' @{ FAKE_UNREAD = 'before' }
+    Assert-Equal '基準で読めない: 補ったサービスは管理者と同じに比べる' (& $zDiff $readDif) 'ZDelay=（行なし）:（行なし）,ZEmpty=（行なし）:（行なし）,ZLsm=状態:変更,ZTrigMan=状態:参考'
+    Assert-Equal '基準で読めない: 追加と削除は確かなまま' ('{0}/{1}' -f (Get-DiffCell $readDif 'サービス' 'Tomcat9' '結果'), (Get-DiffCell $readDif 'サービス' 'Gone' '結果')) '追加/削除'
+    Assert-Equal '基準で読めない: skipped.csv' (@($readDif.Skips | ForEach-Object { $_.'理由' + '/' + $_.'詳細' }) -join ',') ('権限なし/基準: ZEmpty: {0}' -f $unreadNote)
+
+    # 1.0.0 を管理者でなく実行して保存したスナップショット（スタートアップは Unknown のまま、表示名はサービス名、skipped.csv には残っていない）とも、
+    # スタートアップ・実行ユーザー・実行ファイルを比べずに比べる
+    $oldCopy = Join-Path $workRoot 'unread_old'
+    Copy-Item -LiteralPath $unreadRef.Dir -Destination $oldCopy -Recurse
+    $oldCsv = Join-Path $oldCopy 'services.csv'
+    $oldText = [regex]::Replace([IO.File]::ReadAllText($oldCsv), '(?m)^"ZLsm",[^\r\n]*', '"ZLsm","ZLsm","実行中","Unknown","",""')
+    [IO.File]::WriteAllText($oldCsv, $oldText, (New-Object Text.UTF8Encoding $true))
+    [IO.File]::WriteAllText((Join-Path $oldCopy 'skipped.csv'), ('"理由","項目","詳細"' + "`r`n"), (New-Object Text.UTF8Encoding $true))
+    Assert-Equal '1.0.0 の形に書き換えた' (Test-Contains $oldText '"ZLsm","ZLsm","実行中","Unknown","",""') 'True'
+    $oldRun = Invoke-Fake @{ Reference = $oldCopy; Item = 'Service' } 'after' '' '' @{ FAKE_UNREAD = 'before' }
+    Assert-Equal '1.0.0 の Unknown: 状態だけ比べる' (Get-DiffCell $oldRun 'サービス' 'ZLsm' '属性') '状態'
+
     Write-Section 'ドメインコントローラー'
     $dcSnap = Invoke-Fake @{ Snapshot = $true; Item = 'LocalUser,HotFix' } 'before' 'DC'
     Assert-Equal '対象外と表示' ($dcSnap.Log -match ' ローカルユーザー\s+対象外') 'True'
@@ -695,6 +775,14 @@ exit $LASTEXITCODE
     $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
     Assert-Equal '\" で引数を巻き込む: 終了コード' $LASTEXITCODE '1'
     Assert-Equal '\" で引数を巻き込む: ヒント' (Test-Contains $quote '-Reference の値に引用符（"）が残っています') 'True'
+    # 1.0.1: 後ろに空白を含む引用符付きの値（-Item "HotFix, Share" の Share）が余っても、PowerShell の英語のエラーではなく、引用符のヒントを出す
+    Write-Text $cmdFile ("@echo off`r`nchcp 65001 > nul`r`n{0} -NoProfile -ExecutionPolicy Bypass -File ""{1}"" -Reference ""{2}\"" -Item ""HotFix, Share""`r`nexit /b %ERRORLEVEL%`r`n" -f $Exe, $tool, $before.Dir)
+    $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
+    Assert-Equal '\" の後ろに空白を含む値: ヒント' ('{0}/{1}' -f $LASTEXITCODE, (Test-Contains $quote '-Reference の値に引用符（"）が残っています')) '1/True'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    Write-Text $cmdFile ("@echo off`r`nchcp 65001 > nul`r`n{0} -NoProfile -ExecutionPolicy Bypass -File ""{1}"" -Snapshot -Itme Service -OutputFolder ""{2}\unused""`r`nexit /b %ERRORLEVEL%`r`n" -f $Exe, $tool, $workRoot)
+    $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
+    Assert-Equal 'どのパラメーターにも当たらない引数' ('{0}/{1}/{2}' -f $LASTEXITCODE, (Test-Contains $quote 'どのパラメーターにも当たらない引数があります: -Itme Service'), (Test-Path -LiteralPath "$workRoot\unused")) '1/True/False'
 
     # 制約付き言語モードでは、最初に止まる。
     # __PSLockdownPolicy は 5.1 だとコンピューター全体の環境変数しか効かないので、起動した PowerShell の中で切り替えてから呼ぶ
@@ -798,6 +886,18 @@ exit $LASTEXITCODE
     Assert-Equal 'Firewall は管理者なら取れる' (Test-Contains $realInfo ('項目.Firewall = {0}' -f $firewallExpected)) 'True'
     $realServices = @(Read-SnapshotCsv $realSnap 'services.csv')
     Assert-Equal 'サービスが 1 件以上' ($realServices.Count -gt 0) 'True'
+    # 管理者でないと Win32_Service が設定を読めないサービス（LSM など）は、レジストリと Get-Service で補う。補えないものだけ「不明」にして、
+    # skipped.csv に権限なしで残す。訳していない Unknown を書かない
+    $realUnknown = @($realServices | Where-Object { $_.'スタートアップ' -eq 'Unknown' -or -not $_.'スタートアップ' }).Count
+    $realUnread  = @($realServices | Where-Object { $_.'スタートアップ' -eq '不明' }).Count
+    $realUnreadSkips = @(Read-SnapshotCsv $realSnap 'skipped.csv' | Where-Object { $_.'項目' -eq 'サービス' -and $_.'理由' -eq '権限なし' }).Count
+    Assert-Equal '本物のサービス: Unknown を書かず、不明の数と skipped.csv の数が合う' ('{0}/{1}' -f $realUnknown, ($realUnread -eq $realUnreadSkips)) '0/True'
+    if (-not $isAdmin) {
+        # 補う前の状態（Win32_Service が LSM の設定を読めない）であることを先に確かめる
+        Assert-Equal '管理者でないと、Win32_Service は LSM の設定を読めない' ([string](Get-CimInstance -ClassName Win32_Service -Filter "Name='LSM'").StartMode) 'Unknown'
+    }
+    $realLsm = @($realServices | Where-Object { (Get-Clean $_.'サービス名') -eq 'LSM' })
+    Assert-Equal '本物の LSM（管理者でなくても、スタートアップ・表示名・実行ユーザー・実行ファイルを補う）' ('{0}/{1}/{2}/{3}' -f $realLsm.Count, (@($realLsm | Where-Object { $_.'スタートアップ' -like '自動*' -and $_.'表示名' -and $_.'表示名' -ne 'LSM' }).Count), (@($realLsm | Where-Object { $_.'実行ユーザー' }).Count), (@($realLsm | Where-Object { $_.'実行ファイル' -like '*svchost.exe*' }).Count)) '1/1/1/1'
     # スタートアップの「トリガー」は、レジストリの TriggerInfo があるサービスに付く（自動と手動のとき）。
     # ユーザーごとのサービス（状態が空欄）は、名前の末尾を除いているので、レジストリの名前と合わないことがあり、除く
     $triggerMismatch = @($realServices | Where-Object { $_.'スタートアップ' -match '^(自動|手動)' -and $_.'状態' } | Where-Object {

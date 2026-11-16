@@ -298,6 +298,8 @@ try {
     Set-FakeRegistry 'c\Registry64\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate' @{ WUServer = 'http://old:8530' }
     Set-FakeRegistry 'c\Registry64\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU' @{ NoAutoUpdate = 1 }
     Set-FakeRegistry 'c\Registry64\SYSTEM\CurrentControlSet\Control\CrashControl' @{ CrashDumpEnabled = 0 }
+    # Win32_Service が設定を読めないサービスのレジストリ（管理者でなくても読める）。ZUnread はレジストリもないので補えない
+    Set-FakeRegistry 'c\Registry64\SYSTEM\CurrentControlSet\Services\LSM' @{ Start = 2; DelayedAutoStart = 1; ObjectName = 'LocalSystem' }
     Set-FakeRegistry 'c\Registry64\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System' @{ EnableLUA = 0 }
 
     [void][Microsoft.Win32.Registry]::CurrentUser.CreateSubKey(($regBase + '\d\Registry64'))
@@ -393,8 +395,9 @@ function global:Get-CimInstance {
             New-Fake @{ Name = 'CDPUserSvc'; DisplayName = 'Connected Devices'; State = 'Stopped'; StartMode = 'Auto'; DelayedAutoStart = $false; StartName = ''; PathName = 'C:\c.exe' }
             New-Fake @{ Name = 'Zeta'; DisplayName = 'Z'; State = 'Stopped'; StartMode = 'Disabled'; DelayedAutoStart = $false; StartName = 'LocalSystem'; PathName = 'C:\z.exe' }
             if (Test-Scenario 'c') {
-                # 管理者でないときに設定を読めないサービス。本物（LSM など）と同じく、表示名はサービス名、スタートアップは Unknown、ほかは空で返る
-                New-Fake @{ Name = 'ZUnread'; DisplayName = 'ZUnread'; State = 'Stopped'; StartMode = 'Unknown'; DelayedAutoStart = $null; StartName = $null; PathName = $null }
+                # 管理者でないときに設定を読めないサービス。本物（LSM など）と同じく、表示名はサービス名、スタートアップは Unknown、ほかは空で返る。
+                # ZUnread は、スタートアップが空のもの（Unknown と同じに扱う）
+                New-Fake @{ Name = 'ZUnread'; DisplayName = 'ZUnread'; State = 'Stopped'; StartMode = $null; DelayedAutoStart = $null; StartName = $null; PathName = $null }
                 New-Fake @{ Name = 'LSM'; DisplayName = 'LSM'; State = 'Running'; StartMode = 'Unknown'; DelayedAutoStart = $null; StartName = $null; PathName = $null }
             }
         }
@@ -422,6 +425,12 @@ function global:Get-CimInstance {
 function global:Get-FakeGroupMember([string]$GroupName) {
     if ($GroupName -eq 'Administrators') { 'WBTEST-PC\admin'; 'CORP\Domain Admins' }
     if ($GroupName -eq 'Bad') { throw (New-Object UnauthorizedAccessException '偽の拒否: Bad') }
+}
+# サービスの一覧から取る表示名（設定を読めないサービスの表示名を補うのに使う）
+function global:Get-Service {
+    param($Name, $ErrorAction)
+    New-Fake @{ Name = 'LSM'; DisplayName = 'Local Session Manager' }
+    New-Fake @{ Name = 'ZUnread'; DisplayName = 'Unread Service' }
 }
 function global:Get-Disk {
     param($ErrorAction)
@@ -786,11 +795,12 @@ exit $LASTEXITCODE
     }
     $cSkips = @(Read-Result $c 'skipped.csv')
     Assert-Equal 'c: powercfg の失敗を skipped.csv に残す' ((@($cSkips | Where-Object { $_.'項目' -ne 'サービス' } | ForEach-Object { '{0}|{1}|{2}' -f $_.'理由', $_.'項目', (Test-Contains $_.'詳細' 'powercfg が失敗しました（終了コード 5）') })) -join ',') 'その他のエラー|電源プラン|True'
-    # 実機確認の指摘: 管理者でないと、Windows が設定を見せないサービスがあり、スタートアップの Unknown をそのまま書いていた
+    # 実機確認の指摘: 管理者でないと、Windows が設定を見せないサービスがあり、スタートアップの Unknown をそのまま書いていた。
+    # 1.0.1 からは、スタートアップと実行ユーザーをレジストリから、表示名を Get-Service から補う。レジストリもないものだけ「不明」
     $cServices = @(Read-Result $c 'services.csv' | Where-Object { 'LSM', 'ZUnread' -contains (Get-Clean $_.'サービス名') } | ForEach-Object { Get-RowText $_ $Columns['services.csv'] })
-    Assert-Equal 'c: 設定を読めないサービスは「不明」、表示名と実行ユーザーは空欄' ($cServices -join ' / ') 'LSM||不明|実行中| / ZUnread||不明|停止|'
-    Assert-Equal 'c: 設定を読めないサービスを skipped.csv に残す（名前の順）' ((@($cSkips | Where-Object { $_.'項目' -eq 'サービス' } | ForEach-Object { '{0}|{1}' -f $_.'理由', (Get-Clean $_.'詳細') })) -join ' / ') '権限なし|LSM: スタートアップ・表示名・実行ユーザーを読めません（サービスの設定を読む権限がありません） / 権限なし|ZUnread: スタートアップ・表示名・実行ユーザーを読めません（サービスの設定を読む権限がありません）'
-    Assert-Equal 'c: 画面の注意' (Test-Contains $c.Log '※ 取れなかった項目が 3 件あります（skipped.csv を確認してください）') 'True'
+    Assert-Equal 'c: 設定を読めないサービスは、レジストリと Get-Service で補う（補えなければ「不明」）' ($cServices -join ' / ') 'LSM|Local Session Manager|自動（遅延）|実行中|LocalSystem / ZUnread|Unread Service|不明|停止|'
+    Assert-Equal 'c: 補えなかったサービスだけを skipped.csv に残す' ((@($cSkips | Where-Object { $_.'項目' -eq 'サービス' } | ForEach-Object { '{0}|{1}' -f $_.'理由', (Get-Clean $_.'詳細') })) -join ' / ') '権限なし|ZUnread: スタートアップ・実行ユーザーを読めません（サービスの設定を読む権限がありません）'
+    Assert-Equal 'c: 画面の注意' (Test-Contains $c.Log '※ 取れなかった項目が 2 件あります（skipped.csv を確認してください）') 'True'
     Assert-Equal 'c: 画面: 管理者の注意（管理者でないときだけ）' (Test-Contains $c.Log $adminNote) ([string](-not $isAdmin))
     $cServiceCount = [regex]::Match([string]$c.RawLog, '(?m)^ サービス +([0-9,]+)\r?$')
     Assert-Equal 'c: 画面: サービスの件数（読めないものも数える）' $(if ($cServiceCount.Success) { $cServiceCount.Groups[1].Value } else { '（行がない）' }) @(Read-Result $c 'services.csv').Count
@@ -876,6 +886,14 @@ exit $LASTEXITCODE
     Assert-Equal '\" で引数を巻き込む: 終了コード' $LASTEXITCODE '1'
     Assert-Equal '\" で引数を巻き込む: ヒント' (Test-Contains $quote '-OutputFolder の値に引用符（"）が残っています') 'True'
     Assert-Equal '\" で引数を巻き込む: 保存先を作らない' (Test-Path -LiteralPath "$workRoot\out_q") 'False'
+    # 1.0.1: 後ろに空白を含む引用符付きの値が続いて余っても、PowerShell の英語のエラーではなく、引用符のヒントを出す
+    Write-Text $cmdFile ("@echo off`r`nchcp 65001 > nul`r`n{0} -NoProfile -ExecutionPolicy Bypass -File ""{1}"" -OutputFolder ""{2}\out_q\"" -NoSave ""a b""`r`nexit /b %ERRORLEVEL%`r`n" -f $Exe, $tool, $workRoot)
+    $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
+    Assert-Equal '\" の後ろに空白を含む値: ヒント' ('{0}/{1}/{2}' -f $LASTEXITCODE, (Test-Contains $quote '-OutputFolder の値に引用符（"）が残っています'), (Test-Path -LiteralPath "$workRoot\out_q")) '1/True/False'
+    # どのパラメーターにも当たらない引数（名前の書き間違いなど）は、日本語の案内を出して止める
+    Write-Text $cmdFile ("@echo off`r`nchcp 65001 > nul`r`n{0} -NoProfile -ExecutionPolicy Bypass -File ""{1}"" -NoSafe`r`nexit /b %ERRORLEVEL%`r`n" -f $Exe, $tool)
+    $quote = ConvertTo-FlatText (& cmd.exe /c $cmdFile 2>&1 | Out-String)
+    Assert-Equal 'どのパラメーターにも当たらない引数' ('{0}/{1}' -f $LASTEXITCODE, (Test-Contains $quote 'どのパラメーターにも当たらない引数があります: -NoSafe')) '1/True'
 
     # 制約付き言語モードでは、最初に止まる
     $clmCommand = "`$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'; & '{0}' -OutputFolder '{1}'; exit `$LASTEXITCODE" -f $tool, "$workRoot\clm"
@@ -1076,9 +1094,20 @@ function New-Product($Status, $Channel, $Grace) { [pscustomobject]@{ LicenseStat
     Assert-Equal '本物: OS の名前' (Get-Param $real 'OS' '名前') ([string]$os.Caption).Trim()
     Assert-Equal '本物: ソケット数' (Get-Param $real 'CPU' 'ソケット数') ('{0:N0}' -f @(Get-CimInstance -ClassName Win32_Processor).Count)
     Assert-Equal '本物: その他のエラーはない' ((@(Read-Result $real 'skipped.csv' | Where-Object { $_.'理由' -eq 'その他のエラー' }) | ForEach-Object { '{0}: {1}' -f $_.'項目', $_.'詳細' }) -join ' / ') ''
-    # 管理者でないときは、設定を読めないサービス（LSM など）がある。管理者なら 0 件のことが多いが、どちらでも件数が合うことを見る
-    $unreadableServices = @(Get-CimInstance -ClassName Win32_Service | Where-Object { [string]$_.StartMode -eq 'Unknown' -or -not $_.StartMode } | ForEach-Object { [string]$_.Name } | Sort-Object)
-    Assert-Equal '本物: 設定を読めないサービスを skipped.csv に残す' ((@(Read-Result $real 'skipped.csv' | Where-Object { $_.'項目' -eq 'サービス' }) | ForEach-Object { ([string](Get-Clean $_.'詳細')).Split(':')[0] }) -join ',') ($unreadableServices -join ',')
+    # 管理者でないときは、Win32_Service が設定を読めないサービス（LSM など）がある。レジストリから補うので、skipped.csv に残るのは
+    # レジストリの Start も読めないものだけ（管理者なら、どちらも 0 件のことが多い）
+    $unknownServices = @(Get-CimInstance -ClassName Win32_Service | Where-Object { [string]$_.StartMode -eq 'Unknown' -or -not $_.StartMode } | ForEach-Object { [string]$_.Name })
+    $unfilledServices = @($unknownServices | Where-Object {
+        $serviceKey = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SYSTEM\CurrentControlSet\Services\' + $_)
+        $hasStart = $false
+        if ($serviceKey) { try { $hasStart = $null -ne $serviceKey.GetValue('Start') } finally { $serviceKey.Dispose() } }
+        -not $hasStart
+    } | Sort-Object)
+    Assert-Equal '本物: レジストリでも補えないサービスだけを skipped.csv に残す' ((@(Read-Result $real 'skipped.csv' | Where-Object { $_.'項目' -eq 'サービス' }) | ForEach-Object { ([string](Get-Clean $_.'詳細')).Split(':')[0] }) -join ',') ($unfilledServices -join ',')
+    # 管理者でないときは、補う前の状態（Win32_Service が LSM の設定を読めない）であることを先に確かめる
+    if (-not $isAdmin) { Assert-Equal '本物: 管理者でないと、Win32_Service は LSM の設定を読めない' ($unknownServices -contains 'LSM') 'True' }
+    $lsmRow = Get-ListRow $real 'services.csv' 'サービス名' 'LSM'
+    Assert-Equal '本物: LSM のスタートアップ・表示名・実行ユーザー（管理者でなくても補う）' ('{0}/{1}/{2}' -f ([string]$lsmRow.'スタートアップ' -like '自動*'), ([string]$lsmRow.'表示名' -ne '' -and [string]$lsmRow.'表示名' -ne 'LSM'), ([string]$lsmRow.'実行ユーザー' -ne '')) 'True/True/True'
     Assert-Equal '本物: services.csv に Unknown を書かない' (@(Read-Result $real 'services.csv' | Where-Object { (Get-Clean $_.'スタートアップ') -eq 'Unknown' }).Count) '0'
     # レビューの指摘: CIM の一覧をそのままパイプに流すと、一覧全体が 1 件になっていた
     Assert-Equal '本物: 更新プログラムの件数' @(Read-Result $real 'hotfixes.csv').Count @(Get-CimInstance -ClassName Win32_QuickFixEngineering).Count

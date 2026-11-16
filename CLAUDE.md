@@ -63,7 +63,8 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 出力ファイルは BOM 付き UTF-8 にする。5.1 と 7 で同じ結果になる書き方にする（`Export-Csv -Encoding UTF8` は 7 だと BOM なしになるので使わない）
 - CSV の見出しは日本語にする。数値は 3 桁区切りにする（Excel で 12 桁以上の数値が指数表示にならないように）
 - 動作確認は `powershell.exe`（5.1）を主、`pwsh`（7）を補助にする。Claude Code の PowerShell ツールは 7 で動いているので、5.1 の確認は必ず `powershell.exe` を起動して行う
-- `.ps1` を保存すると、フック（`.claude/hooks/ps1-post-edit.ps1`）が BOM を付け、5.1 の文法を確認する。エラーが返ってきたら直す
+- `.ps1` を保存すると、フック（`.claude/hooks/ps1-post-edit.ps1`）が BOM を付け、5.1 の文法を確認する。エラーが返ってきたら直す。ワークスペースが信頼済みになっていないとフック（とスキル）は動かないので、そのときは BOM と 5.1 の文法を自分で確かめる
+- パラメーターの最後に、どのパラメーターにも当たらない引数を受け取る `[Parameter(ValueFromRemainingArguments = $true, DontShow = $true)] [string[]]$_UnknownArgument` を置き、`Stop-WithQuoteError` の直後で `Assert-CommandArgument` を呼ぶ（引用符を確かめるパラメーターの名前を渡す。`tools/Get-DiskUsage/Get-DiskUsage.ps1` を参照）。ヘルプには `.PARAMETER _UnknownArgument` で「指定しません」と書く。これがないと、パラメーターの名前を書き間違えたときや、下の `\"` の後ろに空白を含む値が続いたときに、スクリプトが動く前に PowerShell の英語のエラーで止まる
 
 ## 5.1 の落とし穴
 
@@ -75,7 +76,8 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - Windows の互換用リンク（`All Users`、`Application Data` など）は、5.1 の `LinkType` では判定できない。隠し属性とシステム属性が付いたリパースポイントで判定する。OneDrive のフォルダもリパースポイントなので、リパースポイントをすべて飛ばしてはいけない
 - `powershell -File` で起動すると、配列を渡せない。複数の値はカンマ区切りの 1 つの文字列で受ける
 - `powershell -File` で起動すると、`-Switch:$false` の書き方は使えない（コマンドプロンプトからでも PowerShell からでもエラーになる）。設定ファイルでスイッチを有効にできる場合、コマンドラインから無効に戻す手段はない
-- コマンドプロンプトで `"C:\data\"` と書くと、`\"` が引用符のまま届き、後ろの引数まで巻き込む。`"` はパスに使えない文字なので、値に残っていたら止めてヒントを出す
+- コマンドプロンプトで `"C:\data\"` と書くと、`\"` が引用符のまま届き、後ろの引数まで巻き込む。`"` はパスに使えない文字なので、値に残っていたら止めてヒントを出す。後ろに空白を含む引用符付きの値が続くと（`-Path "C:\data\" -Since "2026-11-12 09:00"`）、空白の後ろ（`09:00`）がどのパラメーターにも当たらずに余る。位置で受けるパラメーターが空いていれば、余りはそちらに入り、別のエラー（「見つかりません」など）が先に出る。だから引用符の確認は、ほかの引数の確認より先にまとめて行う
+- `DontShow` を付けたパラメーターも、スクリプトの `Get-Help`（構文とパラメーターの一覧）には出る（5.1 と 7）。`ValueFromRemainingArguments` のパラメーターがあると、名前の合わない `-Foo` も、エラーにならずに余りとして受け取る（`-File` でも PowerShell から呼んでも）。パラメーターを足すと、それまで通っていた名前の省略形が区別できなくなり、英語のエラーになることがある（`-UnknownArgument` にしたら、Search-EventLog の `-U` が `-Until` と区別できなくなった）。隠しのパラメーターは `_` で始めて、省略形とぶつからないようにする
 - 外部コマンドの出力を `Select-Object -First` で途中まで読むと、7 ではそのコマンド自体が止まる
 - `Get-WinEvent -ListLog` を `Select-Object -First` で受けると、エラーも出さずにスクリプトごと終わる（`finally` は動く。5.1 と 7 の両方）
 - `Get-WinEvent -FilterHashtable` は、権限のないログも壊れた .evtx も、該当なしと同じエラー（`NoMatchingEventsFound`）を返すので区別できない。名前に `&` を含む .evtx は XML のエラーになる。`-LogName` か `-Path` と `-FilterXPath` を使う（権限なしは `UnauthorizedAccessException`、壊れたファイルは `EventLogException` になる）
@@ -112,7 +114,7 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - `return , $list` のように配列を 1 つの値として返す関数は、そのままパイプに流すと一覧全体が 1 件になる。いったん変数に入れてから流す。`@(その関数)` は配列の配列になる
 - `List[object]` に配列を入れたものを `@( )` で囲むと、ArgumentException（配列の型が一致しません）になる（5.1 と 7 の両方）。`.ToArray()` を使う
 - 5.1 から外部コマンド（`powershell.exe` を含む）に `"` を含む引数を渡すと、`"` が落ちる。引用符を確かめるときは `.cmd` ファイルに書いて起動する
-- `Win32_Service` は、管理者でないと設定を読めないサービス（`LSM`、`NetSetupSvc` など）を、StartMode `Unknown`・表示名はサービス名・StartName 空で返す。管理者でないと一覧に出ないサービスもある（Windows Server 2025 の `ZTHELPER`）
+- `Win32_Service` は、管理者でないと設定を読めないサービス（`LSM`、`NetSetupSvc` など）を、StartMode `Unknown`・表示名はサービス名・StartName 空で返す。管理者でないと一覧に出ないサービスもある（Windows Server 2025 の `ZTHELPER`）。サービスのレジストリ（`HKLM\SYSTEM\CurrentControlSet\Services\<名前>` の Start・DelayedAutoStart・ObjectName・ImagePath）は管理者でなくても読め、読めるサービスでは Win32_Service の値と同じ（ImagePath は展開したもの）。表示名は `Get-Service` で取れる（サービスの一覧から取るので、設定を読む権限は要らない）
 - Hyper-V の動的メモリの仮想マシンでは、`Win32_ComputerSystem.TotalPhysicalMemory` はその時点で割り当てられている量で、実行するたびに変わる（起動時メモリ 8 GB の VM で 2.3～2.9 GB）。`Win32_PhysicalMemory` の合計は起動時メモリの量
 - `Get-WindowsFeature` と `Win32_QuickFixEngineering` は、Windows の更新の仕組みが忙しいとき（起動の直後など）、数分から 20 分以上かかることがある（FGTEST-FS の管理者で `Get-WindowsFeature` が 84 秒、一般ユーザーで全体が 21 分。同じ条件でも 1 秒未満のこともある）
 - `Get-WinEvent` は、使わなくても記録ごとにメッセージを組み立てるので、記録が多いと遅い。`EventLogQuery` と `EventLogReader` で読み、値は `EventLogPropertySelector`（`Event/EventData/Data[@Name='TargetLogonId']` のような XPath）で名前で取ると、数十倍速い（Security ログ 17 MB で 1.6 秒）。260 文字以上のパスは `\\?\` が要る。管理者でないときの Security は `UnauthorizedAccessException`、ないログは `EventLogNotFoundException` になる。値は記録の型のまま届き、ログオン ID は UInt64、ログオンの失敗の状態コード（HexInt32）は負の Int32 になる
@@ -154,7 +156,7 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - わざとバグのテストを `Start-Process` で並べて流すときは、`-WorkingDirectory` に各コピーのフォルダを渡す。渡さないと、保存先を変えるバグが、起動した側の現在のフォルダ（リポジトリ）に結果を作る
 - COM の偽物を `Add-Member -MemberType ScriptMethod` で作ると、例外の包まれ方が本物と違う（本物は `MethodInvocationException` や `GetValueInvocationException` に包まれて届く）。例外の処理を確かめるときは、C# のクラスで作る（`tests/Compare-SystemState.Tests.ps1` を参照）
 - `New-Object` を global の関数で差し替えるときは、本物の結果を `,` で包んで返す。包まないと、コレクションが要素に分かれて出てくる
-- コマンドプロンプトの `\"` のヒントは、後ろに引数を続けて確かめる。`"C:\data\"` が最後の引数なら、残った `"` を外して普通に動くツールがある（`Remove-Quote`）。PowerShell から `cmd /c` に直接書くと引用符が変わるので、`.cmd` ファイルに書いて起動する
+- コマンドプロンプトの `\"` のヒントは、後ろに引数を続けて確かめる。`"C:\data\"` が最後の引数なら、残った `"` を外して普通に動くツールがある（`Remove-Quote`）。後ろに空白を含む引用符付きの値（`-NoSuchName "a b"` など）が続く場合と、パラメーターの名前の書き間違いも確かめる（1.0.0 では、どちらも英語のエラーだった）。PowerShell から `cmd /c` に直接書くと引用符が変わるので、`.cmd` ファイルに書いて起動する
 - `[powershell]::Create()` の `Stop()` は、動いている最中に呼んでも、取りこぼして最後まで動き続けることがある（5.1 でも 7 でも。Convert-TextEncoding のテストの条件で 10 回に 5 回）。止まることを確かめる項目は、1 回の結果で判定せず、何度か試す
 - pwsh から `Start-Process powershell.exe` で 5.1 を起動すると、7 のモジュールの場所（`PSModulePath`）を引き継ぎ、`Get-FileHash` や `Get-Acl` が「モジュールを読み込むことができません」になる。わざとバグのテストを 5.1 で並べて流すときは、`powershell.exe` から起動する
 - どの処理に時間がかかっているかは、ツールを `[powershell]::Create()` で動かし、`Streams.Progress` の表示が変わった時刻を記録すると、ツールを変えずに測れる。Ctrl+C の合図にする表示が出るまでの秒数も、これで測る
