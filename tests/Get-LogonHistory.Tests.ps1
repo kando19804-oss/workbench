@@ -333,7 +333,8 @@ function New-EvtxRecord($Event, [long]$RecordId, [int]$Start, $Templates) {
     $values.Add(@(0x0A, [uint64]$RecordId))
     $values.Add(@(0x01, [string]$Event.Channel))
     $values.Add(@(0x01, [string]$Event.Computer))
-    $items = if ($null -ne $Event.Data) { @($Event.Data) } elseif ($null -ne $Event.UserData) { @($Event.UserData.Items) } else { @() }
+    # if の出力は配列をほどくので、値が 1 つだけの記録でも組の配列のままになるよう、@( ) の中で受ける
+    $items = @(if ($null -ne $Event.Data) { $Event.Data } elseif ($null -ne $Event.UserData) { $Event.UserData.Items })
     foreach ($d in $items) { $values.Add(@($d[1], $d[2])) }
     if (-not $known) {
         $rec.AddRange([byte[]](0, 0, 0, 0))
@@ -754,7 +755,7 @@ try {
 
     Write-Section '画面と summary.txt'
     $summary = $x.Lines
-    Assert-Equal 'summary.txt の先頭' $summary[0] 'ログオンの履歴 (Get-LogonHistory 1.0.1)'
+    Assert-Equal 'summary.txt の先頭' $summary[0] 'ログオンの履歴 (Get-LogonHistory 1.0.2)'
     Assert-Equal 'summary.txt の最後は保存先' $summary[-1] ('保存先: {0}' -f $run.Dir)
     $table = @(Get-SessionTableLines $summary)
     Assert-Equal 'ログオンの表の見出し' (($table[0] -replace '\s+', ' ').Trim()) 'ログオン ログオフ 時間 ユーザー 種類 接続元 管理者'
@@ -1045,7 +1046,16 @@ try {
     $run = Invoke-Tool 'half' (@('-Path', $half) + $range)
     $x = Read-Result $run.Dir
     $halfCount = @($x.Sessions).Count
-    Assert-Equal '最後が壊れた .evtx: 読めた分を出す' ('{0}/{1}' -f $run.Code, ($halfCount -gt 100 -and $halfCount -lt 300)) '0/True'
+    # 1.0.2: EventLogReader は既定で 64 件ずつまとめて取り出すため、壊れた場所の手前の記録を最大 63 件まとめて失っていた。
+    # 壊れた場所の手前にあるログオン（4624）の数を 1 件ずつ読んで数え、ツールがそのすべてを出すことを確かめる
+    $readable = 0
+    $allRecords = 0
+    $allReader = New-Object Diagnostics.Eventing.Reader.EventLogReader((New-Object Diagnostics.Eventing.Reader.EventLogQuery($half, [Diagnostics.Eventing.Reader.PathType]::FilePath, '*')))
+    $allReader.BatchSize = 1
+    try { while ($e = $allReader.ReadEvent()) { $allRecords++; if ($e.Id -eq 4624) { $readable++ }; $e.Dispose() } } catch { }
+    $allReader.Dispose()
+    Assert-Equal '壊れた場所の手前の記録の数は 64 の倍数でない（64 件ずつの読み落としを見分けられる）' (($allRecords % 64) -ne 0) 'True'
+    Assert-Equal '最後が壊れた .evtx: 壊れた場所の手前のログオンをすべて出す' ('{0}/{1}/{2}' -f $run.Code, ($halfCount -lt 300), $halfCount) ('0/True/{0}' -f $readable)
     Assert-Equal '最後が壊れた .evtx: skipped.csv に残す' ((@($x.Skipped) | ForEach-Object { '{0}/{1}' -f $_.'理由', ($_.'詳細' -replace '^(途中まで読んだ（記録 )[\d,]+( 件は結果に含む）).*$', '$1N$2') }) -join ',') 'ファイルを読めない/途中まで読んだ（記録 N 件は結果に含む）'
     # 期間に合う記録の前で壊れている: Security ログを 1 件も読めなかったので、「該当なし」と区別して止める
     $failEvents = New-Object 'System.Collections.Generic.List[object]'
@@ -1210,7 +1220,7 @@ try {
     $clmCode = $LASTEXITCODE
     Assert-Equal '制約付き言語モード: 止まる' ('{0}/{1}/{2}' -f $clmCode, $clm.Contains('制約付き言語モードでは使えません（AppLocker や WDAC でスクリプトの実行が制限されている環境です）'), (Test-Path -LiteralPath "$workRoot\clm")) '1/True/False'
     $help = (@(& $Exe -NoProfile -ExecutionPolicy Bypass -Command ("Get-Help '{0}' -Full | Out-String -Width 300" -f $tool) 2>&1) | ForEach-Object { "$_" }) -join "`n"
-    Assert-Equal 'ヘルプの .NOTES' ('{0}/{1}/{2}/{3}' -f $help.Contains('Get-LogonHistory 1.0.1'), $help.Contains('Copyright (c) 2026 結進舎'), $help.Contains('Released under the MIT License.'), $help.Contains('https://github.com/kando19804-oss/workbench/blob/main/LICENSE')) 'True/True/True/True'
+    Assert-Equal 'ヘルプの .NOTES' ('{0}/{1}/{2}/{3}' -f $help.Contains('Get-LogonHistory 1.0.2'), $help.Contains('Copyright (c) 2026 結進舎'), $help.Contains('Released under the MIT License.'), $help.Contains('https://github.com/kando19804-oss/workbench/blob/main/LICENSE')) 'True/True/True/True'
     Assert-Equal 'ヘルプのパラメーター' (@(@('Since', 'Until', 'User', 'LogonType', 'Path', 'OutputFolder', 'NoSave') | Where-Object { -not $help.Contains("-$_") }) -join ',') ''
 
     Write-Section 'Ctrl+C で中断'

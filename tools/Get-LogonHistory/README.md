@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\Get-LogonHistory.ps1 -Path D:\collect
 ## 画面の表示例
 
 ```
-ログオンの履歴 (Get-LogonHistory 1.0.1)
+ログオンの履歴 (Get-LogonHistory 1.0.2)
 対象: SERVER01（管理者: はい）   Security ログ: 2026-10-28 09:12 から残っています
 期間: 2026-11-05 15:00 ～ 2026-11-12 15:00（7 日）   種類: 対話, リモートデスクトップ, ロック解除
 

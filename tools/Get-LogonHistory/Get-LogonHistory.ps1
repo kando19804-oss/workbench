@@ -60,7 +60,7 @@
     ほかのサーバーから集めた .evtx ファイルを読みます。
 
 .NOTES
-    Get-LogonHistory 1.0.1
+    Get-LogonHistory 1.0.2
     Copyright (c) 2026 結進舎
     Released under the MIT License.
     https://github.com/kando19804-oss/workbench/blob/main/LICENSE
@@ -99,7 +99,7 @@ if ($ExecutionContext.SessionState.LanguageMode -ne 'FullLanguage') {
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion    = '1.0.1'
+$ScriptVersion    = '1.0.2'
 $ToolName         = 'Get-LogonHistory'
 $ToolTitle        = 'ログオンの履歴'
 $ScreenRows       = 20       # 画面に表示する各表の行数（保存するときだけ）
@@ -496,7 +496,11 @@ function New-EventReader($Source, [string]$Query, [bool]$Reverse = $false) {
     $pathType = if ($Source.IsFile) { [Diagnostics.Eventing.Reader.PathType]::FilePath } else { [Diagnostics.Eventing.Reader.PathType]::LogName }
     $eventQuery = New-Object Diagnostics.Eventing.Reader.EventLogQuery($Source.Name, $pathType, $Query)
     $eventQuery.ReverseDirection = $Reverse
-    return New-Object Diagnostics.Eventing.Reader.EventLogReader($eventQuery)
+    $reader = New-Object Diagnostics.Eventing.Reader.EventLogReader($eventQuery)
+    # 既定では 64 件ずつまとめて取り出すため、途中が壊れた .evtx では、壊れた場所の手前の記録までまとめて失う。1 件ずつ取り出す
+    # （条件で絞って読むので、遅くはならない）
+    $reader.BatchSize = 1
+    return $reader
 }
 
 # 条件に合う最初の記録（$Reverse なら最後の記録）の、日時・ログの名前・コンピューター。ないときは $null
