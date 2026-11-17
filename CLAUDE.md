@@ -132,13 +132,13 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - `New-Object 型 (( 'a' + $b )), $c` のように、引数の先頭が `((` だと 5.1 の文法エラー（式に末尾の ')' がありません）になる。`[型]::new(...)` を使う
 - `[Array]::Sort($keys, $values, [StringComparer]::Ordinal)` は、PowerShell が型を合わせた写しを作って渡すことがあり、`$values` が並ばない。`[Array]::Sort([Array]$keys, [Array]$values, [Collections.IComparer][StringComparer]::Ordinal)` と書く
 - 書き換えた直後のショートカットは、ウイルス対策ソフトなどが削除の権限付きでしばらく開いていることがあり、`ReadAllBytes`（読み取りだけを共有）は「別のプロセスが使用中」になる。読むときは `FileShare` に `ReadWrite, Delete` を渡す
-- `EventLogReader` は、条件に合う記録を既定で 64 件ずつまとめて取り出す（`BatchSize`）。途中が壊れた .evtx では、次のまとまりがまるごと例外になり、壊れた場所の手前の記録を最大 63 件失う（条件で絞った記録はまばらなので、何日分にもなる）。`BatchSize = 1` にする（記録が少なければ遅くならない）。Get-LogonHistory 1.0.1 は既定のまま
+- `EventLogReader` は、条件に合う記録を既定で 64 件ずつまとめて取り出す（`BatchSize`）。途中が壊れた .evtx では、次のまとまりがまるごと例外になり、壊れた場所の手前の記録を最大 63 件失う（条件で絞った記録はまばらなので、何日分にもなる）。`BatchSize = 1` にする（3.6 万件をすべて読んでも 0.4 秒が 1.2 秒になる程度。絞って読むならむしろ速い）。`Get-WinEvent` も中で同じく 64 件ずつ取り出し、件数を指定できないので、壊れた .evtx を読むツールでは使わない（Search-EventLog と Get-LogonHistory は 1.0.2 で直した）
 - `EventLogPropertySelector` は `Event/EventData/Data[1]` のような位置の指定を受け付けない（「指定されたクエリは無効です」）。名前のない Data（System ログの 6008 など、古い形のソースの記録）は `Properties` で読む。Binary は byte[] の値として入る
 - 古い形のソース（User32・EventLog など）は、`Get-WinEvent -ListProvider` で記録の定義が出ない。値の並びは、メッセージ ファイル（`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\System\<ソース>` の EventMessageFile）を `FormatMessage` で読んで確かめる（User32 の 1076 は %1 理由・%2 コード・%5 コメント・%6 ユーザー）
 - System ログの OS の停止（Kernel-General 13）と停止の開始（Kernel-Power 109）は、次の起動のあとにまとめて書かれる。記録の番号の順と時刻の順が一致しないので、時刻で並べる。予期しない停止（EventLog 6008）の説明の文の日付には U+200E が入り、書式は地域の設定で変わる。Binary にローカルと UTC の SYSTEMTIME がある
 - 停止の指示（User32 1074）の種類と理由は、記録を書いた OS の言語の文字で入る（「電源を切る」「power off」）。再起動かシャットダウンかは Kernel-Power 109 の ShutdownActionType（4 シャットダウン・5 再起動・6 電源を切る）で判定する。`Restart-Computer` の指示はプロセスが `wmiprvse.exe`（理由のコード 0x80070015、理由の文は「この理由のタイトルが見つかりません」）。期限切れの評価版の Windows Server は、`wlms.exe` が 1 時間ごとにシャットダウンする。`shutdown /a` で取り消すと 1075 が書かれる
 - イベントログのサービスだけを再起動すると、OS は再起動していないのに 6006 と 6005 が書かれる
-- `$x = if ($c) { @($a) }` のように if 文の出力を代入すると、要素 1 つの配列がほどける（`$a` が「組の配列」1 つなら、`$x` は組の中身になる）。`$x = @(if ($c) { $a })` と書く（5.1 と 7 の両方）。`tests/Get-LogonHistory.Tests.ps1` の .evtx の組み立ても、値が 1 つだけの記録ではこれで壊れる
+- `$x = if ($c) { @($a) }` のように if 文の出力を代入すると、要素 1 つの配列がほどける（`$a` が「組の配列」1 つなら、`$x` は組の中身になる）。`$x = @(if ($c) { $a })` と書く（5.1 と 7 の両方）
 
 ## テストの書き方の注意
 
