@@ -57,5 +57,8 @@ LogonHistory_*/
 # Update-ShortcutTarget の実行結果（既定ではスクリプトと同じフォルダに保存される。共有フォルダのパスと、置き換える前のショートカットを含む）
 ShortcutTarget_*/
 
+# Get-RebootHistory の実行結果（既定ではスクリプトと同じフォルダに保存される。停止を指示したユーザーの名前とコメントを含む）
+RebootHistory_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
