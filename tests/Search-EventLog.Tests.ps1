@@ -472,7 +472,7 @@ try {
         Assert-Equal ('{0} は BOM 付き UTF-8' -f $name) ($head -join ',') '239,187,191'
     }
     $summaryText = $x.Lines -join "`n"
-    Assert-Equal 'summary.txt の先頭' $x.Lines[0] 'イベントログ抽出 (Search-EventLog 1.0.1)'
+    Assert-Equal 'summary.txt の先頭' $x.Lines[0] 'イベントログ抽出 (Search-EventLog 1.0.2)'
     Assert-Equal 'summary.txt の集計' $summaryText.Contains('■ 集計（件数の多い順）') 'True'
     Assert-Equal 'summary.txt の件数の行' $summaryText.Contains('イベント 8 件（重大 1・エラー 7）') 'True'
     Assert-Equal 'summary.txt の保存先' $x.Lines[-1] ('保存先: {0}' -f $run.Dir)
@@ -852,6 +852,12 @@ try {
     Assert-Equal '壊れたファイルは飛ばしてほかを読む' (Get-CodeAndIds $run) '0/32'
     Assert-Equal 'skipped.csv の理由' ((@($x.Skipped) | ForEach-Object { '{0}/{1}' -f $_.'理由', $_.'対象' }) -join ',') "ファイルを読めない/$badDir\broken.evtx"
     Assert-Equal 'スキップの行（ファイルを読めない）' $run.Log.Contains('スキップ 1 件（ファイルを読めない）') 'True'
+    # 1.0.2 のレビューで見つかった問題: 一覧には出るのに開けない .evtx（名前が . で終わるフォルダの下）が、「ログがない（この PC にはないログです）」になった
+    $dotDir = Join-Path $workRoot 'dotdir'
+    [void][IO.Directory]::CreateDirectory('\\?\' + "$dotDir\name.")
+    [IO.File]::Copy("$treeDir\a.evtx", '\\?\' + "$dotDir\name.\a.evtx")
+    $run = Invoke-Tool 'dotdir' (@('-Path', $dotDir) + $range)
+    Assert-Equal '開けない .evtx は「ファイルを読めない」' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains(('{0}\name.\a.evtx: ファイルを読めない' -f $dotDir)), $run.Log.Contains('ログがない')) '1/True/False'
     $run = Invoke-Tool 'badnomatch' @('-Path', ('{0}\broken.evtx,{1}\a.evtx' -f $badDir, $treeDir), '-Since', '2000-01-01', '-Until', '2000-01-02')
     Assert-Equal '読めたファイルに該当がなければ、該当なし' ('{0}/{1}' -f $run.Code, $run.Log.Contains('スキップ 1 件（ファイルを読めない）')) '2/True'
     $run = Invoke-Tool 'baddir' (@('-Path', $badDir) + $range)
@@ -867,7 +873,15 @@ try {
     $run = Invoke-Tool 'half' (@('-Path', $half) + $range)
     $x = Read-Result $run.Dir
     $halfRead = @($x.Events).Count
-    Assert-Equal '途中で壊れた .evtx: 読めた分を出す' ('{0}/{1}' -f $run.Code, ($halfRead -gt 0 -and $halfRead -lt 1234)) '0/True'
+    # 1.0.2: Get-WinEvent は 64 件ずつまとめて取り出すため、壊れた場所の手前のイベントを最大 63 件まとめて失っていた。
+    # 壊れた場所の手前にあるイベントの数を 1 件ずつ読んで数え、ツールがそのすべてを出すことを確かめる（このファイルのイベントは、すべて条件に合う）
+    $readable = 0
+    $allReader = New-Object Diagnostics.Eventing.Reader.EventLogReader((New-Object Diagnostics.Eventing.Reader.EventLogQuery($half, [Diagnostics.Eventing.Reader.PathType]::FilePath, '*')))
+    $allReader.BatchSize = 1
+    try { while ($e = $allReader.ReadEvent()) { $readable++; $e.Dispose() } } catch { }
+    $allReader.Dispose()
+    Assert-Equal '壊れた場所の手前の件数は 64 の倍数でない（64 件ずつの読み落としを見分けられる）' (($readable % 64) -ne 0) 'True'
+    Assert-Equal '途中で壊れた .evtx: 壊れた場所の手前のイベントをすべて出す' ('{0}/{1}' -f $run.Code, $halfRead) ('0/{0}' -f $readable)
     Assert-Equal '途中で壊れた .evtx: skipped.csv に残す' ((@($x.Skipped) | ForEach-Object { '{0}/{1}' -f $_.'理由', ($_.'詳細' -replace ':.*$', '') }) -join ',') ('ファイルを読めない/途中まで読んだ（イベント {0} 件は結果に含む）' -f $halfRead.ToString('N0', [Globalization.CultureInfo]::InvariantCulture))
 
     Write-Section '権限なし'
@@ -1003,13 +1017,26 @@ try {
     $run = Invoke-Tool 'liveslash' (@('-LogName', 'Microsoft-Windows-TaskScheduler/Operational,Windows PowerShell', '-Level', 'Warning') + $liveRange)
     Assert-Equal '/ やスペースを含むログの名前' (@((Read-Result $run.Dir).Skipped).Count) 0
     Assert-Equal '/ やスペースを含むログの名前: 終了コード' ($run.Code -eq 0 -or $run.Code -eq 2) 'True'
-    # 分析とデバッグのログは -Oldest でないと読めない（Get-WinEvent -ListLog は、Select-Object -First で受けるとスクリプトごと黙って終わる）
+    # 1.0.2: ログの名前の * と ?（Get-WinEvent が黙って許していた書き方を、EventLogReader に変えても使えるようにした）
+    $run = Invoke-Tool 'livewild' @('-LogName', 'Syste*', '-Level', 'Critical,Error,Warning,Information', '-Since', '1d')
+    $x = Read-Result $run.Dir
+    Assert-Equal 'ログの名前の *（当たるログを読む）' ('{0}/{1}/{2}' -f ($run.Code -eq 0 -or $run.Code -eq 2), @($x.Skipped).Count, @(@($x.Events) | Where-Object { $_.'ログ' -notlike 'Syste*' }).Count) 'True/0/0'
+    Assert-Equal 'ログの名前の *: ログの行は書いたとおり' $run.Log.Contains('ログ: Syste*') 'True'
+    $one = Invoke-Tool 'livesystem' (@('-LogName', 'System', '-Level', 'Critical,Error,Warning,Information') + $liveRange)
+    $two = Invoke-Tool 'livesystem2' (@('-LogName', 'System,Syst?m,SYSTEM', '-Level', 'Critical,Error,Warning,Information') + $liveRange)
+    Assert-Equal '同じログを重ねて書いても 1 回だけ読む' (@((Read-Result $two.Dir).Events).Count) (@((Read-Result $one.Dir).Events).Count)
+    $run = Invoke-Plain @('-LogName', 'NoSuch*,NoSuchLog?', '-NoSave')
+    Assert-Equal 'ログの名前の * に当たるログがない: 止まる' ('{0}/{1}/{2}' -f $run.Code, $run.Log.Contains('NoSuch*: ログがない（この PC にはないログです）'), $run.Log.Contains('NoSuchLog?: ログがない')) '1/True/True'
+    # 1.0.2 のレビューで見つかった問題: [ ] もワイルドカードとして読み、閉じていない [ で英語のエラーになった（* と ? だけをワイルドカードにする）
+    $run = Invoke-Plain @('-LogName', 'Sys[tem,[SA]*', '-NoSave')
+    Assert-Equal 'ログの名前の [ ] はふつうの文字' ('{0}/{1}/{2}/{3}' -f $run.Code, $run.Log.Contains('Sys[tem: ログがない'), $run.Log.Contains('[SA]*: ログがない'), $run.Log.Contains('Exception')) '1/True/True/False'
+    # 分析とデバッグのログは古い順でないと読めない（Get-WinEvent -ListLog は、Select-Object -First で受けるとスクリプトごと黙って終わる）
     $debugLog = @(Get-WinEvent -ListLog '*' -Force -ErrorAction SilentlyContinue | Where-Object { @('Analytical', 'Debug') -contains [string]$_.LogType -and -not $_.IsEnabled })
     if ($debugLog.Count -gt 0) {
         $run = Invoke-Tool 'livedebug' (@('-LogName', $debugLog[0].LogName) + $liveRange)
         Assert-Equal ('分析とデバッグのログ（{0}）' -f $debugLog[0].LogName) ('{0}/{1}' -f $run.Code, @((Read-Result $run.Dir).Skipped).Count) '2/0'
-        # -Oldest を外すとエラーになることを使って、「その他のエラー」を確かめる
-        $patched = New-PatchedTool 'nooldest' '-FilterXPath $query -Oldest' '-FilterXPath $query'
+        # 新しい順に読むとエラーになることを使って、「その他のエラー」を確かめる
+        $patched = New-PatchedTool 'reverse' '$reader = New-Object Diagnostics.Eventing.Reader.EventLogReader((New-Object Diagnostics.Eventing.Reader.EventLogQuery($target.Name, $pathType, $query)))' '$eq = New-Object Diagnostics.Eventing.Reader.EventLogQuery($target.Name, $pathType, $query); $eq.ReverseDirection = $true; $reader = New-Object Diagnostics.Eventing.Reader.EventLogReader($eq)'
         $run = Invoke-Tool 'othererror' (@('-LogName', ('{0},System' -f $debugLog[0].LogName)) + $liveRange) $patched
         Assert-Equal 'ログを読むときのほかのエラーは、その他のエラー' ((@((Read-Result $run.Dir).Skipped) | ForEach-Object { '{0}/{1}' -f $_.'理由', $_.'対象' }) -join ',') ('その他のエラー/{0}' -f $debugLog[0].LogName)
     } else {
