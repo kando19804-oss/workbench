@@ -14,7 +14,8 @@
         powershell -ExecutionPolicy Bypass -File .\Search-EventLog.ps1
 
 .PARAMETER LogName
-    読むイベントログの名前。カンマで区切って複数書けます。既定値は System,Application です。
+    読むイベントログの名前。カンマで区切って複数書けます。*（任意の文字列）と ?（任意の 1 文字）も使えます。
+    既定値は System,Application です。
 
 .PARAMETER Path
     読む .evtx ファイル、または .evtx ファイルのあるフォルダ（サブフォルダも探します）。カンマで区切って複数書けます。
@@ -70,7 +71,7 @@
     D:\collected の下の .evtx ファイルから、直近 3 日の重大・エラーを取り出します。
 
 .NOTES
-    Search-EventLog 1.0.1
+    Search-EventLog 1.0.2
     Copyright (c) 2026 結進舎
     Released under the MIT License.
     https://github.com/kando19804-oss/workbench/blob/main/LICENSE
@@ -111,7 +112,7 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.1'
+$ScriptVersion = '1.0.2'
 $ScreenGroups  = 30       # 画面に表示する集計の件数（保存するときだけ）
 $ScreenEvents  = 20       # 画面に表示する新しい順の件数（保存するときだけ）
 $ScreenMessage = 80       # 画面に表示するメッセージの長さ
@@ -338,11 +339,11 @@ function Test-InnerException([Exception]$Exception, [type]$Type) {
     return $false
 }
 
-# Get-WinEvent の Path はワイルドカードとして解決されるため、[ ] * ? と ` を文字どおりに扱うようエスケープする。
-# 260 文字以上のパスは \\?\ を付けないと読めない（? もエスケープするので、7 でも読める）
+# .evtx を読むときのパス。EventLogReader はパスをワイルドカードとして読まないので、そのまま渡す。
+# 260 文字以上のパスは \\?\ を付けないと読めない
 function ConvertTo-EvtxPath([string]$FullPath) {
-    $text = if ($FullPath.Length -ge $LongPathLength) { ConvertTo-LongPath $FullPath } else { $FullPath }
-    return $text.Replace('`', '``').Replace('[', '`[').Replace(']', '`]').Replace('*', '`*').Replace('?', '`?')
+    if ($FullPath.Length -ge $LongPathLength) { return ConvertTo-LongPath $FullPath }
+    return $FullPath
 }
 
 # イベント ビューアーの「ソース」と同じように、先頭の Microsoft-Windows- を省く
@@ -501,7 +502,7 @@ if ($useFiles) {
             $full = [IO.Path]::GetFullPath($full)
         } catch { }
         if ([IO.File]::Exists((ConvertTo-LongPath $full))) {
-            $targets.Add(@{ Label = $full; Filter = @{ Path = (ConvertTo-EvtxPath $full) } })
+            $targets.Add(@{ Label = $full; Name = (ConvertTo-EvtxPath $full); IsFile = $true })
         } elseif ([IO.Directory]::Exists((ConvertTo-LongPath $full))) {
             # フォルダの下の .evtx を探す。リンクはたどらず、読めないフォルダは飛ばす
             # （ドライブのルートは、最後の \ を外すと \\?\D: になって読めない）
@@ -529,7 +530,7 @@ if ($useFiles) {
                     if ($entry -is [IO.DirectoryInfo]) { $subDirs.Add($entry.FullName) }
                     elseif ($entry.Extension -ieq '.evtx') {
                         $file = ConvertTo-DisplayPath $entry.FullName
-                        $targets.Add(@{ Label = $file; Filter = @{ Path = (ConvertTo-EvtxPath $file) } })
+                        $targets.Add(@{ Label = $file; Name = (ConvertTo-EvtxPath $file); IsFile = $true })
                     }
                 }
                 for ($i = $subDirs.Count - 1; $i -ge 0; $i--) { $stack.Push($subDirs[$i]) }
@@ -540,7 +541,35 @@ if ($useFiles) {
     }
     if ($targets.Count -eq 0) { Stop-WithError ('-Path に、読める .evtx ファイルがありません: {0}' -f $Path) }
 } else {
-    foreach ($item in (Split-List $LogName)) { $targets.Add(@{ Label = $item; Filter = @{ LogName = $item } }) }
+    # ログの名前には * や ? を使える（この PC のログの名前の一覧から、当たるものを探す）。同じログは 1 回だけ読む。
+    # * と ? だけをワイルドカードにする（WildcardPattern は [ ] を文字の範囲として読み、閉じていない [ では例外を出すため、
+    # [ ] とバッククォートはエスケープする）
+    $logNames = $null
+    $logNamesError = ''
+    $addedLogs = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($item in (Split-List $LogName)) {
+        if ($item.IndexOfAny([char[]]@('*', '?')) -lt 0) {
+            if ($addedLogs.Add($item)) { $targets.Add(@{ Label = $item; Name = $item; IsFile = $false }) }
+            continue
+        }
+        if ($null -eq $logNames) {
+            $logNames = New-Object 'System.Collections.Generic.List[string]'
+            try {
+                foreach ($name in [Diagnostics.Eventing.Reader.EventLogSession]::GlobalSession.GetLogNames()) { $logNames.Add($name) }
+            } catch {
+                # 一覧を読めないときは、当たらなかった項目の詳細に理由を書く
+                $logNamesError = Get-ErrorText (Get-InnerException $_.Exception)
+            }
+            # 5.1 と 7 で同じ順に読むよう、文字の番号の順に並べる
+            $logNames.Sort([StringComparer]::OrdinalIgnoreCase)
+        }
+        $escaped = $item.Replace('`', '``').Replace('[', '`[').Replace(']', '`]')
+        $wildcard = New-Object Management.Automation.WildcardPattern($escaped, [Management.Automation.WildcardOptions]::IgnoreCase)
+        $matched = @($logNames | Where-Object { $wildcard.IsMatch($_) })
+        # 当たるログがないときは、読むときに「ログがない」として残す
+        if ($matched.Count -eq 0) { $targets.Add(@{ Label = $item; Name = $item; IsFile = $false; NoMatch = $true }); continue }
+        foreach ($name in $matched) { if ($addedLogs.Add($name)) { $targets.Add(@{ Label = $name; Name = $name; IsFile = $false }) } }
+    }
     if ($targets.Count -eq 0) { Stop-WithError '-LogName を指定してください' }
 }
 
@@ -583,8 +612,10 @@ $lines      = New-Object 'System.Collections.Generic.List[string]'
 try {
     #region 読み取り
 
-    # -FilterHashtable は使わない。権限のないログや壊れた .evtx でも「該当なし」と同じエラーを返して区別できず、
-    # 名前に & を含む .evtx も読めないため
+    # Get-WinEvent は使わない。条件に合うイベントを 64 件ずつまとめて取り出すため、途中が壊れた .evtx では、壊れた場所の
+    # 手前のイベントまでまとめて失う（取り出す件数は指定できない）。EventLogReader で 1 件ずつ取り出す。
+    # 条件は XPath で書く（Get-WinEvent の -FilterHashtable は、権限のないログや壊れた .evtx でも「該当なし」と同じエラーを返して
+    # 区別できず、名前に & を含む .evtx も読めなかった）
     $query = "*[System[({0}) and TimeCreated[@SystemTime>='{1}' and @SystemTime<='{2}']" -f (@($levelValues | ForEach-Object { "Level=$_" }) -join ' or '),
         (ConvertTo-QueryTime $sinceInfo.Time), (ConvertTo-QueryTime $endTime)
     if ($idInQuery) { $query += ' and ({0})' -f (@($idList | ForEach-Object { "EventID=$_" }) -join ' or ') }
@@ -592,62 +623,81 @@ try {
 
     $nextProgress = 0L
     foreach ($target in $targets) {
-        $filter = $target.Filter
         $countBefore = $events.Count
-        Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
+        # ログの名前の * で何百ものログを読むときに、表示に時間を取られないよう間引く
+        if ($sw.ElapsedMilliseconds -ge $nextProgress) {
+            Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
+            $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
+        }
+        # ログの名前の * や ? に当たるログがなかった（ログの名前の一覧を読めなかったときは、その理由を書く）
+        if ($target.ContainsKey('NoMatch')) {
+            if ($logNamesError) { Add-Skip 'その他のエラー' $target.Label ('ログの名前の一覧を読めません: {0}' -f $logNamesError) }
+            else { Add-Skip 'ログがない' $target.Label 'この PC にはないログです' }
+            $target['Failed'] = $true
+            continue
+        }
+        $reader = $null
         try {
             # 1 件ずつ受け取って、読みながら絞り込む（すべてを先にメモリへ読み込まないため）。
-            # -Oldest は、壊れた .evtx でも壊れた場所の手前まで読むため（新しい順だと、最後のほうが壊れていると 1 件も読めない）。
-            # 分析とデバッグのログも、-Oldest でないと読めない。並べ替えは後で行う
-            Get-WinEvent @filter -FilterXPath $query -Oldest -ErrorAction Stop | ForEach-Object {
-                $record = $_
-                if ($sw.ElapsedMilliseconds -ge $nextProgress) {
-                    Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
-                    $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
+            # 古い順に読むのは、壊れた .evtx でも壊れた場所の手前まで読むため（新しい順だと、最後のほうが壊れていると 1 件も読めない）。
+            # 分析とデバッグのログも、古い順でないと読めない。並べ替えは後で行う
+            $pathType = if ($target.IsFile) { [Diagnostics.Eventing.Reader.PathType]::FilePath } else { [Diagnostics.Eventing.Reader.PathType]::LogName }
+            $reader = New-Object Diagnostics.Eventing.Reader.EventLogReader((New-Object Diagnostics.Eventing.Reader.EventLogQuery($target.Name, $pathType, $query)))
+            $reader.BatchSize = 1
+            while ($true) {
+                $record = $reader.ReadEvent()
+                if ($null -eq $record) { break }
+                try {
+                    if ($sw.ElapsedMilliseconds -ge $nextProgress) {
+                        Write-Progress -Activity 'イベントログ抽出' -Status (Format-Invariant 'イベント {0:N0} 件' $events.Count) -CurrentOperation $target.Label
+                        $nextProgress = $sw.ElapsedMilliseconds + $ProgressMs
+                    }
+                    if ($excludeSet.Count -gt 0 -and $excludeSet.Contains([int]$record.Id)) { continue }
+                    if ($idList.Count -gt 0 -and -not $idInQuery -and -not $idSet.Contains([int]$record.Id)) { continue }
+                    # ソースは、Microsoft-Windows- を省いた名前でも探せるように、ここで絞る
+                    $sourceName = ConvertTo-SourceName ([string]$record.ProviderName)
+                    if ($sourceKeys.Count -gt 0 -and -not $sourceKeys.Contains($sourceName)) { continue }
+                    # メッセージは、ソースの情報がないと取得できない（例外になることもある）
+                    $message = $null
+                    try { $message = $record.FormatDescription() } catch { }
+                    # Windows はメッセージの日時などに見えない文字（U+200E）を入れる。-Pattern で日時を探せるように取り除く
+                    if ($message) { $message = $InvisibleMarks.Replace($message, '') }
+                    if ($patternTerms.Count -gt 0) {
+                        if (-not $message) { continue }
+                        $hit = $false
+                        foreach ($term in $patternTerms) { if ($message.IndexOf($term, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $hit = $true; break } }
+                        if (-not $hit) { continue }
+                    }
+                    if (-not $message) { $message = $NoMessage; $noMessageCount++ }
+                    $task = ''
+                    try { $task = [string]$record.TaskDisplayName } catch { }
+                    $levelValue = [int]$record.Level
+                    $levelName  = if ($LevelNames.ContainsKey($levelValue)) { $LevelNames[$levelValue] } else { [string]$levelValue }
+                    $events.Add([pscustomobject]@{
+                        Time = $record.TimeCreated; Log = [string]$record.LogName; LevelValue = $levelValue; Level = $levelName; Id = [int]$record.Id
+                        Source = $sourceName; Task = $task; Machine = [string]$record.MachineName; User = (Get-AccountName $record.UserId)
+                        Message = $message; FirstLine = (Get-FirstLine $message)
+                    })
+                } finally {
+                    $record.Dispose()
                 }
-                if ($excludeSet.Count -gt 0 -and $excludeSet.Contains([int]$record.Id)) { return }
-                if ($idList.Count -gt 0 -and -not $idInQuery -and -not $idSet.Contains([int]$record.Id)) { return }
-                # ソースは、Microsoft-Windows- を省いた名前でも探せるように、ここで絞る
-                $sourceName = ConvertTo-SourceName ([string]$record.ProviderName)
-                if ($sourceKeys.Count -gt 0 -and -not $sourceKeys.Contains($sourceName)) { return }
-                # メッセージは、ソースの情報がないと取得できない（例外になることもある）
-                $message = $null
-                try { $message = $record.Message } catch { }
-                # Windows はメッセージの日時などに見えない文字（U+200E）を入れる。-Pattern で日時を探せるように取り除く
-                if ($message) { $message = $InvisibleMarks.Replace($message, '') }
-                if ($patternTerms.Count -gt 0) {
-                    if (-not $message) { return }
-                    $hit = $false
-                    foreach ($term in $patternTerms) { if ($message.IndexOf($term, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $hit = $true; break } }
-                    if (-not $hit) { return }
-                }
-                if (-not $message) { $message = $NoMessage; $script:noMessageCount++ }
-                $task = ''
-                try { $task = [string]$record.TaskDisplayName } catch { }
-                $levelValue = [int]$record.Level
-                $levelName  = if ($LevelNames.ContainsKey($levelValue)) { $LevelNames[$levelValue] } else { [string]$levelValue }
-                $events.Add([pscustomobject]@{
-                    Time = $record.TimeCreated; Log = [string]$record.LogName; LevelValue = $levelValue; Level = $levelName; Id = [int]$record.Id
-                    Source = $sourceName; Task = $task; Machine = [string]$record.MachineName; User = (Get-AccountName $record.UserId)
-                    Message = $message; FirstLine = (Get-FirstLine $message)
-                })
             }
         } catch {
-            $errorId = [string]$_.FullyQualifiedErrorId
-            # 該当するイベントがなかっただけのときは、読めたものとして扱う
-            if ($errorId -notlike 'NoMatchingEventsFound*') {
-                $ex = Get-InnerException $_.Exception
-                if ($errorId -like 'NoMatchingLogsFound*') {
-                    Add-Skip 'ログがない' $target.Label 'この PC にはないログです'
-                } elseif (Test-InnerException $_.Exception ([UnauthorizedAccessException])) {
-                    Add-Skip '権限なし' $target.Label 'アクセスが拒否されました'
-                } else {
-                    $detail = Get-ErrorText $ex
-                    if ($events.Count -gt $countBefore) { $detail = Format-Invariant '途中まで読んだ（イベント {0:N0} 件は結果に含む）: {1}' ($events.Count - $countBefore) $detail }
-                    Add-Skip $(if ($useFiles) { 'ファイルを読めない' } else { 'その他のエラー' }) $target.Label $detail
-                }
-                $target['Failed'] = $true
+            $ex = Get-InnerException $_.Exception
+            # EventLogReader は、.evtx を開けないとき（読む前に消えた、名前が . で終わるフォルダの下など）も、ログがないときと
+            # 同じ例外を出す。ファイルのときは「ファイルを読めない」にする
+            if (-not $target.IsFile -and (Test-InnerException $_.Exception ([Diagnostics.Eventing.Reader.EventLogNotFoundException]))) {
+                Add-Skip 'ログがない' $target.Label 'この PC にはないログです'
+            } elseif (Test-InnerException $_.Exception ([UnauthorizedAccessException])) {
+                Add-Skip '権限なし' $target.Label 'アクセスが拒否されました'
+            } else {
+                $detail = Get-ErrorText $ex
+                if ($events.Count -gt $countBefore) { $detail = Format-Invariant '途中まで読んだ（イベント {0:N0} 件は結果に含む）: {1}' ($events.Count - $countBefore) $detail }
+                Add-Skip $(if ($useFiles) { 'ファイルを読めない' } else { 'その他のエラー' }) $target.Label $detail
             }
+            $target['Failed'] = $true
+        } finally {
+            if ($reader) { $reader.Dispose() }
         }
     }
     $elapsed = $sw.Elapsed
@@ -691,7 +741,8 @@ try {
             $more = if ($targets.Count -gt 1) { Format-Invariant ' ほか {0:N0} ファイル' ($targets.Count - 1) } else { '' }
             $lines.Add(('対象: {0}{1}' -f $targets[0].Label, $more))
         } else {
-            $lines.Add(('対象: {0}（管理者: {1}）   ログ: {2}' -f $machineName, $(if ($isAdmin) { 'はい' } else { 'いいえ' }), (($targets | ForEach-Object { $_.Label }) -join ', ')))
+            # ログは -LogName に書いたとおりに出す（* で何百ものログに当たっても、この行が長くならないように）
+            $lines.Add(('対象: {0}（管理者: {1}）   ログ: {2}' -f $machineName, $(if ($isAdmin) { 'はい' } else { 'いいえ' }), ((Split-List $LogName) -join ', ')))
         }
         $span = if ($sinceInfo.Relative -and -not $untilInfo) { '（{0}）' -f $sinceInfo.Relative } else { '' }
         $lines.Add((Format-Invariant '期間: {0:yyyy-MM-dd HH:mm} ～ {1:yyyy-MM-dd HH:mm}{2}   レベル: {3}' $sinceInfo.Time $endTime $span ($levelLabels -join ', ')))
