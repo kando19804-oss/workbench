@@ -60,5 +60,8 @@ ShortcutTarget_*/
 # Get-RebootHistory の実行結果（既定ではスクリプトと同じフォルダに保存される。停止を指示したユーザーの名前とコメントを含む）
 RebootHistory_*/
 
+# Remove-OldFile の実行結果（既定ではスクリプトと同じフォルダに保存される。削除した・移したファイルのパスを含む）
+OldFile_*/
+
 # Mac の Finder が作るファイル
 .DS_Store
