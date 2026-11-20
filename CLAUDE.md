@@ -139,6 +139,11 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 停止の指示（User32 1074）の種類と理由は、記録を書いた OS の言語の文字で入る（「電源を切る」「power off」）。再起動かシャットダウンかは Kernel-Power 109 の ShutdownActionType（4 シャットダウン・5 再起動・6 電源を切る）で判定する。`Restart-Computer` の指示はプロセスが `wmiprvse.exe`（理由のコード 0x80070015、理由の文は「この理由のタイトルが見つかりません」）。期限切れの評価版の Windows Server は、`wlms.exe` が 1 時間ごとにシャットダウンする。`shutdown /a` で取り消すと 1075 が書かれる
 - イベントログのサービスだけを再起動すると、OS は再起動していないのに 6006 と 6005 が書かれる
 - `$x = if ($c) { @($a) }` のように if 文の出力を代入すると、要素 1 つの配列がほどける（`$a` が「組の配列」1 つなら、`$x` は組の中身になる）。`$x = @(if ($c) { $a })` と書く（5.1 と 7 の両方）
+- PowerShell は、.NET の string 型のフィールドやメソッドの引数に渡した `$null` を `""` にする（5.1 と 7 の両方）。C# のクラスに値を持たせて「値がない」を null で判定すると、すべて「ある」になる（Remove-OldFile の開発中に、対象のファイルがすべて対象外になった）。null のまま渡すときは `[NullString]::Value` を使う
+- 属性の読み取りだけ（`FILE_READ_ATTRIBUTES`）で開いたハンドルは、共有の制限の対象にならない。ほかのプロセスが共有なしで開いていても開け、開いていても、ほかのプロセスの削除や名前の変更を止めない。押さえておくときは、`DELETE` などの権限を付け、共有に `FILE_SHARE_DELETE` を含めずに開く
+- 中のファイルを開いている最中でも、別のプロセスからは親のフォルダの名前を変えられる（同じプロセスからは拒否される）。空のフォルダは、開いたままでも、その場でジャンクションに変えられる（`FSCTL_SET_REPARSE_POINT`）。親のフォルダを開いて押さえても、確かめた後で途中のフォルダを差し替えられるのは防げない。削除・移動は、対象を 1 件ずつ開き、`GetFinalPathNameByHandle` で実際の場所を確かめてから、開いたまま行う（Remove-OldFile を参照）
+- `SetFileInformationByHandle` の `FileRenameInfo` で移すときは、移す先のパスを `\\?\` ではなく `\??\` で始める（Windows の内部の書き方。`MoveFileEx` も中でこの形にしている）
+- `Read-Host` の入力を Ctrl+C でやめると、改行しない（5.1 と 7 の両方）。止まったときのメッセージが確認の行（「…[N] いいえ:」）に続いて出るので、確認を待っている間だけ印を立て、止まったときは先に改行する（Remove-OldFile 1.0.0 で直した。Update-ShortcutTarget・Convert-TextEncoding 1.0.1 は未対応）
 
 ## テストの書き方の注意
 
@@ -163,7 +168,7 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - わざとバグのテストを `Start-Process` で並べて流すときは、`-WorkingDirectory` に各コピーのフォルダを渡す。渡さないと、保存先を変えるバグが、起動した側の現在のフォルダ（リポジトリ）に結果を作る
 - COM の偽物を `Add-Member -MemberType ScriptMethod` で作ると、例外の包まれ方が本物と違う（本物は `MethodInvocationException` や `GetValueInvocationException` に包まれて届く）。例外の処理を確かめるときは、C# のクラスで作る（`tests/Compare-SystemState.Tests.ps1` を参照）
 - `New-Object` を global の関数で差し替えるときは、本物の結果を `,` で包んで返す。包まないと、コレクションが要素に分かれて出てくる
-- コマンドプロンプトの `\"` のヒントは、後ろに引数を続けて確かめる。`"C:\data\"` が最後の引数なら、残った `"` を外して普通に動くツールがある（`Remove-Quote`）。後ろに空白を含む引用符付きの値（`-NoSuchName "a b"` など）が続く場合と、パラメーターの名前の書き間違いも確かめる（1.0.0 では、どちらも英語のエラーだった）。PowerShell から `cmd /c` に直接書くと引用符が変わるので、`.cmd` ファイルに書いて起動する
+- コマンドプロンプトの `\"` のヒントは、後ろに引数を続けて確かめる。`"C:\data\"` が最後の引数なら、残った `"` を外して普通に動くツールがある（`Remove-Quote`）。後ろに空白を含む引用符付きの値（`-NoSuchName "a b"` など）が続く場合と、パラメーターの名前の書き間違いも確かめる（1.0.0 では、どちらも英語のエラーだった）。書き間違いは、ほかのパラメーターの省略形にならない名前で試す（`-Exclud` は `-Exclude` の省略形として通り、普通に動く）。PowerShell から `cmd /c` に直接書くと引用符が変わるので、`.cmd` ファイルに書いて起動する
 - `[powershell]::Create()` の `Stop()` は、動いている最中に呼んでも、取りこぼして最後まで動き続けることがある（5.1 でも 7 でも。Convert-TextEncoding のテストの条件で 10 回に 5 回）。止まることを確かめる項目は、1 回の結果で判定せず、何度か試す
 - pwsh から `Start-Process powershell.exe` で 5.1 を起動すると、7 のモジュールの場所（`PSModulePath`）を引き継ぎ、`Get-FileHash` や `Get-Acl` が「モジュールを読み込むことができません」になる。わざとバグのテストを 5.1 で並べて流すときは、`powershell.exe` から起動する
 - どの処理に時間がかかっているかは、ツールを `[powershell]::Create()` で動かし、`Streams.Progress` の表示が変わった時刻を記録すると、ツールを変えずに測れる。Ctrl+C の合図にする表示が出るまでの秒数も、これで測る
@@ -174,6 +179,9 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - テストの一時フォルダ（`GetTempPath`）と `%TEMP%`・`%TMP%` は、PC によって文字が一致しない（Windows Server の 8.3 形式の名前など）。環境変数の展開を確かめるときは、テストで環境変数を作って子のプロセスに引き継がせる
 - Windows Server の PowerShell 7（Windows ターミナル）では、Ctrl+C のキーを送る補助の `AttachConsole` がエラー 5 になることがある。キーを送れなかったときはスキップにする
 - 開発に使っている PC（Windows 11 Insider・ウイルスバスター・Acronis）は、Update-ShortcutTarget のテスト（管理共有越しに .lnk を数百個作り・書き換え・消し、プロセスを数十回起動する）の最中に 2 回ブルースクリーンになった（2026-11-13。スタックに Trend Micro の tmeyes.sys と condrv.sys）。このテストとわざとバグは、FGTEST の VM で流す
+- 同じ PC では、`icacls` で削除の拒否（`(DE)`・`(DC)`）を付けると、icacls のプロセスが何も出さずに終わり（終了コード 0）、ACL も付かない（ウイルス対策ソフトか Acronis の振る舞いの監視と思われる。`(RD)`・`(R)`・`(WD,AD)` は通る）。削除の拒否は .NET の `SetAccessControl` で付ける。本人の `Delete` と、親のフォルダの `DeleteSubdirectoriesAndFiles` の両方を拒否する（本人だけだと、親の権限で消せる。`tests/Remove-OldFile.Tests.ps1` を参照）
+- 確認（`Read-Host`）を待っている間の Ctrl+C は、ツールのコピーで `Read-Host` の行を `throw (New-Object Management.Automation.PipelineStoppedException)` に書き換えると再現できる。この例外は `catch` に捕まらず、`finally` だけが動く（5.1 と 7 の両方。`tests/Remove-OldFile.Tests.ps1` を参照）
+- 削除・移動するツールの Ctrl+C（`[Console]::TreatControlCAsInput` で受け取る）は、起動した側の PowerShell と同じコンソールの設定を変える。実機確認では、ツールが終わった後に `Start-Sleep` を Ctrl+C で止められるか（設定を戻せているか）も確かめる
 
 ## コミット
 
