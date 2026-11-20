@@ -63,5 +63,8 @@ RebootHistory_*/
 # Remove-OldFile の実行結果（既定ではスクリプトと同じフォルダに保存される。削除した・移したファイルのパスを含む）
 OldFile_*/
 
+# Get-FolderPermission の実行結果（既定ではスクリプトと同じフォルダに保存される。ユーザー名・グループ名とアクセス権を含む）
+FolderPermission_*/
+
 # Mac の Finder が作るファイル
 .DS_Store

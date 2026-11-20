@@ -144,6 +144,17 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 中のファイルを開いている最中でも、別のプロセスからは親のフォルダの名前を変えられる（同じプロセスからは拒否される）。空のフォルダは、開いたままでも、その場でジャンクションに変えられる（`FSCTL_SET_REPARSE_POINT`）。親のフォルダを開いて押さえても、確かめた後で途中のフォルダを差し替えられるのは防げない。削除・移動は、対象を 1 件ずつ開き、`GetFinalPathNameByHandle` で実際の場所を確かめてから、開いたまま行う（Remove-OldFile を参照）
 - `SetFileInformationByHandle` の `FileRenameInfo` で移すときは、移す先のパスを `\\?\` ではなく `\??\` で始める（Windows の内部の書き方。`MoveFileEx` も中でこの形にしている）
 - `Read-Host` の入力を Ctrl+C でやめると、改行しない（5.1 と 7 の両方）。止まったときのメッセージが確認の行（「…[N] いいえ:」）に続いて出るので、確認を待っている間だけ印を立て、止まったときは先に改行する（Remove-OldFile 1.0.0 で直した。Update-ShortcutTarget・Convert-TextEncoding 1.0.1 は未対応）
+- ACL は `GetFileSecurity` ではなく `GetNamedSecurityInfo` で読む。`GetFileSecurity` はディスクの上の形をそのまま返し、継承の印（`ID`）のない古い形の ACL では、親から継承した設定も「このフォルダで設定した」に見える。`GetNamedSecurityInfo` は親と見比べて印を付け直す（エクスプローラーと同じ見え方）。PowerShell 7 には `DirectoryInfo.GetAccessControl` がない（`[IO.FileSystemAclExtensions]` を使う）
+- 古い形の ACL はめずらしくない。Windows Server の `C:\` と、フォーマットしたままのドライブのルートには自動継承の印（`AI`）がなく、その下に作ったフォルダは継承の印のない形になる（Windows 11 の `C:\` は `D:PAI` だが、`%TEMP%` の下も古い形）
+- 共有のルート（`\\fs01\営業` そのもの）を共有越しに `GetNamedSecurityInfo` で読むと、親をたどれないため、古い形の ACL では継承の印を付け直せず、すべて「このフォルダ」の設定になる。管理共有越し（`\\fs01\D$\share\営業`）なら親をたどれる（Get-FolderPermission の実機確認で見つけた）
+- 古い形の ACL で、管理者が作ったフォルダ（所有者が Administrators）は、CREATOR OWNER から作られた「Administrators フル コントロール このフォルダだけ」が、親から継承した Administrators の設定と重なるため、`GetNamedSecurityInfo` でも継承として付け直されない（エクスプローラーでも「継承元: なし」）。ファイルは、作るときに同じ設定を 1 つにまとめるので残らない
+- Windows は、継承した ACE を子の側で省いたり（同じ SID に同じ権限が効くとき）、IO（下へ渡すだけ）の ACE に分けたり、汎用のアクセス権（`GA` など）のまま書いたり、0x1F01FF に切りそろえたりする。CREATOR OWNER から作られた分は作った人の SID になり、所有者を後から変えると合わない。親と子の ACE を 1 つずつ比べると、Program Files で 1.2 万件の誤判定になった。子に効く権限と下へ渡す権限を、意味で比べる
+- .NET（`Get-Acl`・`GetAccessControl`）は、継承の状態が同じで同じアカウントの設定をまとめ、並べ替えた形で返す。ディスクの上の形を確かめるときは `GetFileSecurity` で読む
+- `NetShareGetInfo`（502）は、管理用の共有（`C$` など）では SD が null を返す（Windows の既定の設定が使われる）。この PC の共有の実際の設定は `Get-SmbShareAccess` で読める。ほかのサーバーの 502 と 2（共有のフォルダの場所）は、そのサーバーの管理者でないと拒否される
+- 管理共有（`C$`）は、その PC にサインインしているユーザー（INTERACTIVE）にも開ける。一般ユーザーでも、その PC の上からなら `\\自分の PC\C$` を開ける（ほかの PC からは開けない）
+- WinNT プロバイダーで読んだグループのメンバーのオブジェクトは、`UserFlags` を持たない。ユーザーの `AdsPath` で開き直して読む
+- `LookupAccountSid`（.NET の `Translate` も）は、組み込みのローカルアカウント（Administrator・Guest など）のドメインを小文字のホスト名（`pc01\Administrator`）で返し、自分で作ったアカウントは大文字（`PC01\user1`）で返す
+- ローカルのアカウント（`FS01\Administrator`）で実行すると、ドメインに参加している PC でも、ADSI のサーバーレスのバインド（`LDAP://<SID=…>`）が「指定されたドメインがないか、またはアクセスできません。」になる。`[ADSI]` のプロパティを読むだけだと、エラーにならずに空を返す
 
 ## テストの書き方の注意
 
@@ -182,6 +193,10 @@ Windows のサーバー・クライアントを扱う SE・運用担当向けの
 - 同じ PC では、`icacls` で削除の拒否（`(DE)`・`(DC)`）を付けると、icacls のプロセスが何も出さずに終わり（終了コード 0）、ACL も付かない（ウイルス対策ソフトか Acronis の振る舞いの監視と思われる。`(RD)`・`(R)`・`(WD,AD)` は通る）。削除の拒否は .NET の `SetAccessControl` で付ける。本人の `Delete` と、親のフォルダの `DeleteSubdirectoriesAndFiles` の両方を拒否する（本人だけだと、親の権限で消せる。`tests/Remove-OldFile.Tests.ps1` を参照）
 - 確認（`Read-Host`）を待っている間の Ctrl+C は、ツールのコピーで `Read-Host` の行を `throw (New-Object Management.Automation.PipelineStoppedException)` に書き換えると再現できる。この例外は `catch` に捕まらず、`finally` だけが動く（5.1 と 7 の両方。`tests/Remove-OldFile.Tests.ps1` を参照）
 - 削除・移動するツールの Ctrl+C（`[Console]::TreatControlCAsInput` で受け取る）は、起動した側の PowerShell と同じコンソールの設定を変える。実機確認では、ツールが終わった後に `Start-Sleep` を Ctrl+C で止められるか（設定を戻せているか）も確かめる
+- 管理者として実行すると、テストで作ったフォルダの所有者は自分ではなく Administrators になり、CREATOR OWNER から作られる設定も Administrators の SID になる。所有者や CREATOR OWNER の分を「自分」と決め打ちしない（Get-FolderPermission の実機確認で、管理者の回帰テストが 2 件失敗した）
+- 共有のフォルダそのもの（共有のルート）の動きは、テストの環境（管理者でない）では本物の共有を作れないので確かめられない。実機確認で本物の共有（`New-SmbShare`）を作り、ローカルのパス・`\\localhost`・ほかの PC からの共有越しの 3 つで確かめる（Get-FolderPermission の共有のルートの問題は、ここで見つかった）
+- ほかの PC から、管理者でないユーザーとして共有越しに確かめるときは、`runas /netonly /user:FGTEST\t-yamada powershell.exe` で開いた PowerShell を使う（ネットワーク越しのときだけそのユーザーになる。同じサーバーに管理者で `net use` していても、別につながる）
+- FGTEST-FS で `runas` で開いた PowerShell の画面は、日本語を含む長い行の表示が崩れる（PowerShell の起動メッセージから崩れる）。その画面で動かしたツールの結果は、ファイルに保存して確かめる
 
 ## コミット
 
