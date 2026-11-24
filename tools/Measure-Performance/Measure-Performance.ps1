@@ -1799,6 +1799,9 @@ try {
 } catch { }
 
 try {
+    # 記録の予定の時刻を、秒の区切りにそろえる。予定が秒の区切りの直前（xx.95 秒など）にあると、わずかな遅れで
+    # 続く 2 回が同じ秒になり（-Interval 1 のとき）、CSV に同じ時刻の行が並ぶため。書く時刻は四捨五入する
+    [Threading.Thread]::Sleep(1000 - (Get-Date).Millisecond)
     # 準備に時間がかかっても、最初の回が 1 間隔の平均になるよう、記録の直前にもう一度読み取って起点にする
     [void]$pdh.Collect()
     $sampler.Baseline()
@@ -1827,6 +1830,7 @@ try {
 
         [void]$pdh.Collect()
         $now  = Get-Date
+        $now  = [datetime]::new([long][math]::Floor(($now.Ticks + 5000000) / 10000000) * 10000000, $now.Kind)   # 秒に四捨五入
         $wall = [DateTime]::UtcNow
         # 前の回から間があきすぎたとき（スリープから戻ったときなど）は、あいだの長い時間の平均になるので記録しない
         $gap  = ($wall - $previousWall).TotalSeconds -gt $GapFactor * $Interval
