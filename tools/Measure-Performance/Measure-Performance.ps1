@@ -128,7 +128,10 @@ $QueuePerCpu    = 2         # 目安: プロセッサ待ち行列が、論理プ
 $MemoryLimit    = 90.0      # 目安: メモリ使用率(%) がこれ以上
 $CommitPctLimit = 90.0      # 目安: コミット率(%) がこれ以上
 $LatencyLimit   = 20.0      # 目安: ディスクの応答時間(ms) がこれ以上
-$LatencyMinIops = 10.0      # 応答時間は、読み書きが 1 秒にこの回数以上あったときだけ判定する
+$LatencyMinBusy = 0.1       # 応答時間は、1 秒あたりの読み書きの回数 × 応答時間（秒）がこれ以上のときだけ判定する
+                            # （1 秒のうち、合わせて 0.1 秒以上読み書きを待っていたとき。平均の待ち行列と同じ値で、
+                            # 読み書きのほとんどないディスクの 1 回の遅い書き込みは外し、遅くて回数が少ないディスクは拾う）
+$LatencyMinCount = 2        # 応答時間は、その回の間に読み書きがこの回数以上あったときだけ判定する
 $FreeLimit      = 10.0      # 目安: ディスクの空き(%) がこれ未満
 $NetLimit       = 80.0      # 目安: ネットワークの使用率(%) がこれ以上
 $GapFactor      = 2         # 前の回から、間隔のこの倍を超えて間があいたら、その回は記録しない（スリープから戻ったときなど）
@@ -345,10 +348,12 @@ function Format-TextTable([string[]]$Head, [bool[]]$Right, $Rows, $Groups = $nul
     return , $lines.ToArray()
 }
 
-# 数値の書式。値がないときは空の文字列
+# 数値の書式。値がないときは空の文字列。7（.NET Core 3.0 以降）は 0 に丸まる負の値を -0.0 と書くので、5.1 と同じ 0.0 にそろえる
 function Format-Number($Value, [string]$Format) {
     if ($null -eq $Value) { return '' }
-    return ([double]$Value).ToString($Format, $Invariant)
+    $text = ([double]$Value).ToString($Format, $Invariant)
+    if ($text -match '^-[0.,]+$') { $text = $text.Substring(1) }
+    return $text
 }
 
 # 増減（+12、-4、0）
@@ -626,7 +631,24 @@ if ($ConfigFile) {
 
 #region 引数の確認
 
-if ($NoSave -and $OutputFolder) { Stop-WithError '-NoSave のときは、-OutputFolder は指定できません' }
+# 片方がコマンドライン、もう片方が設定ファイルから来たときは、コマンドラインを優先する（今回だけ画面で見る、今回だけ保存する）。
+# powershell -File では -NoSave:$false と書けないので、設定ファイルの NoSave = true は、-OutputFolder で取り消せるようにする
+if ($NoSave -and $OutputFolder) {
+    $noSaveOnLine = $PSBoundParameters.ContainsKey('NoSave')
+    $outputOnLine = $PSBoundParameters.ContainsKey('OutputFolder')
+    if ($noSaveOnLine -and -not $outputOnLine) {
+        $OutputFolder = ''
+        $configApplied.Remove('OutputFolder')
+    } elseif ($outputOnLine -and -not $noSaveOnLine) {
+        $NoSave = $false
+        $configApplied.Remove('NoSave')
+    } elseif ($noSaveOnLine) {
+        Stop-WithError '-NoSave のときは、-OutputFolder は指定できません'
+    } else {
+        $lineOrder = @([int]$configApplied['NoSave'], [int]$configApplied['OutputFolder']) | Sort-Object
+        Stop-WithError (('設定ファイルの {0} 行目と {1} 行目: NoSave = true のときは、OutputFolder は書けません' -f $lineOrder[0], $lineOrder[1]) + "`r`n" + ('ファイル: {0}' -f $configPath))
+    }
+}
 
 if ($Duration -and $Duration * 60 -lt $Interval) {
     Stop-WithError ('-Duration（{0} 分）が -Interval（{1} 秒）より短いため、1 回も記録できません' -f $Duration, $Interval)
@@ -679,7 +701,6 @@ foreach ($item in @($Counter)) {
     }
 }
 
-$startTime = Get-Date
 $isAdmin = $false
 try {
     $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -812,7 +833,9 @@ namespace Workbench.MeasurePerformance
             return result != 0 ? result : raw.CStatus;
         }
 
-        // インスタンスごとの値。値のないインスタンス（読み取りの間に増えたものなど）は含めない
+        // インスタンスごとの値。値のないインスタンス（読み取りの間に増えたものなど）は含めない。
+        // 同じ名前のインスタンス（\Process(*) の svchost など）は番号なしで届くので、パフォーマンス モニターと同じように
+        // 2 つ目から #1、#2 を付けて区別する（値のないインスタンスも数えて、番号をパフォーマンス モニターとそろえる）
         public CounterData Read(IntPtr counter)
         {
             CounterData data = new CounterData();
@@ -828,14 +851,17 @@ namespace Workbench.MeasurePerformance
                 if (result != 0) { return data; }
                 List<string> names = new List<string>();
                 List<double> values = new List<double>();
+                Dictionary<string, int> seen = new Dictionary<string, int>(StringComparer.Ordinal);
                 int itemSize = Marshal.SizeOf(typeof(FMT_ITEM));
                 for (int i = 0; i < count; i++)
                 {
                     FMT_ITEM item = (FMT_ITEM)Marshal.PtrToStructure(new IntPtr(buffer.ToInt64() + (long)i * itemSize), typeof(FMT_ITEM));
+                    string name = item.Name == IntPtr.Zero ? "" : (Marshal.PtrToStringUni(item.Name) ?? "");
+                    int number;
+                    if (seen.TryGetValue(name, out number)) { seen[name] = number + 1; name = name + "#" + number.ToString(); } else { seen[name] = 1; }
                     if (item.Value.CStatus != 0 && item.Value.CStatus != 1) { continue; }
                     if (double.IsNaN(item.Value.Value) || double.IsInfinity(item.Value.Value)) { continue; }
-                    string name = item.Name == IntPtr.Zero ? "" : Marshal.PtrToStringUni(item.Name);
-                    names.Add(name ?? "");
+                    names.Add(name);
                     values.Add(item.Value.Value);
                 }
                 data.Names = names.ToArray();
@@ -881,6 +907,59 @@ namespace Workbench.MeasurePerformance
         public int Samples;
         public bool Specified;
         internal List<string> ServiceList = new List<string>();
+        internal string SortName = "";   // 名前の順に並べるときのキー（大文字にそろえ、文字の番号の順で比べる）
+    }
+
+    // CSV の値。スクリプトの ConvertTo-CellText・Protect-ExcelText・ConvertTo-CsvLine と同じ決まりにする
+    // （process-list.csv は行が多くなることがあるため、ここでまとめて作る）
+    public static class CsvText
+    {
+        private static readonly System.Text.RegularExpressions.Regex lineBreaks = new System.Text.RegularExpressions.Regex(@"\s*[\r\n]+\s*");
+        private static readonly System.Text.RegularExpressions.Regex controls = new System.Text.RegularExpressions.Regex(@"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]");
+        private static readonly System.Text.RegularExpressions.Regex excelRisk = new System.Text.RegularExpressions.Regex(@"^(?:[=+\-@]|[\d\s.,/:+\-]+$)");
+
+        // 途中の改行は空白 1 つに、ほかの制御文字は ? にする
+        public static string Cell(string text)
+        {
+            if (string.IsNullOrEmpty(text)) { return ""; }
+            return controls.Replace(lineBreaks.Replace(text, " "), "?").Trim();
+        }
+
+        // Excel が数式・数値・日付に変える形の値は ="..." で囲む。式に書けない 255 文字を超える値は、先頭に空白を足す
+        public static string Excel(string text)
+        {
+            if (string.IsNullOrEmpty(text)) { return ""; }
+            bool risky = excelRisk.IsMatch(text);
+            if (!risky)
+            {
+                string normalized = text;
+                try { normalized = text.Normalize(NormalizationForm.FormKC); } catch (ArgumentException) { }
+                double number;
+                risky = double.TryParse(normalized.TrimEnd('%'), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out number);
+            }
+            if (!risky) { return text; }
+            if (text.Length <= 255) { return "=\"" + text.Replace("\"", "\"\"") + "\""; }
+            return " " + text;
+        }
+
+        // 数値。7（.NET Core 3.0 以降）は 0 に丸まる負の値を -0.0 と書くので、5.1 と同じ 0.0 にそろえる
+        public static string Number(double value, string format)
+        {
+            string text = value.ToString(format, System.Globalization.CultureInfo.InvariantCulture);
+            if (text.Length > 1 && text[0] == '-' && text.TrimStart('-').Trim('0', '.', ',').Length == 0) { text = text.Substring(1); }
+            return text;
+        }
+
+        public static string Line(string[] fields)
+        {
+            StringBuilder builder = new StringBuilder();
+            for (int i = 0; i < fields.Length; i++)
+            {
+                if (i > 0) { builder.Append(','); }
+                builder.Append('"').Append((fields[i] ?? "").Replace("\"", "\"\"")).Append('"');
+            }
+            return builder.ToString();
+        }
     }
 
     public sealed class ProcRow
@@ -1093,11 +1172,66 @@ namespace Workbench.MeasurePerformance
             return selected.ToArray();
         }
 
+        // まとめと process-list.csv の並べ方。期間中に見たプロセスは長い記録で何万件にもなるので、ここで並べる
+        // （PowerShell の Sort-Object では、10 万件で 1 回 5 秒ほどかかる）
+        private static int CompareName(ProcStat a, ProcStat b)
+        {
+            int c = string.CompareOrdinal(a.SortName, b.SortName);
+            return c != 0 ? c : a.Pid.CompareTo(b.Pid);
+        }
+
+        // CPU の平均の高い順（平均は合計を記録した回の数で割るので、合計の順と同じ）
+        public ProcStat[] SortedByCpu()
+        {
+            List<ProcStat> list = new List<ProcStat>(StatList);
+            list.Sort(delegate (ProcStat a, ProcStat b) { int c = b.CpuSum.CompareTo(a.CpuSum); return c != 0 ? c : CompareName(a, b); });
+            return list.ToArray();
+        }
+
+        // メモリの最大の高い順
+        public ProcStat[] SortedByMemory()
+        {
+            List<ProcStat> list = new List<ProcStat>(StatList);
+            list.Sort(delegate (ProcStat a, ProcStat b) { int c = b.MemoryMax.CompareTo(a.MemoryMax); return c != 0 ? c : CompareName(a, b); });
+            return list.ToArray();
+        }
+
+        // -Process で指定したプロセスを、名前の順に
+        public ProcStat[] SpecifiedByName()
+        {
+            List<ProcStat> list = new List<ProcStat>();
+            foreach (ProcStat stat in StatList) { if (stat.Specified) { list.Add(stat); } }
+            list.Sort(CompareName);
+            return list.ToArray();
+        }
+
+        // process-list.csv の行（見出しを除く）
+        public static string[] ListLines(ProcStat[] ordered, int recorded)
+        {
+            System.Globalization.CultureInfo invariant = System.Globalization.CultureInfo.InvariantCulture;
+            const string timeFormat = "yyyy/MM/dd HH:mm:ss";
+            double divisor = Math.Max(1, recorded);
+            string[] lines = new string[ordered.Length];
+            for (int i = 0; i < ordered.Length; i++)
+            {
+                ProcStat stat = ordered[i];
+                lines[i] = CsvText.Line(new string[] {
+                    CsvText.Excel(CsvText.Cell(stat.Name)), stat.Pid.ToString(invariant), CsvText.Excel(stat.Services), CsvText.Excel(CsvText.Cell(stat.User)),
+                    stat.Started > DateTime.MinValue ? stat.Started.ToString(timeFormat, invariant) : "",
+                    CsvText.Excel(CsvText.Cell(stat.Path)), CsvText.Excel(CsvText.Cell(stat.CommandLine)),
+                    stat.FirstSeen.ToString(timeFormat, invariant), stat.LastSeen.ToString(timeFormat, invariant),
+                    CsvText.Number(stat.CpuSum / divisor, "N1"), CsvText.Number(stat.CpuMax, "N1"), CsvText.Number(stat.MemoryMax, "N1"),
+                    CsvText.Number(stat.CommitMax, "N1"), CsvText.Number(stat.CommitLast - stat.CommitFirst, "N1") });
+            }
+            return lines;
+        }
+
         private ProcStat NewStat(string key, Snap snap, DateTime now)
         {
             ProcStat stat = new ProcStat();
             stat.Key = key;
             stat.Name = snap.Name;
+            stat.SortName = snap.Name.ToUpperInvariant();
             stat.Pid = snap.Pid;
             stat.Started = snap.Create > 0 ? DateTime.FromFileTime(snap.Create) : DateTime.MinValue;
             stat.FirstSeen = now;
@@ -1325,7 +1459,8 @@ $cpuCount = [Workbench.MeasurePerformance.SystemInfo]::ProcessorCount()
 $queueLimit = $cpuCount * $QueuePerCpu
 
 $osName = ''
-try { $osName = [string](Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption -ErrorAction Stop).Caption } catch { }
+# WMI が応答しないサーバーで止まらないよう、待つ時間を区切る
+try { $osName = [string](Get-CimInstance -ClassName Win32_OperatingSystem -Property Caption -OperationTimeoutSec 10 -ErrorAction Stop).Caption } catch { }
 if (-not $osName) {
     try { $osName = [string](Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -Name ProductName -ErrorAction Stop).ProductName } catch { }
 }
@@ -1407,7 +1542,7 @@ $adapterRefreshed = [DateTime]::MinValue
 function Update-AdapterName {
     $script:adapterRefreshed = [DateTime]::UtcNow
     try {
-        foreach ($a in @(Get-CimInstance -ClassName Win32_NetworkAdapter -Property Name, NetConnectionID -ErrorAction Stop)) {
+        foreach ($a in @(Get-CimInstance -ClassName Win32_NetworkAdapter -Property Name, NetConnectionID -OperationTimeoutSec 10 -ErrorAction Stop)) {
             if (-not $a.Name -or -not $a.NetConnectionID) { continue }
             $instance = ([string]$a.Name).Replace('(', '[').Replace(')', ']').Replace('#', '_').Replace('/', '_').Replace('\', '_')
             $adapterNames[$instance] = [string]$a.NetConnectionID
@@ -1447,6 +1582,9 @@ if ($netHandles) {
 #endregion
 
 #region 保存先の準備
+
+# 記録を始める時刻。準備（Add-Type のコンパイルや WMI）が終わってから取り、「対象」の行・フォルダ名・まとめの始めをそろえる
+$startTime = Get-Date
 
 # 記録を始めてから書き込めないと分かるのを避けるため、先に保存先のフォルダと CSV の見出しを作っておく
 $runDir = $null
@@ -1509,7 +1647,7 @@ function Add-CsvLine([string]$Key, $Lines) {
     $file = $csvFiles[$Key]
     if ($null -eq $file) { return }
     try {
-        if ($file.Rows + $Lines.Count -gt $MaxCsvRows) { Start-CsvPart $file ('行が {0:N0} 行に達したため' -f $MaxCsvRows) }
+        if ($file.Rows + $Lines.Count -gt $MaxCsvRows) { Start-CsvPart $file (Format-Invariant '行が {0:N0} 行に達したため' $MaxCsvRows) }
         $text = ($Lines -join "`r`n") + "`r`n"
         try {
             [IO.File]::AppendAllText((ConvertTo-LongPath $file.Path), $text, $Utf8NoBom)
@@ -1628,7 +1766,7 @@ $processText = @()
 if ($Top -gt 0) { $processText += 'CPU とメモリの上位 {0} 件' -f $Top }
 if ($processNames.Count -gt 0) { $processText += '指定 {0}' -f ($processNames -join ', ') }
 if ($processText.Count -eq 0) { $processText = @('毎回は記録しない') }
-$recordStart = Get-Date
+$recordStart = $startTime
 if ($Duration) {
     $durationText = if ($Duration -lt 60) { '{0} 分間' -f $Duration } elseif ($Duration % 60 -eq 0) { '{0} 時間' -f ($Duration / 60) } else { '{0} 時間 {1} 分' -f [math]::Floor($Duration / 60), ($Duration % 60) }
     $endPlan = $recordStart.AddMinutes($Duration)
@@ -1643,7 +1781,10 @@ if ($runDir) { $headLines.Add(('保存先: {0}' -f $runDir)) }
 foreach ($line in $headLines) {
     if ($line.StartsWith('※', [StringComparison]::Ordinal)) { Write-Host $line -ForegroundColor Yellow } else { Write-Host $line }
 }
-if (-not $inputRedirected) { Write-Host '止めるときは Ctrl+C を押してください。それまでの記録を保存します。' }
+if (-not $inputRedirected) {
+    if ($runDir) { Write-Host '止めるときは Ctrl+C を押してください。それまでの記録を保存します。' }
+    else { Write-Host '止めるときは Ctrl+C を押してください。それまでのまとめを表示します。' }
+}
 Write-Host ''
 Write-Host $liveHead
 
@@ -1657,7 +1798,6 @@ try {
     }
 } catch { }
 
-$finalLines = $null
 try {
     # 準備に時間がかかっても、最初の回が 1 間隔の平均になるよう、記録の直前にもう一度読み取って起点にする
     [void]$pdh.Collect()
@@ -1779,7 +1919,9 @@ try {
                     if ($null -ne $freeGB) { $s.FreeGB = $freeGB }
                     if ($null -ne $d.FreePct) { $s.FreePct = $d.FreePct }
 
-                    $latencyHit = $null -ne $latency -and $null -ne $d.Iops -and $d.Iops -ge $LatencyMinIops -and $latency -ge $LatencyLimit
+                    # 1 回だけの遅い読み書きは外す（-Interval 1 では、1 回 100 ms の読み書きだけで回数 × 応答時間が 0.1 になるため）
+                    $latencyHit = $null -ne $latency -and $null -ne $d.Iops -and $latency -ge $LatencyLimit -and
+                        $d.Iops * $Interval -ge $LatencyMinCount -and $d.Iops * $latency / 1000 -ge $LatencyMinBusy
                     if ($null -ne $latency) { Update-Limit ('latency:' + $name) ('{0} の応答時間 {1} ms 以上' -f $name, $LatencyLimit) 5 $name $latencyHit $now }
                     if ($null -ne $d.FreePct) { Update-Limit ('free:' + $name) ('{0} の空き {1}% 未満' -f $name, $FreeLimit) 6 $name ($d.FreePct -lt $FreeLimit) $now }
 
@@ -1896,203 +2038,225 @@ try {
 } catch {
     $unexpected = $_
 } finally {
-    if ($keyInput) { try { [Console]::TreatControlCAsInput = $oldCtrlC } catch { } }
-    # 入力をリダイレクトしているときの Ctrl+C は、ここだけが動く
+    # 入力をリダイレクトしているときの Ctrl+C は、ここだけが動く。
+    # Ctrl+C をキーとして受け取る設定は、保存が終わるまで戻さない（長い記録ではまとめに時間がかかり、
+    # その間にもう一度 Ctrl+C を押されると、summary.txt と process-list.csv を保存しないまま止まるため）
     if (-not $endReason) { $endReason = if ($unexpected) { 'エラー' } else { 'Ctrl+C' } }
-    $recordEnd = Get-Date
+    try {
+        $recordEnd = Get-Date
+        Write-Progress -Activity $ToolTitle -Status 'まとめを作っています'
 
-    #region まとめ
+        #region まとめ
 
-    $sumLines = [System.Collections.Generic.List[string]]::new()
-    $sumLines.Add(('記録を終えました（{0}）  {1} ～ {2}（{3}・{4:N0} 回）' -f $endReason, (Format-When $recordStart), (Format-When $recordEnd), (Format-Duration ($recordEnd - $recordStart)), $recorded))
-    if ($unexpected) { $sumLines.Add(('※ エラーで止まりました: {0}' -f (Get-ErrorText (Get-InnerException $unexpected.Exception)))) }
+        $sumLines = [System.Collections.Generic.List[string]]::new()
+        $sumLines.Add((Format-Invariant '記録を終えました（{0}）  {1} ～ {2}（{3}・{4:N0} 回）' $endReason (Format-When $recordStart) (Format-When $recordEnd) (Format-Duration ($recordEnd - $recordStart)) $recorded))
+        if ($unexpected) { $sumLines.Add(('※ エラーで止まりました: {0}' -f (Get-ErrorText (Get-InnerException $unexpected.Exception)))) }
 
-    $allStats = @()
-    if ($recorded -eq 0) {
-        $sumLines.Add('1 回も記録しないうちに止めました')
-    } else {
-        # CPU とメモリ
-        $sumLines.Add('')
-        $sumLines.Add('■ CPU とメモリ')
-        $rows = [System.Collections.Generic.List[object]]::new()
-        foreach ($item in @(@('CPU 使用率(%)', 'CpuTotal'), @('最も忙しいコア(%)', 'CpuCore'), @('プロセッサ待ち行列', 'Queue'), @('メモリ使用率(%)', 'Memory'), @('コミット率(%)', 'CommitPct'), @('ページ読み込み(回/秒)', 'PageReads'))) {
-            $s = $systemStats[$item[1]]
-            if ($s.Count -eq 0) { continue }
-            $rows.Add([string[]]@($item[0], (Format-Number (Get-Average $s) 'N1'), ('{0}（{1}）' -f (Format-Number $s.Max 'N1'), (Format-When $s.MaxTime))))
-        }
-        foreach ($line in (Format-TextTable @('', '平均', '最大（時刻）') @($false, $true, $true) $rows.ToArray())) { $sumLines.Add($line) }
-
-        # ディスク
-        if ($diskStats.Count -gt 0) {
+        $byCpu = $null
+        if ($recorded -eq 0) {
+            $sumLines.Add('1 回も記録しないうちに止めました')
+        } else {
+            # CPU とメモリ
             $sumLines.Add('')
-            $sumLines.Add('■ ディスク')
+            $sumLines.Add('■ CPU とメモリ')
             $rows = [System.Collections.Generic.List[object]]::new()
-            foreach ($name in @($diskStats.Keys | Sort-Object -Property @{ Expression = { ConvertTo-SortKey $_ } })) {
-                $s = $diskStats[$name]
-                $free = ''
-                if ($null -ne $s.FreeGB) { $free = Format-Invariant '{0:N1} GB' $s.FreeGB }
-                if ($null -ne $s.FreePct) { $free += Format-Invariant '（{0:N0}%）' $s.FreePct }
-                $rows.Add([string[]]@($name, (Format-Number (Get-Average $s.Busy) 'N0'), (Format-Number $s.Busy.Max 'N0'),
-                    (Format-Number $(if ($s.Latency.Count -gt 0) { Get-Average $s.Latency } else { 0 }) 'N1'), (Format-Number $(if ($s.Latency.Count -gt 0) { $s.Latency.Max } else { 0 }) 'N1'),
-                    (Format-Number (Get-Average $s.Read) 'N1'), (Format-Number $s.Read.Max 'N1'), (Format-Number (Get-Average $s.Write) 'N1'), (Format-Number $s.Write.Max 'N1'), $free))
+            foreach ($item in @(@('CPU 使用率(%)', 'CpuTotal'), @('最も忙しいコア(%)', 'CpuCore'), @('プロセッサ待ち行列', 'Queue'), @('メモリ使用率(%)', 'Memory'), @('コミット率(%)', 'CommitPct'), @('ページ読み込み(回/秒)', 'PageReads'))) {
+                $s = $systemStats[$item[1]]
+                if ($s.Count -eq 0) { continue }
+                $rows.Add([string[]]@($item[0], (Format-Number (Get-Average $s) 'N1'), ('{0}（{1}）' -f (Format-Number $s.Max 'N1'), (Format-When $s.MaxTime))))
             }
-            $groups = @(@('', 1), @('使用時間(%)', 2), @('応答時間(ms)', 2), @('読み取り(MB/秒)', 2), @('書き込み(MB/秒)', 2), @('', 1))
-            foreach ($line in (Format-TextTable @('ドライブ', '平均', '最大', '平均', '最大', '平均', '最大', '平均', '最大', '空き') @($false, $true, $true, $true, $true, $true, $true, $true, $true, $false) $rows.ToArray() $groups)) { $sumLines.Add($line) }
-        }
+            foreach ($line in (Format-TextTable @('', '平均', '最大（時刻）') @($false, $true, $true) $rows.ToArray())) { $sumLines.Add($line) }
 
-        # ネットワーク（通信のあったアダプターだけ）
-        $netNames = @($netStats.Keys | Where-Object { $netStats[$_].Traffic } | Sort-Object -Property @{ Expression = { ConvertTo-SortKey (Get-AdapterName $_) } }, @{ Expression = { ConvertTo-SortKey $_ } })
-        if ($netNames.Count -gt 0) {
-            $sumLines.Add('')
-            $sumLines.Add('■ ネットワーク')
-            $rows = [System.Collections.Generic.List[object]]::new()
-            foreach ($name in $netNames) {
-                $s = $netStats[$name]
-                $label = Get-AdapterName $name
-                if ($s.Bandwidth) { $label += '（{0}）' -f (Format-Speed $s.Bandwidth) }
-                $rows.Add([string[]]@($label, (Format-Number (Get-Average $s.Received) 'N1'), (Format-Number $s.Received.Max 'N1'),
-                    (Format-Number (Get-Average $s.Sent) 'N1'), (Format-Number $s.Sent.Max 'N1'), $(if ($s.Util.Count -gt 0) { Format-Number $s.Util.Max 'N0' } else { '-' })))
-            }
-            $groups = @(@('', 1), @('受信(Mbps)', 2), @('送信(Mbps)', 2), @('使用率(%)', 1))
-            foreach ($line in (Format-TextTable @('アダプター', '平均', '最大', '平均', '最大', '最大') @($false, $true, $true, $true, $true, $true) $rows.ToArray() $groups)) { $sumLines.Add($line) }
-        }
-
-        # プロセス。期間全体の平均は、記録した回の数で割る（動いていなかった回は 0% として数える）
-        $allStats = @($sampler.StatList.ToArray())
-        $summaryTop = if ($Top -gt 0) { $Top } else { 5 }
-        $byCpu = @($allStats | Sort-Object -Property @{ Expression = { $_.CpuSum }; Descending = $true }, @{ Expression = { ConvertTo-SortKey $_.Name } }, @{ Expression = { $_.Pid } })
-        if ($byCpu.Count -gt 0) {
-            $sumLines.Add('')
-            $sumLines.Add('■ CPU を多く使ったプロセス（期間の平均）')
-            $rows = [System.Collections.Generic.List[object]]::new()
-            $rank = 0
-            foreach ($st in ($byCpu | Select-Object -First $summaryTop)) {
-                $rank++
-                $rows.Add([string[]]@($rank, (Format-Number ($st.CpuSum / $recorded) 'N1'), (Format-Number $st.CpuMax 'N1'), (Limit-Width (ConvertTo-CellText $st.Name) $NameWidth), $st.Pid, (Limit-Width $st.Services $ServiceWidth)))
-            }
-            foreach ($line in (Format-TextTable @('順位', '平均(%)', '最大(%)', 'プロセス', 'PID', 'サービス') @($true, $true, $true, $false, $true, $false) $rows.ToArray())) { $sumLines.Add($line) }
-
-            $sumLines.Add('')
-            $sumLines.Add('■ メモリを多く使ったプロセス（期間の最大）')
-            $byMemory = @($allStats | Sort-Object -Property @{ Expression = { $_.MemoryMax }; Descending = $true }, @{ Expression = { ConvertTo-SortKey $_.Name } }, @{ Expression = { $_.Pid } })
-            $rows = [System.Collections.Generic.List[object]]::new()
-            $rank = 0
-            foreach ($st in ($byMemory | Select-Object -First $summaryTop)) {
-                $rank++
-                $rows.Add([string[]]@($rank, (Format-Number $st.MemoryMax 'N0'), (Format-Signed ($st.CommitLast - $st.CommitFirst)), (Limit-Width (ConvertTo-CellText $st.Name) $NameWidth), $st.Pid, (Limit-Width $st.Services $ServiceWidth)))
-            }
-            foreach ($line in (Format-TextTable @('順位', 'メモリ(MB)', 'コミットの増減(MB)', 'プロセス', 'PID', 'サービス') @($true, $true, $true, $false, $true, $false) $rows.ToArray())) { $sumLines.Add($line) }
-        }
-
-        # 指定したプロセス（-Process）
-        if ($processNames.Count -gt 0) {
-            $specified = @($allStats | Where-Object { $_.Specified } | Sort-Object -Property @{ Expression = { ConvertTo-SortKey $_.Name } }, @{ Expression = { $_.Pid } })
-            if ($specified.Count -gt 0) {
+            # ディスク
+            if ($diskStats.Count -gt 0) {
                 $sumLines.Add('')
-                $sumLines.Add('■ 指定したプロセス（-Process）')
+                $sumLines.Add('■ ディスク')
                 $rows = [System.Collections.Generic.List[object]]::new()
-                foreach ($st in ($specified | Select-Object -First $SummaryRows)) {
-                    $rows.Add([string[]]@((Limit-Width (ConvertTo-CellText $st.Name) $NameWidth), $st.Pid, (Format-Number ($st.CpuSum / $recorded) 'N1'), (Format-Number $st.CpuMax 'N1'), (Format-Number $st.MemoryMax 'N0'), (Format-Signed ($st.CommitLast - $st.CommitFirst))))
+                foreach ($name in @($diskStats.Keys | Sort-Object -Property @{ Expression = { ConvertTo-SortKey $_ } })) {
+                    $s = $diskStats[$name]
+                    $free = ''
+                    if ($null -ne $s.FreeGB) { $free = Format-Invariant '{0:N1} GB' $s.FreeGB }
+                    if ($null -ne $s.FreePct) { $free += Format-Invariant '（{0:N0}%）' $s.FreePct }
+                    $rows.Add([string[]]@($name, (Format-Number (Get-Average $s.Busy) 'N0'), (Format-Number $s.Busy.Max 'N0'),
+                        (Format-Number $(if ($s.Latency.Count -gt 0) { Get-Average $s.Latency } else { 0 }) 'N1'), (Format-Number $(if ($s.Latency.Count -gt 0) { $s.Latency.Max } else { 0 }) 'N1'),
+                        (Format-Number (Get-Average $s.Read) 'N1'), (Format-Number $s.Read.Max 'N1'), (Format-Number (Get-Average $s.Write) 'N1'), (Format-Number $s.Write.Max 'N1'), $free))
                 }
-                foreach ($line in (Format-TextTable @('プロセス', 'PID', 'CPU の平均(%)', 'CPU の最大(%)', 'メモリの最大(MB)', 'コミットの増減(MB)') @($false, $true, $true, $true, $true, $true) $rows.ToArray())) { $sumLines.Add($line) }
-                if ($specified.Count -gt $SummaryRows) { $sumLines.Add((Get-MoreText ($specified.Count - $SummaryRows) 'process-list.csv')) }
+                $groups = @(@('', 1), @('使用時間(%)', 2), @('応答時間(ms)', 2), @('読み取り(MB/秒)', 2), @('書き込み(MB/秒)', 2), @('', 1))
+                foreach ($line in (Format-TextTable @('ドライブ', '平均', '最大', '平均', '最大', '平均', '最大', '平均', '最大', '空き') @($false, $true, $true, $true, $true, $true, $true, $true, $true, $false) $rows.ToArray() $groups)) { $sumLines.Add($line) }
             }
-        }
 
-        # 追加のカウンター（-Counter）
-        if ($counterStats.Count -gt 0) {
+            # ネットワーク（通信のあったアダプターだけ）
+            $netNames = @($netStats.Keys | Where-Object { $netStats[$_].Traffic } | Sort-Object -Property @{ Expression = { ConvertTo-SortKey (Get-AdapterName $_) } }, @{ Expression = { ConvertTo-SortKey $_ } })
+            if ($netNames.Count -gt 0) {
+                $sumLines.Add('')
+                $sumLines.Add('■ ネットワーク')
+                $rows = [System.Collections.Generic.List[object]]::new()
+                foreach ($name in $netNames) {
+                    $s = $netStats[$name]
+                    $label = Get-AdapterName $name
+                    if ($s.Bandwidth) { $label += '（{0}）' -f (Format-Speed $s.Bandwidth) }
+                    $rows.Add([string[]]@($label, (Format-Number (Get-Average $s.Received) 'N1'), (Format-Number $s.Received.Max 'N1'),
+                        (Format-Number (Get-Average $s.Sent) 'N1'), (Format-Number $s.Sent.Max 'N1'), $(if ($s.Util.Count -gt 0) { Format-Number $s.Util.Max 'N0' } else { '-' })))
+                }
+                $groups = @(@('', 1), @('受信(Mbps)', 2), @('送信(Mbps)', 2), @('使用率(%)', 1))
+                foreach ($line in (Format-TextTable @('アダプター', '平均', '最大', '平均', '最大', '最大') @($false, $true, $true, $true, $true, $true) $rows.ToArray() $groups)) { $sumLines.Add($line) }
+            }
+
+            # プロセス。期間全体の平均は、記録した回の数で割る（動いていなかった回は 0% として数える）。
+            # 長い記録では何万件にもなるので、並べ替えは C# で行い、表に出す分だけを取り出す
+            $summaryTop = if ($Top -gt 0) { $Top } else { 5 }
+            $byCpu = $sampler.SortedByCpu()
+            if ($byCpu.Count -gt 0) {
+                $sumLines.Add('')
+                $sumLines.Add('■ CPU を多く使ったプロセス（期間の平均）')
+                $rows = [System.Collections.Generic.List[object]]::new()
+                for ($i = 0; $i -lt [math]::Min($summaryTop, $byCpu.Count); $i++) {
+                    $st = $byCpu[$i]
+                    $rows.Add([string[]]@(($i + 1), (Format-Number ($st.CpuSum / $recorded) 'N1'), (Format-Number $st.CpuMax 'N1'), (Limit-Width (ConvertTo-CellText $st.Name) $NameWidth), $st.Pid, (Limit-Width $st.Services $ServiceWidth)))
+                }
+                foreach ($line in (Format-TextTable @('順位', '平均(%)', '最大(%)', 'プロセス', 'PID', 'サービス') @($true, $true, $true, $false, $true, $false) $rows.ToArray())) { $sumLines.Add($line) }
+
+                $sumLines.Add('')
+                $sumLines.Add('■ メモリを多く使ったプロセス（期間の最大）')
+                $byMemory = $sampler.SortedByMemory()
+                $rows = [System.Collections.Generic.List[object]]::new()
+                for ($i = 0; $i -lt [math]::Min($summaryTop, $byMemory.Count); $i++) {
+                    $st = $byMemory[$i]
+                    $rows.Add([string[]]@(($i + 1), (Format-Number $st.MemoryMax 'N0'), (Format-Signed ($st.CommitLast - $st.CommitFirst)), (Limit-Width (ConvertTo-CellText $st.Name) $NameWidth), $st.Pid, (Limit-Width $st.Services $ServiceWidth)))
+                }
+                foreach ($line in (Format-TextTable @('順位', 'メモリ(MB)', 'コミットの増減(MB)', 'プロセス', 'PID', 'サービス') @($true, $true, $true, $false, $true, $false) $rows.ToArray())) { $sumLines.Add($line) }
+            }
+
+            # 指定したプロセス（-Process）
+            if ($processNames.Count -gt 0) {
+                $specified = $sampler.SpecifiedByName()
+                if ($specified.Count -gt 0) {
+                    $sumLines.Add('')
+                    $sumLines.Add('■ 指定したプロセス（-Process）')
+                    $rows = [System.Collections.Generic.List[object]]::new()
+                    for ($i = 0; $i -lt [math]::Min($SummaryRows, $specified.Count); $i++) {
+                        $st = $specified[$i]
+                        $rows.Add([string[]]@((Limit-Width (ConvertTo-CellText $st.Name) $NameWidth), $st.Pid, (Format-Number ($st.CpuSum / $recorded) 'N1'), (Format-Number $st.CpuMax 'N1'), (Format-Number $st.MemoryMax 'N0'), (Format-Signed ($st.CommitLast - $st.CommitFirst))))
+                    }
+                    foreach ($line in (Format-TextTable @('プロセス', 'PID', 'CPU の平均(%)', 'CPU の最大(%)', 'メモリの最大(MB)', 'コミットの増減(MB)') @($false, $true, $true, $true, $true, $true) $rows.ToArray())) { $sumLines.Add($line) }
+                    if ($specified.Count -gt $SummaryRows) { $sumLines.Add((Get-MoreText ($specified.Count - $SummaryRows) 'process-list.csv')) }
+                }
+            }
+
+            # 追加のカウンター（-Counter）
+            if ($counterStats.Count -gt 0) {
+                $sumLines.Add('')
+                $sumLines.Add('■ 追加のカウンター')
+                $rows = [System.Collections.Generic.List[object]]::new()
+                foreach ($c in (@($counterStats.Values) | Select-Object -First $SummaryRows)) {
+                    $rows.Add([string[]]@((Limit-Width $c.Path $CounterWidth), (Limit-Width (ConvertTo-CellText $c.Instance) $NameWidth), (Format-Number (Get-Average $c.Stat) '#,##0.###'), ('{0}（{1}）' -f (Format-Number $c.Stat.Max '#,##0.###'), (Format-When $c.Stat.MaxTime))))
+                }
+                foreach ($line in (Format-TextTable @('カウンター', 'インスタンス', '平均', '最大（時刻）') @($false, $false, $true, $true) $rows.ToArray())) { $sumLines.Add($line) }
+                if ($counterStats.Count -gt $SummaryRows) { $sumLines.Add((Get-MoreText ($counterStats.Count - $SummaryRows) 'counters.csv')) }
+            }
+
+            # 目安を超えたところ
             $sumLines.Add('')
-            $sumLines.Add('■ 追加のカウンター')
-            $rows = [System.Collections.Generic.List[object]]::new()
-            foreach ($c in (@($counterStats.Values) | Select-Object -First $SummaryRows)) {
-                $rows.Add([string[]]@((Limit-Width $c.Path $CounterWidth), (Limit-Width (ConvertTo-CellText $c.Instance) $NameWidth), (Format-Number (Get-Average $c.Stat) '#,##0.###'), ('{0}（{1}）' -f (Format-Number $c.Stat.Max '#,##0.###'), (Format-When $c.Stat.MaxTime))))
-            }
-            foreach ($line in (Format-TextTable @('カウンター', 'インスタンス', '平均', '最大（時刻）') @($false, $false, $true, $true) $rows.ToArray())) { $sumLines.Add($line) }
-            if ($counterStats.Count -gt $SummaryRows) { $sumLines.Add((Get-MoreText ($counterStats.Count - $SummaryRows) 'counters.csv')) }
-        }
-
-        # 目安を超えたところ
-        $sumLines.Add('')
-        $sumLines.Add('■ 目安を超えたところ')
-        $hits = @($limits.Values | Where-Object { $_.Count -gt 0 } | Sort-Object -Property @{ Expression = { $_.Order } }, @{ Expression = { $_.Sort } })
-        if ($hits.Count -eq 0) {
-            $sumLines.Add(' 目安を超えたところはありません')
-        } else {
-            foreach ($item in $hits) {
-                if ($item.Count -eq 1) {
-                    $sumLines.Add((' ※ {0}: 1 回（{1}）' -f $item.Label, (Format-When $item.FirstTime)))
-                } elseif ($item.BestLength -le 1) {
-                    $sumLines.Add((Format-Invariant ' ※ {0}: {1:N0} 回（続けて超えたことはありません）' $item.Label $item.Count))
-                } else {
-                    $sumLines.Add((Format-Invariant ' ※ {0}: {1:N0} 回（最も長く続いたのは {2} ～ {3} の {4:N0} 回）' $item.Label $item.Count (Format-When $item.BestStart) (Format-When $item.BestEnd) $item.BestLength))
+            $sumLines.Add('■ 目安を超えたところ')
+            $hits = @($limits.Values | Where-Object { $_.Count -gt 0 } | Sort-Object -Property @{ Expression = { $_.Order } }, @{ Expression = { $_.Sort } })
+            if ($hits.Count -eq 0) {
+                $sumLines.Add(' 目安を超えたところはありません')
+            } else {
+                foreach ($item in $hits) {
+                    if ($item.Count -eq 1) {
+                        $sumLines.Add((' ※ {0}: 1 回（{1}）' -f $item.Label, (Format-When $item.FirstTime)))
+                    } elseif ($item.BestLength -le 1) {
+                        $sumLines.Add((Format-Invariant ' ※ {0}: {1:N0} 回（続けて超えたことはありません）' $item.Label $item.Count))
+                    } else {
+                        $sumLines.Add((Format-Invariant ' ※ {0}: {1:N0} 回（最も長く続いたのは {2} ～ {3} の {4:N0} 回）' $item.Label $item.Count (Format-When $item.BestStart) (Format-When $item.BestEnd) $item.BestLength))
+                    }
                 }
             }
+
+            $sumLines.Add('')
+            $selfCpu = if ($sampler.Self.Samples -gt 0) { $sampler.Self.CpuSum / $sampler.Self.Samples } else { 0 }
+            $sumLines.Add((Format-Invariant 'このツールの CPU 使用率: 平均 {0:N1}%' $selfCpu))
         }
 
-        $sumLines.Add('')
-        $selfCpu = if ($sampler.Self.Samples -gt 0) { $sampler.Self.CpuSum / $sampler.Self.Samples } else { 0 }
-        $sumLines.Add((Format-Invariant 'このツールの CPU 使用率: 平均 {0:N1}%' $selfCpu))
-    }
-
-    # 注意
-    $notes = [System.Collections.Generic.List[string]]::new()
-    for ($i = 0; $i -lt $processNames.Count; $i++) {
-        if ($recorded -gt 0 -and -not $sampler.PatternMatched[$i]) { $notes.Add(('※ -Process に当たるプロセスは、期間中に見つかりませんでした: {0}' -f $processNames[$i])) }
-    }
-    if ($skippedRounds -gt 0 -or $gapRounds -gt 0) {
-        $notes.Add((Format-Invariant '※ 間に合わずに飛ばした回 {0:N0} 回・間があいて記録しなかった回 {1:N0} 回（スリープから戻ったときなど）' $skippedRounds $gapRounds))
-    }
-    foreach ($note in $splitNotes) { $notes.Add($note) }
-    if ($saveError) { $notes.Add(('※ {0} から記録を保存できていません: {1}' -f (Format-When $saveErrorAt), $saveError)) }
-    if (-not $isAdmin -and $recorded -gt 0) { $notes.Add('※ 管理者として実行すると、ほかのユーザーのプロセスの実行ユーザー・実行ファイル・コマンドラインも記録できます') }
-    if ($notes.Count -gt 0) {
-        $sumLines.Add('')
-        foreach ($note in $notes) { $sumLines.Add($note) }
-    }
-
-    Write-Host ''
-    foreach ($line in $sumLines) {
-        if ($line.StartsWith('■', [StringComparison]::Ordinal)) { Write-Host $line -ForegroundColor Cyan }
-        elseif ($line.TrimStart().StartsWith('※', [StringComparison]::Ordinal)) { Write-Host $line -ForegroundColor Yellow }
-        else { Write-Host $line }
-    }
-
-    #endregion
-
-    #region 保存（summary.txt と process-list.csv）
-
-    if ($saving) {
-        try {
-            $listLines = [System.Collections.Generic.List[string]]::new()
-            $listLines.Add((ConvertTo-CsvLine $ListColumns))
-            $ordered = @($allStats | Sort-Object -Property @{ Expression = { $_.CpuSum }; Descending = $true }, @{ Expression = { ConvertTo-SortKey $_.Name } }, @{ Expression = { $_.Pid } })
-            foreach ($st in $ordered) {
-                $listLines.Add((ConvertTo-CsvLine @((Protect-ExcelText (ConvertTo-CellText $st.Name)), $st.Pid, (Protect-ExcelText $st.Services), (Protect-ExcelText (ConvertTo-CellText $st.User)),
-                    $(if ($st.Started -gt [DateTime]::MinValue) { $st.Started.ToString($TimeFormat, $Invariant) } else { '' }),
-                    (Protect-ExcelText (ConvertTo-CellText $st.Path)), (Protect-ExcelText (ConvertTo-CellText $st.CommandLine)),
-                    $st.FirstSeen.ToString($TimeFormat, $Invariant), $st.LastSeen.ToString($TimeFormat, $Invariant),
-                    (Format-Number ($st.CpuSum / [math]::Max(1, $recorded)) 'N1'), (Format-Number $st.CpuMax 'N1'), (Format-Number $st.MemoryMax 'N1'),
-                    (Format-Number $st.CommitMax 'N1'), (Format-Number ($st.CommitLast - $st.CommitFirst) 'N1'))))
-            }
-            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'process-list.csv')), [string[]]$listLines.ToArray(), $Utf8Bom)
-            $textLines = @($headLines) + @('') + @($sumLines)
-            [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$textLines, $Utf8Bom)
-        } catch {
-            $saveError = Get-ErrorText (Get-InnerException $_.Exception)
-            $saving = $false
+        # 注意
+        $notes = [System.Collections.Generic.List[string]]::new()
+        for ($i = 0; $i -lt $processNames.Count; $i++) {
+            if ($recorded -gt 0 -and -not $sampler.PatternMatched[$i]) { $notes.Add(('※ -Process に当たるプロセスは、期間中に見つかりませんでした: {0}' -f $processNames[$i])) }
         }
-    }
-    if ($runDir) {
+        if ($skippedRounds -gt 0 -or $gapRounds -gt 0) {
+            $notes.Add((Format-Invariant '※ 間に合わずに飛ばした回 {0:N0} 回・間があいて記録しなかった回 {1:N0} 回（スリープから戻ったときなど）' $skippedRounds $gapRounds))
+        }
+        foreach ($note in $splitNotes) { $notes.Add($note) }
+        if ($saving -and $sampler.StatList.Count -gt $MaxCsvRows) {
+            $notes.Add((Format-Invariant '※ process-list.csv は、{0:N0} 件ごとに process-list_2.csv などに分けました（Excel で開ける行数の上限のため）' $MaxCsvRows))
+        }
+        if ($saveError) { $notes.Add(('※ {0} から記録を保存できていません: {1}' -f (Format-When $saveErrorAt), $saveError)) }
+        # 実行ユーザーなどは process-list.csv にしか出ないので、保存しないときは出さない
+        if (-not $isAdmin -and $recorded -gt 0 -and $runDir) { $notes.Add('※ 管理者として実行すると、ほかのユーザーのプロセスの実行ユーザー・実行ファイル・コマンドラインも記録できます') }
+        if ($notes.Count -gt 0) {
+            $sumLines.Add('')
+            foreach ($note in $notes) { $sumLines.Add($note) }
+        }
+
+        Write-Progress -Activity $ToolTitle -Completed
         Write-Host ''
+        foreach ($line in $sumLines) {
+            if ($line.StartsWith('■', [StringComparison]::Ordinal)) { Write-Host $line -ForegroundColor Cyan }
+            elseif ($line.TrimStart().StartsWith('※', [StringComparison]::Ordinal)) { Write-Host $line -ForegroundColor Yellow }
+            else { Write-Host $line }
+        }
+
+        #endregion
+
+        #region 保存（summary.txt と process-list.csv）
+
         if ($saving) {
-            Write-Host ('保存先: {0}' -f $runDir)
-        } else {
-            Write-Warning ('記録の一部を保存できませんでした: {0}' -f $saveError)
-            Write-Host ('保存先: {0}' -f $runDir)
+            Write-Progress -Activity $ToolTitle -Status 'process-list.csv と summary.txt を保存しています'
+            try {
+                # 行づくりは C# で行う（長い記録では何万行にもなるため）。ほかの CSV と同じく、100 万行ごとに次のファイルに分ける
+                if ($null -eq $byCpu) { $byCpu = $sampler.SortedByCpu() }
+                $listLines = [Workbench.MeasurePerformance.ProcessSampler]::ListLines($byCpu, $recorded)
+                $header = ConvertTo-CsvLine $ListColumns
+                $part = 1
+                $offset = 0
+                do {
+                    $count = [math]::Min($MaxCsvRows, $listLines.Count - $offset)
+                    $chunk = [string[]]::new($count + 1)
+                    $chunk[0] = $header
+                    [Array]::Copy($listLines, $offset, $chunk, 1, $count)
+                    $fileName = if ($part -eq 1) { 'process-list.csv' } else { 'process-list_{0}.csv' -f $part }
+                    [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir $fileName)), $chunk, $Utf8Bom)
+                    $offset += $count
+                    $part++
+                } while ($offset -lt $listLines.Count)
+                $textLines = @($headLines) + @('') + @($sumLines)
+                [IO.File]::WriteAllLines((ConvertTo-LongPath (Join-Path $runDir 'summary.txt')), [string[]]$textLines, $Utf8Bom)
+            } catch {
+                $saveError = Get-ErrorText (Get-InnerException $_.Exception)
+                $saving = $false
+            }
+            Write-Progress -Activity $ToolTitle -Completed
+        }
+        if ($runDir) {
+            Write-Host ''
+            if ($saving) {
+                Write-Host ('保存先: {0}' -f $runDir)
+            } else {
+                Write-Warning ('記録の一部を保存できませんでした: {0}' -f $saveError)
+                Write-Host ('保存先: {0}' -f $runDir)
+            }
+        }
+
+        #endregion
+    } finally {
+        # 保存が終わってから（まとめの途中で想定外の例外が起きたときも）、Ctrl+C の扱いを元に戻す。
+        # この設定は、起動した側のコマンドプロンプトや PowerShell と共有しているため、必ず戻す。
+        # その間に押された Ctrl+C は、戻した後に効かないよう読み捨てる
+        if ($keyInput) {
+            try { while ([Console]::KeyAvailable) { [void][Console]::ReadKey($true) } } catch { }
+            try { [Console]::TreatControlCAsInput = $oldCtrlC } catch { }
         }
     }
-
-    #endregion
 }
 
 #endregion
