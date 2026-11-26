@@ -95,9 +95,16 @@ function Invoke-Tool([string]$Label, [string[]]$ToolArgs, [string]$ToolPath = $f
 }
 
 # 保存しない実行や、引数の誤りで止まることを確かめる実行
-function Invoke-Plain([string[]]$ToolArgs, [string]$ToolPath = $fast) {
-    $log = ConvertTo-FlatText ((@(& $Exe -NoProfile -ExecutionPolicy Bypass -File $ToolPath @ToolArgs 2>&1) | ForEach-Object { "$_" }) -join "`n")
-    [pscustomobject]@{ Code = $LASTEXITCODE; Log = $log }
+# -RedirectInput は標準入力に空の行を渡す。コンソールのない環境（Claude Code など）では最初からリダイレクトされているが、
+# 本物のコンソールでは渡さないとコンソールのままになり、-Duration なしの実行が止まらない
+function Invoke-Plain([string[]]$ToolArgs, [string]$ToolPath = $fast, [switch]$RedirectInput) {
+    if ($RedirectInput) {
+        $lines = @('' | & $Exe -NoProfile -ExecutionPolicy Bypass -File $ToolPath @ToolArgs 2>&1)
+    } else {
+        $lines = @(& $Exe -NoProfile -ExecutionPolicy Bypass -File $ToolPath @ToolArgs 2>&1)
+    }
+    $code = $LASTEXITCODE
+    [pscustomobject]@{ Code = $code; Log = (ConvertTo-FlatText (($lines | ForEach-Object { "$_" }) -join "`n")) }
 }
 
 # コマンドプロンプトから起動した場合の引数の渡り方を確かめるため、バッチファイル経由で実行する
@@ -682,7 +689,7 @@ try {
     Write-Section '引数の誤り（記録を始める前に止まる）'
     $r = Invoke-Plain @('-Interval', '120', '-Duration', '1') $tool
     Assert-Equal '-Duration が -Interval より短い' ('{0}/{1}' -f $r.Code, $r.Log.Contains('-Duration（1 分）が -Interval（120 秒）より短いため、1 回も記録できません')) '1/True'
-    $r = Invoke-Plain @('-Interval', '1')
+    $r = Invoke-Plain @('-Interval', '1') -RedirectInput
     Assert-Equal '入力をリダイレクトして -Duration なし' ('{0}/{1}' -f $r.Code, $r.Log.Contains('Ctrl+C で止められない起動のしかたです。-Duration で記録する時間を指定してください')) '1/True'
     $r = Invoke-Plain @('-Duration', '2', '-Foo', 'bar')
     Assert-Equal 'どのパラメーターにも当たらない引数' ('{0}/{1}' -f $r.Code, $r.Log.Contains('どのパラメーターにも当たらない引数があります: -Foo bar')) '1/True'
