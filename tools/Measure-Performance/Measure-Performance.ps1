@@ -1812,12 +1812,13 @@ try {
     $sampler.Baseline()
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $previousWall = [DateTime]::UtcNow
-    # 記録の予定の時刻は、始めの時刻（秒の区切り）から数える。始めの時刻のあとの準備（保存先のフォルダ・見出しの表示）に
-    # 使った時間を差し引く。準備に時間がかかり（保存先のネットワークが遅いなど）、最初の回まで半分の間隔もないときは、
-    # 最初の回を 1 間隔あとにする（その回は、起点からの平均になる）
+    # 記録の予定の時刻は、始めの時刻（秒の区切り）から数える。始めの時刻のあとの準備（保存先のフォルダ・見出しの表示・
+    # 起点の読み取り）に使った時間を差し引く（最初の回は、その分だけ短い時間の平均になる）。準備に時間がかかり（保存先の
+    # ネットワークが遅いなど）、最初の回まで 0.2 秒もないときだけ、最初の回を 1 間隔あとにする（短すぎる時間の平均にしないため。
+    # 0.5 秒で区切ると、VM の 5.1 で準備がたまに長引いたときに -Interval 1 の最初の回が減った）
     $lead   = ((Get-Date) - $startTime).TotalSeconds
     $nextAt = [double]$Interval - $lead
-    while ($nextAt -lt $Interval / 2) { $nextAt += $Interval }
+    while ($nextAt -lt 0.2) { $nextAt += $Interval }
     $endAt  = if ($Duration) { [double]$Duration * 60 - $lead } else { [double]::MaxValue }
 
     while ($true) {
