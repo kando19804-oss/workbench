@@ -49,7 +49,7 @@ $quick     = @('-Interval', '1', '-Duration', '3')   # fast で 3 秒（3 回）
 $script:failCount = 0
 
 # -Duration を秒として扱うための書き換え（fast と、書き換えたコピーのすべてに当てる）
-$FastPair = @('$endAt  = if ($Duration) { [double]$Duration * 60 }', '$endAt  = if ($Duration) { [double]$Duration * 1 }')
+$FastPair = @('$endAt  = if ($Duration) { [double]$Duration * 60 - $lead }', '$endAt  = if ($Duration) { [double]$Duration * 1 - $lead }')
 
 $Heads = @{
     'system.csv'       = '"日時","CPU 使用率(%)","最も忙しいコア(%)","プロセッサ待ち行列","メモリ使用率(%)","空きメモリ(MB)","コミット(MB)","コミットの上限(MB)","コミット率(%)","ページ読み込み(回/秒)","プロセス数"'
@@ -326,6 +326,13 @@ try {
     $folderTime = [regex]::Match((Split-Path -Leaf $run.Dir), '_(\d{8})_(\d{6})$')
     $startShown = [regex]::Match($x.Text, '記録を終えました（指定の時間）  (\d\d):(\d\d):(\d\d)')
     Assert-Equal '「対象」・フォルダ名・まとめの始めの時刻がそろう' ('{0}/{1}' -f (($targetTime.Groups[4..6] | ForEach-Object { $_.Value }) -join ''), (($startShown.Groups[1..3] | ForEach-Object { $_.Value }) -join '')) ('{0}/{0}' -f $folderTime.Groups[2].Value)
+    # 最初の記録は始めの時刻の 1 間隔後、まとめの期間は始めの時刻から指定の時間の終わりまで
+    # （始めの時刻を取ったあとで秒の区切りまで待っていたため、記録が 1 秒遅れ、期間が 1 秒長く見えていた。実機確認で見つけた）
+    $startAt = [datetime]::ParseExact($targetTime.Value.Substring($targetTime.Value.Length - 19), 'yyyy-MM-dd HH:mm:ss', $inv)
+    $firstAt = [datetime]::ParseExact($x.System[0].'日時', 'yyyy/MM/dd HH:mm:ss', $inv)
+    $period  = [regex]::Match($x.Text, '記録を終えました（指定の時間）  (\d\d:\d\d:\d\d) ～ (\d\d:\d\d:\d\d)（(.+?)・')
+    Assert-Equal '最初の記録は、始めの時刻の 1 秒後（-Interval 1）' ($firstAt - $startAt).TotalSeconds 1
+    Assert-Equal 'まとめの期間は、始めの時刻から 3 秒（指定の時間の終わり）' ('{0} ～ {1}（{2}）' -f $period.Groups[1].Value, $period.Groups[2].Value, $period.Groups[3].Value) ('{0} ～ {1}（3秒）' -f $startAt.ToString('HH:mm:ss', $inv), $startAt.AddSeconds(3).ToString('HH:mm:ss', $inv))
 
     # 本物の値の妥当性
     # コミットは「今の」値（これまでの最大ではない）。200 MB を確保して解放したプロセスで、Get-Process のプライベートメモリと比べる
@@ -356,6 +363,13 @@ try {
     Assert-Equal '本物: スクリプトのフォルダに保存' ([bool]$realDir) 'True'
     Assert-Equal '本物: 1 分で 2 回（30 秒ごと）・指定の時間で終わる' ('{0}/{1}' -f (Get-RecordedCount $x.Text), $x.Text.Contains('記録を終えました（指定の時間）')) '2/True'
     Assert-Equal '本物: 記録の行' $x.Text.Contains('記録: 30 秒ごと・1 分間（') 'True'
+    # 記録は始めの時刻の 30 秒後と 60 秒後。「（～まで）」・最後の記録・まとめの終わりがそろう
+    $realStart  = [regex]::Match($x.Text, '対象: .+?(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)')
+    $realPlan   = [regex]::Match($x.Text, '記録: 30 秒ごと・1 分間（(\d\d:\d\d:\d\d) まで）')
+    $realPeriod = [regex]::Match($x.Text, '記録を終えました（指定の時間）  (\d\d:\d\d:\d\d) ～ (\d\d:\d\d:\d\d)（(.+?)・')
+    $realTimes  = @($x.System | ForEach-Object { $_.'日時'.Substring(11) }) -join ','
+    $s = [datetime]::ParseExact($realStart.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $inv)
+    Assert-Equal '本物: 記録の時刻・「まで」・まとめの期間がそろう' ('{0}|{1}|{2} ～ {3}（{4}）' -f $realTimes, $realPlan.Groups[1].Value, $realPeriod.Groups[1].Value, $realPeriod.Groups[2].Value, $realPeriod.Groups[3].Value) ('{0},{1}|{1}|{2} ～ {1}（1分0秒）' -f $s.AddSeconds(30).ToString('HH:mm:ss', $inv), $s.AddSeconds(60).ToString('HH:mm:ss', $inv), $s.ToString('HH:mm:ss', $inv))
 
     #endregion
 
