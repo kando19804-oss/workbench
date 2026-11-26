@@ -677,9 +677,12 @@ try {
         $x = Read-Result $run.Dir
         $diskLine = ('※ {0} の応答時間 20 ms 以上: ' -f $drive)
         Assert-Equal ('ディスクの応答時間 {0} ms・{1} 回/秒（まとめ）' -f $case[0].Split('|')) $x.Text.Contains($diskLine) $case[2]
-        # 記録中の行の ※ は、本物のほかのドライブが目安を超えても付くので、「付くはず」のときだけ確かめる
-        if ($case[2]) { Assert-Equal ('ディスクの応答時間 {0} ms・{1} 回/秒（記録中の行の ※）' -f $case[0].Split('|')) $run.Log.Contains(' ms ※') 'True' }
-        if ($case[3]) { Assert-Equal ('CPU の目安の表示（{0} 回目）' -f $case[1]) $x.Text.Contains($case[3]) 'True' }
+        # 記録中の行の * は、本物のほかのドライブが目安を超えても付くので、「付くはず」のときだけ確かめる
+        if ($case[2]) { Assert-Equal ('ディスクの応答時間 {0} ms・{1} 回/秒（記録中の行の *）' -f $case[0].Split('|')) $run.Log.Contains(' ms * ') 'True' }
+        if ($case[3]) {
+            Assert-Equal ('CPU の目安の表示（{0} 回目）' -f $case[1]) $x.Text.Contains($case[3]) 'True'
+            Assert-Equal ('CPU の目安の記録中の行の *（{0} 回目）' -f $case[1]) ([regex]::IsMatch($run.Log, '\d\d:\d\d:\d\d +\d+% \* ')) 'True'
+        }
     }
     $env:MP_TEST_DISK = $null
     $env:MP_TEST_CPUHIT = $null
@@ -850,6 +853,27 @@ try {
     $result = Invoke-Helper $parityScript @('-Tool', $repoTool)
     Assert-Equal 'C# の CsvText とスクリプトの関数の結果が同じ' $result['DIFF'] '0'
     Assert-Equal '10 万件の並べ替えと process-list.csv の行づくりが 15 秒未満' ('{0}/{1}' -f ([double]::Parse("0$($result['SECONDS'])", $inv) -lt 15), $result['LINES']) 'True/100000'
+
+    #endregion
+
+    #region 画面によって幅の変わる文字
+
+    # ※ と … は、Windows PowerShell のウィンドウでは 2 文字分、Windows ターミナルでは 1 文字分で描かれ、後ろの列がずれる（実機確認で見つけた）
+    Write-Section '記録中の行と表に、画面によって幅の変わる文字（※ …）を使わない'
+    $widthScript = New-HelperScript 'width.ps1' @(
+        'param([string]$Tool)'
+        '$ast = [Management.Automation.Language.Parser]::ParseFile($Tool, [ref]$null, [ref]$null)'
+        'foreach ($a in $ast.FindAll({ $args[0] -is [Management.Automation.Language.AssignmentStatementAst] -and $args[0].Left.Extent.Text -eq ''$wideChar'' }, $true)) { . ([scriptblock]::Create($a.Extent.Text)) }'
+        'foreach ($f in $ast.FindAll({ $args[0] -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) { if ($f.Name -in ''Get-DisplayWidth'', ''Limit-Width'', ''Get-Mark'') { . ([scriptblock]::Create($f.Extent.Text)) } }'
+        '''MARK=['' + (Get-Mark $true) + ''][''+ (Get-Mark $false) + '']'''
+        '''ASCII='' + (Limit-Width ''AsusFanControlService.exe'' 20)'
+        '$wide = Limit-Width ''あいうえおかきくけこさしすせそ'' 20'
+        '''WIDE='' + $wide.Length + ''/'' + (Get-DisplayWidth $wide) + ''/'' + $wide.EndsWith(''...'', [StringComparison]::Ordinal)'
+    )
+    $result = Invoke-Helper $widthScript @('-Tool', $repoTool)
+    Assert-Equal '目安の印（超えた・超えていない）は、どちらも半角 3 文字' $result['MARK'] '[ * ][   ]'
+    Assert-Equal '長い名前は ... で切る（半角 20 文字分）' $result['ASCII'] 'AsusFanControlSer...'
+    Assert-Equal '全角の長い名前も ... で切り、20 文字分を超えない（文字数/幅/... で終わる）' $result['WIDE'] '11/19/True'
 
     #endregion
 
