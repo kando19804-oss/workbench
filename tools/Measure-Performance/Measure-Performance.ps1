@@ -1583,8 +1583,13 @@ if ($netHandles) {
 
 #region 保存先の準備
 
-# 記録を始める時刻。準備（Add-Type のコンパイルや WMI）が終わってから取り、「対象」の行・フォルダ名・まとめの始めをそろえる
+# 記録を始める時刻。準備（Add-Type のコンパイルや WMI）が終わってから、次の秒の区切りまで待って取る。
+# 「対象」の行・フォルダ名・まとめの始め・「（～まで）」をこの時刻にそろえ、記録の予定の時刻もここから数える。
+# 予定を秒の区切りにそろえるのは、予定が区切りの直前（xx.95 秒など）にあると、わずかな遅れで続く 2 回が同じ秒になり
+# （-Interval 1 のとき）、CSV に同じ時刻の行が並ぶため。書く時刻は四捨五入する
+[Threading.Thread]::Sleep(1000 - (Get-Date).Millisecond)
 $startTime = Get-Date
+$startTime = [datetime]::new([long][math]::Floor(($startTime.Ticks + 5000000) / 10000000) * 10000000, $startTime.Kind)   # 秒に四捨五入
 
 # 記録を始めてから書き込めないと分かるのを避けるため、先に保存先のフォルダと CSV の見出しを作っておく
 $runDir = $null
@@ -1799,16 +1804,18 @@ try {
 } catch { }
 
 try {
-    # 記録の予定の時刻を、秒の区切りにそろえる。予定が秒の区切りの直前（xx.95 秒など）にあると、わずかな遅れで
-    # 続く 2 回が同じ秒になり（-Interval 1 のとき）、CSV に同じ時刻の行が並ぶため。書く時刻は四捨五入する
-    [Threading.Thread]::Sleep(1000 - (Get-Date).Millisecond)
     # 準備に時間がかかっても、最初の回が 1 間隔の平均になるよう、記録の直前にもう一度読み取って起点にする
     [void]$pdh.Collect()
     $sampler.Baseline()
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $previousWall = [DateTime]::UtcNow
-    $nextAt = [double]$Interval
-    $endAt  = if ($Duration) { [double]$Duration * 60 } else { [double]::MaxValue }
+    # 記録の予定の時刻は、始めの時刻（秒の区切り）から数える。始めの時刻のあとの準備（保存先のフォルダ・見出しの表示）に
+    # 使った時間を差し引く。準備に時間がかかり（保存先のネットワークが遅いなど）、最初の回まで半分の間隔もないときは、
+    # 最初の回を 1 間隔あとにする（その回は、起点からの平均になる）
+    $lead   = ((Get-Date) - $startTime).TotalSeconds
+    $nextAt = [double]$Interval - $lead
+    while ($nextAt -lt $Interval / 2) { $nextAt += $Interval }
+    $endAt  = if ($Duration) { [double]$Duration * 60 - $lead } else { [double]::MaxValue }
 
     while ($true) {
         # 次の予定の時刻まで待つ。待っている間に Ctrl+C を受け取る
@@ -2048,6 +2055,8 @@ try {
     if (-not $endReason) { $endReason = if ($unexpected) { 'エラー' } else { 'Ctrl+C' } }
     try {
         $recordEnd = Get-Date
+        # 指定の時間で終わったときは、終わりを予定の時刻（「（～まで）」の時刻）にする。最後の回の処理に時間がかかっても、ずれないように
+        if ($endReason -eq '指定の時間') { $recordEnd = $startTime.AddSeconds($endAt + $lead) }
         Write-Progress -Activity $ToolTitle -Status 'まとめを作っています'
 
         #region まとめ
