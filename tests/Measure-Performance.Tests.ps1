@@ -333,6 +333,13 @@ try {
     $period  = [regex]::Match($x.Text, '記録を終えました（指定の時間）  (\d\d:\d\d:\d\d) ～ (\d\d:\d\d:\d\d)（(.+?)・')
     Assert-Equal '最初の記録は、始めの時刻の 1 秒後（-Interval 1）' ($firstAt - $startAt).TotalSeconds 1
     Assert-Equal 'まとめの期間は、始めの時刻から 3 秒（指定の時間の終わり）' ('{0} ～ {1}（{2}）' -f $period.Groups[1].Value, $period.Groups[2].Value, $period.Groups[3].Value) ('{0} ～ {1}（3秒）' -f $startAt.ToString('HH:mm:ss', $inv), $startAt.AddSeconds(3).ToString('HH:mm:ss', $inv))
+    # 始めの時刻のあとの準備に 0.6 秒かかっても、最初の回は 1 秒後のまま（最初の回まで 0.2 秒以上あるので、ずらさない）
+    # （待つのは起点の読み取りとストップウォッチより前。保存先の準備が長引いたときと同じ形にする）
+    $slowPrep = New-PatchedTool 'slowprep' @('    # 準備に時間がかかっても、最初の回が 1 間隔の平均になるよう', ('    [Threading.Thread]::Sleep(600)' + "`n" + '    # 準備に時間がかかっても、最初の回が 1 間隔の平均になるよう'))
+    $slowRun = Invoke-Tool 'slowprep' $quick $slowPrep
+    $slowX = Read-Result $slowRun.Dir
+    $slowStart = [regex]::Match($slowX.Text, '対象: .+?(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)')
+    Assert-Equal '準備に 0.6 秒かかっても、最初の記録は始めの時刻の 1 秒後' ([datetime]::ParseExact($slowX.System[0].'日時', 'yyyy/MM/dd HH:mm:ss', $inv) - [datetime]::ParseExact($slowStart.Groups[1].Value, 'yyyy-MM-dd HH:mm:ss', $inv)).TotalSeconds 1
 
     # 本物の値の妥当性
     # コミットは「今の」値（これまでの最大ではない）。200 MB を確保して解放したプロセスで、Get-Process のプライベートメモリと比べる
@@ -592,7 +599,8 @@ try {
 
     # 1 つの CSV の行が上限に達したら分ける（process-list.csv も。レビュー 2 回目 軽微 4）
     $split = New-PatchedTool 'split' @('$MaxCsvRows     = 1000000', '$MaxCsvRows     = 2')
-    $run = Invoke-Tool 'split' $quick $split
+    # 3 回目で分かれる。VM で回が減っても 3 回以上記録できるよう、5 秒記録する（FGTEST-FS の 5.1 で、3 秒では 2 回のことがあった）
+    $run = Invoke-Tool 'split' @('-Interval', '1', '-Duration', '5') $split
     $x = Read-Result $run.Dir
     $n = Get-RecordedCount $x.Text
     $systemParts = @(Get-ChildItem -LiteralPath $run.Dir -Filter 'system*.csv')
