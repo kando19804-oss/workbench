@@ -93,7 +93,7 @@ powershell -ExecutionPolicy Bypass -File .\Measure-Performance.ps1 -ConfigFile .
 | 使用率(%) | 受信と送信の大きいほう ÷ 速度です（受信と送信は同時に速度いっぱいまで使えるため、合計では割りません） | |
 | 速度(Mbps) | アダプターのつながっている速度です | `Current Bandwidth` |
 
-カウンターはすべて `\Network Interface(*)\` のものです。
+カウンターはすべて `\Network Interface(*)\` のものです。Hyper-V の仮想スイッチの vEthernet や、VPN の仮想のアダプターは、このカウンターに出ないことがあり、そのときは記録しません（物理のアダプターを通る通信は、物理のアダプターで記録します。内部の仮想スイッチの中だけの通信は記録されません）。
 
 ### プロセス（processes.csv、process-list.csv）
 
