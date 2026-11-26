@@ -118,7 +118,7 @@ $ToolName       = 'Measure-Performance'
 $ToolTitle      = '性能の記録'
 $MaxCsvRows     = 1000000   # 1 つの CSV に書く行の上限（Excel で開ける行数は 1,048,576 行）
 $SummaryRows    = 20        # まとめの「指定したプロセス」「追加のカウンター」に出す行数
-$NameWidth      = 24        # まとめの表のプロセスの名前の幅（半角の文字数）。超える分は … にする
+$NameWidth      = 24        # まとめの表のプロセスの名前の幅（半角の文字数）。超える分は ... にする
 $LiveNameWidth  = 20        # 記録中の行のプロセスの名前の幅
 $ServiceWidth   = 30        # まとめの表のサービスの幅
 $CounterWidth   = 50        # まとめの表のカウンターの幅
@@ -277,15 +277,16 @@ function Get-DisplayWidth([string]$Text) {
     return $width
 }
 
-# 画面の表の値を、半角 $Width 文字分までにする（超える分は … にする）
+# 画面の表の値を、半角 $Width 文字分までにする（超える分は ... にする）。
+# … は、Windows PowerShell のウィンドウでは 2 文字分、Windows ターミナルでは 1 文字分で描かれ、後ろの列がずれるため使わない
 function Limit-Width([string]$Text, [int]$Width) {
     if ((Get-DisplayWidth $Text) -le $Width) { return $Text }
     $result = ''
     foreach ($ch in $Text.ToCharArray()) {
-        if ((Get-DisplayWidth ($result + $ch)) -gt $Width - 2) { break }
+        if ((Get-DisplayWidth ($result + $ch)) -gt $Width - 3) { break }
         $result += $ch
     }
-    return $result + '…'
+    return $result + '...'
 }
 
 function Format-PadLeft([string]$Text, [int]$Width) {
@@ -1722,7 +1723,9 @@ function Close-LimitRound([bool]$Reset) {
     }
 }
 
-function Get-Mark([bool]$Hit) { if ($Hit) { return ' ※' } return '   ' }
+# 目安を超えた値の印。※ は、Windows PowerShell のウィンドウでは 2 文字分、Windows ターミナルでは 1 文字分で描かれ、
+# 後ろの列がずれるため、どの画面でも 1 文字分の * にする（実機確認で見つけた）
+function Get-Mark([bool]$Hit) { if ($Hit) { return ' * ' } return '   ' }
 
 # まとめの表に出しきれなかった件数。保存しないときは、見る CSV がないので件数だけ
 function Get-MoreText([int]$Count, [string]$FileName) {
